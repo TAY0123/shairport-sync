@@ -715,6 +715,95 @@ impl AudioEngine {
         }
     }
 
+    /// Try to enqueue all complete frames atomically under a single
+    /// producer-lock interval — either every complete frame is accepted
+    /// or zero are.
+    ///
+    /// When `unchecked` is `false`: checks the playback gate first.
+    /// If the gate is closed the call returns `(requested, 0)` without
+    /// touching any overflow/loss counters.
+    ///
+    /// When `unchecked` is `true`: the playback gate is bypassed
+    /// (used during Priming / Rebuffering so the output FIFO can fill).
+    ///
+    /// The producer lock is acquired once.  If the ring buffer has
+    /// enough room for all complete frames the entire block is pushed.
+    /// If not, **zero** frames are pushed and no overflow/loss counter
+    /// is incremented — capacity rejection is scheduler backpressure,
+    /// not a genuine overflow.
+    ///
+    /// Trailing samples that do not form a complete frame (`< channels`)
+    /// are never accepted and cause the block to be fully rejected.
+    ///
+    /// Returns `(requested_frames, accepted_frames)` where
+    /// `accepted_frames` is either `requested_frames` or `0`.
+    pub fn try_enqueue_output_frames_all_or_nothing(
+        &self,
+        samples: &[f32],
+        unchecked: bool,
+    ) -> (usize, usize) {
+        let channels = self.output_channels() as usize;
+        if channels == 0 {
+            return (0, 0);
+        }
+        let total_frames = samples.len() / channels;
+        if total_frames == 0 {
+            return (0, 0);
+        }
+        // Incomplete trailing samples → can never push.
+        let has_trailing = !samples.len().is_multiple_of(channels);
+        if has_trailing {
+            // Trailing samples prevent an all-or-nothing push.
+            return (total_frames, 0);
+        }
+
+        // Check the playback gate when not in unchecked mode.
+        if !unchecked && !self.playback_enabled.load(Ordering::Acquire) {
+            // Gate is closed — reject without touching overflow counters.
+            // Count on the playback-disabled counter.
+            self.playback_disabled_rejected_samples
+                .fetch_add(samples.len(), Ordering::Release);
+            return (total_frames, 0);
+        }
+
+        let mut producer = self.producer.lock();
+
+        use ringbuf::traits::{Observer, Producer};
+        let occupied = producer.occupied_len();
+        let available_samples = self.capacity.saturating_sub(occupied);
+        let available_frames = available_samples / channels;
+
+        if total_frames > available_frames {
+            // Insufficient capacity — reject entirely without counting
+            // as overflow (this is scheduler backpressure).
+            return (total_frames, 0);
+        }
+
+        let samples_to_push = total_frames * channels;
+        let pushed = producer.push_slice(&samples[..samples_to_push]);
+        debug_assert_eq!(
+            pushed, samples_to_push,
+            "try_enqueue_all_or_nothing: push_slice wrote {pushed} of {samples_to_push}"
+        );
+
+        // Track max observed occupancy (only on successful push).
+        let current_occupancy = producer.occupied_len();
+        let mut prev = self.max_observed_occupancy.load(Ordering::Acquire);
+        while current_occupancy > prev {
+            match self.max_observed_occupancy.compare_exchange_weak(
+                prev,
+                current_occupancy,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => prev = current,
+            }
+        }
+
+        (total_frames, total_frames)
+    }
+
     // -----------------------------------------------------------------------
     // Legacy sample-oriented enqueue (delegates to frame-safe internals)
     // -----------------------------------------------------------------------
@@ -1709,6 +1798,48 @@ mod tests {
              This causes immediate underrun bursts on the first callback.",
             status.queued_ms as f64
         );
+    }
+
+    #[test]
+    fn all_or_nothing_enqueue_is_atomic_between_concurrent_producers() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (engine, _consumer) = AudioEngine::new(40);
+        engine.set_output_format(48_000, 2); // 20 frames total.
+
+        // Leave room for exactly one of two eight-frame blocks.
+        let initial = vec![0.1f32; 10 * 2];
+        assert_eq!(
+            engine.try_enqueue_output_frames_all_or_nothing(&initial, true),
+            (10, 10)
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for value in [0.2f32, 0.3f32] {
+            let engine = engine.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let block = vec![value; 8 * 2];
+                barrier.wait();
+                engine.try_enqueue_output_frames_all_or_nothing(&block, true)
+            }));
+        }
+        barrier.wait();
+
+        let results: Vec<(usize, usize)> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("producer thread panicked"))
+            .collect();
+        assert!(results.iter().all(|&(requested, _)| requested == 8));
+        assert_eq!(
+            results.iter().map(|&(_, accepted)| accepted).sum::<usize>(),
+            8,
+            "exactly one complete producer block must fit"
+        );
+        assert_eq!(engine.status().queued_frames, 18);
+        assert_eq!(engine.status().producer_overflow_samples, 0);
     }
 
     // ---------------------------------------------------------------------------
