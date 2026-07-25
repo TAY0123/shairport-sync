@@ -18,6 +18,7 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     airplay::pairing::{PairingEndpoint, PairingService, PairingSession},
     airplay::sdp::parse_sdp,
+    airplay::session_crypto::SessionCrypto,
     airplay::{
         crypto::{IdentityKey, PairCipher},
         dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
@@ -531,8 +532,26 @@ fn local_non_loopback_interface_addresses() -> Vec<IpAddr> {
     Vec::new()
 }
 
+/// Bundles the set of shared services / configuration that almost every RTSP
+/// handler needs.  This keeps function signatures under the clippy
+/// `too_many_arguments` limit (7) without burying the ownership / cleanup
+/// logic inside an opaque mega-struct.
+struct ConnectionServices<'a> {
+    config: &'a AirplayConfig,
+    state: &'a AppState,
+    pairing: &'a PairingService,
+    audio_engine: &'a AudioEngine,
+    player: &'a SharedPlayer,
+    dacp: &'a DacpController,
+}
+
+/// Entry point for a per-peer RTSP connection.  This function receives owned
+/// values and creates the borrowed [`ConnectionServices`] context; it has 8
+/// parameters by design (the spawned-task boundary requires ownership transfer).
+/// All downstream functions use the slimmer context struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: AirplayConfig,
     state: AppState,
@@ -542,11 +561,49 @@ async fn handle_connection(
     dacp: DacpController,
 ) -> anyhow::Result<()> {
     debug!(%peer, "RTSP connection opened");
-    let mut buf = Vec::with_capacity(8192);
-    let mut encrypted_buf = Vec::with_capacity(8192);
     let mut session = RtspSession::default();
     session.local_addr = stream.local_addr().ok();
     session.peer_addr = Some(peer);
+
+    let services = ConnectionServices {
+        config: &config,
+        state: &state,
+        pairing: &pairing,
+        audio_engine: &audio_engine,
+        player: &player,
+        dacp: &dacp,
+    };
+
+    // Run the inner request/response loop.  Every exit from this inner
+    // function — whether clean EOF, read error, write error, or encryption
+    // error — flows through the idempotent cleanup block below, matching
+    // the pthread cleanup handler in shairport-sync C.
+    let result = process_rtsp_requests(stream, peer, &services, &mut session).await;
+
+    // --- Idempotent per-connection cleanup (safe to call regardless of
+    //     how the inner function exited).  TEARDOWN already performs an
+    //     equivalent cleanup, so this is a safety-net for EOF/error exits. ---
+    perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+
+    match &result {
+        Ok(()) => debug!(%peer, "RTSP connection closed cleanly"),
+        Err(e) => warn!(%peer, %e, "RTSP connection closed with error (cleanup performed)"),
+    }
+
+    result
+}
+
+/// Inner request/response loop extracted from [`handle_connection`] so that
+/// every exit path (EOF, read/write error, encryption failure) returns to a
+/// single point where per-connection cleanup is guaranteed.
+async fn process_rtsp_requests(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    svc: &ConnectionServices<'_>,
+    session: &mut RtspSession,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut encrypted_buf = Vec::with_capacity(8192);
     loop {
         let mut chunk = [0u8; 4096];
         let read = stream.read(&mut chunk).await?;
@@ -596,16 +653,7 @@ async fn handle_connection(
             // requests while its own M4 response is still plaintext.
             let encrypt_response = session.control_cipher.is_some();
 
-            let response = route_request(
-                &config,
-                &state,
-                &pairing,
-                &mut session,
-                &request,
-                &audio_engine,
-                &player,
-                &dacp,
-            );
+            let response = route_request(svc, session, &request);
 
             log_response(peer, &request, &response);
             let mut wire = response.to_bytes();
@@ -639,16 +687,53 @@ async fn handle_connection(
         }
     }
 }
-fn route_request(
-    config: &AirplayConfig,
+
+/// Idempotent per-connection cleanup.  Safe to call multiple times (TEARDOWN
+/// may have already run an equivalent cleanup; subsequent calls are no-ops).
+///
+/// Only a connection that actually established / controlled the principal
+/// playback session (marked via [`RtspSession::is_playback_owner`]) may clear
+/// global playback state, crypto, and DACP.  Non-owner connections — e.g.
+/// OPTIONS-only probes or ancillary AP2 control sockets that never issued a
+/// successful ANNOUNCE / audio SETUP — only abort their own listener tasks.
+///
+/// Matches the pthread cleanup handler `rtsp_conversation_thread_cleanup_function`
+/// in shairport-sync C but with explicit ownership gating.
+fn perform_connection_cleanup(
     state: &AppState,
-    pairing: &PairingService,
-    session: &mut RtspSession,
-    request: &RtspRequest,
     audio_engine: &AudioEngine,
     player: &SharedPlayer,
     dacp: &DacpController,
+    session: &mut RtspSession,
+) {
+    if session.is_playback_owner {
+        player.stop();
+        audio_engine.set_playback_enabled(false);
+        state.set_active(false);
+        state.set_player_state(PlayerState::Stopped);
+        *state.session_crypto.write() = None;
+        *state.ap2_media_key.write() = None;
+        *state.ap2_audio_format.write() = None;
+        dacp.clear_session();
+    }
+    session.abort_ap2_listeners();
+}
+
+fn route_request(
+    svc: &ConnectionServices<'_>,
+    session: &mut RtspSession,
+    request: &RtspRequest,
 ) -> RtspResponse {
+    // Unpack the services bundle so the rest of the function body stays
+    // readable and unchanged.  The function signature is the part clippy
+    // inspects for `too_many_arguments`.
+    let config = svc.config;
+    let state = svc.state;
+    let pairing = svc.pairing;
+    let audio_engine = svc.audio_engine;
+    let player = svc.player;
+    let dacp = svc.dacp;
+
     if let Some(client_name) = request.headers.get("X-Apple-Client-Name") {
         state.set_client_name(client_name.clone());
     }
@@ -666,7 +751,7 @@ fn route_request(
         );
     }
 
-    match (request.method.as_str(), request.uri.as_str()) {
+    let mut resp = match (request.method.as_str(), request.uri.as_str()) {
         ("OPTIONS", _) => {
             let public = if config.airplay2_enabled {
                 "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, PUT, SETPEERS"
@@ -683,35 +768,105 @@ fn route_request(
             .with_cseq(request),
         ("ANNOUNCE", _) => {
             info!("AP1 ANNOUNCE received ({} bytes body)", request.body.len());
+            // Clear any stale session crypto from a previous ANNOUNCE before
+            // populating fresh key material.  This matches the C behaviour
+            // where conn->stream.aeskey / aesiv are simply overwritten each
+            // ANNOUNCE, and the player thread sees the latest values atomically.
+            *state.session_crypto.write() = None;
+            // Also clear ALAC state so the RTP decoder re-initialises on the
+            // first packet of the new stream.
+            *state.alac_magic_cookie.write() = None;
+            *state.alac_sample_rate.write() = None;
+            *state.alac_sample_size.write() = None;
+            *state.alac_channels.write() = None;
+            *state.frames_per_packet.write() = None;
+            state
+                .track_transition_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
             let sdp = String::from_utf8_lossy(&request.body);
             let parsed = parse_sdp(&sdp);
             state.set_source_format(parsed.source_format_description());
             let params = parsed.classic_params();
 
+            // --- Classic AirPlay crypto: unwrap rsaaeskey with the well-known
+            //     Shairport Sync / AirPort Express RSA private key, then pair
+            //     it with aesiv into a SessionCrypto stored on the app state.
+            //
+            //     RSA-OAEP output MUST be exactly 16 bytes (matching rtsp.c);
+            //     any other length is rejected rather than truncated.  Partial
+            //     key/IV material returns RTSP 456 (Parameter Not Understood)
+            //     and leaves the classic crypto slot cleared. ---
+            let has_encryption = params.rsaaeskey.is_some();
+            let mut crypto_err: Option<&'static str> = None;
+            let mut aes_key: Option<[u8; 16]> = None;
+            let mut aes_iv: Option<[u8; 16]> = None;
+
             if let Some(encrypted_key) = &params.rsaaeskey {
-                let rsa_key = decoder::generate_rsa_key();
-                match decoder::rsa_oaep_decrypt(&rsa_key, encrypted_key) {
-                    Ok(mut aes_key_bytes) => {
-                        if aes_key_bytes.len() >= 16 {
-                            aes_key_bytes.truncate(16);
-                            let mut key = [0u8; 16];
-                            key.copy_from_slice(&aes_key_bytes);
-                            *state.session_key.write() = Some(key);
+                match decoder::classic_rsa_oaep_decrypt(encrypted_key) {
+                    Ok(aes_key_bytes) => {
+                        if aes_key_bytes.len() == 16 {
+                            let mut k = [0u8; 16];
+                            k.copy_from_slice(&aes_key_bytes);
+                            aes_key = Some(k);
                             info!("classic AirPlay AES session key derived");
+                        } else {
+                            warn!(
+                                len = aes_key_bytes.len(),
+                                "RSA-OAEP output not exactly 16 bytes"
+                            );
+                            crypto_err = Some("decrypted AES key has wrong length");
                         }
                     }
                     Err(e) => {
-                        warn!(%e, "RSA-OAEP decryption of AES key failed");
+                        warn!(%e, "RSA-OAEP decryption of AES key failed with classic key");
+                        crypto_err = Some("RSA-OAEP decryption failed");
                     }
                 }
             }
 
             if let Some(iv) = &params.aesiv {
                 if iv.len() == 16 {
-                    state.set_diagnostic("aes_iv_set", "yes");
+                    let mut v = [0u8; 16];
+                    v.copy_from_slice(iv);
+                    aes_iv = Some(v);
+                } else {
+                    warn!(len = iv.len(), "aesiv is not 16 bytes");
+                    crypto_err = Some("aesiv wrong length");
                 }
             }
 
+            // If the sender provides encryption material, all of it must be
+            // valid.  A partial key (rsaaeskey without aesiv, or vice-versa)
+            // is an error.  Unencrypted sessions (no rsaaeskey at all) are
+            // also rejected because our classic RTP path requires AES-CBC;
+            // accepting them would succeed the ANNOUNCE but silently drop
+            // every audio packet.
+            if crypto_err.is_none() && has_encryption && aes_key.is_none() {
+                crypto_err = Some("rsaaeskey provided but decryption produced no valid key");
+            }
+            if crypto_err.is_none() && has_encryption && aes_iv.is_none() {
+                crypto_err = Some("rsaaeskey provided but aesiv is missing or invalid");
+            }
+            if crypto_err.is_none() && !has_encryption {
+                crypto_err = Some("unencrypted classic AirPlay sessions are not supported");
+            }
+
+            if let Some(err) = crypto_err {
+                warn!(%err, "ANNOUNCE crypto rejected");
+                return response(456, "Parameter Not Understood").with_cseq(request);
+            }
+
+            // Both key and IV are valid — store session crypto.
+            if let (Some(key), Some(iv)) = (aes_key, aes_iv)
+                && let Some(crypto) = SessionCrypto::new(&key, &iv)
+            {
+                *state.session_crypto.write() = Some(crypto);
+                session.is_playback_owner = true;
+                info!("classic AirPlay session crypto stored");
+            }
+
+            // --- ALAC format parameters ---
             if let Some(asc) = &params.alac_specific_config {
                 state
                     .alac_magic_cookie
@@ -933,11 +1088,13 @@ fn route_request(
         }
         ("TEARDOWN", _) => {
             if let Some(stream_type) = ap2_teardown_stream_type(&request.body) {
-                player.stop();
-                audio_engine.set_playback_enabled(false);
-                state.set_player_state(PlayerState::Stopped);
+                if session.is_playback_owner {
+                    player.stop();
+                    audio_engine.set_playback_enabled(false);
+                    state.set_player_state(PlayerState::Stopped);
+                }
                 session.abort_ap2_stream_listener(stream_type);
-                if stream_type == Ap2StreamType::BufferedAudio {
+                if session.is_playback_owner && stream_type == Ap2StreamType::BufferedAudio {
                     player.flush();
                     state.clear_track_for_transition();
                     state.set_diagnostic("audio_waiting_for_track_title", "true");
@@ -949,14 +1106,16 @@ fn route_request(
                 return response(200, "OK").with_cseq(request);
             }
 
-            player.stop();
-            audio_engine.set_playback_enabled(false);
-            state.set_active(false);
-            state.set_player_state(PlayerState::Stopped);
-            *state.session_key.write() = None;
-            *state.ap2_media_key.write() = None;
-            *state.ap2_audio_format.write() = None;
-            dacp.clear_session();
+            if session.is_playback_owner {
+                player.stop();
+                audio_engine.set_playback_enabled(false);
+                state.set_active(false);
+                state.set_player_state(PlayerState::Stopped);
+                *state.session_crypto.write() = None;
+                *state.ap2_media_key.write() = None;
+                *state.ap2_audio_format.write() = None;
+                dacp.clear_session();
+            }
             session.abort_ap2_listeners();
             info!("TEARDOWN");
             response(200, "OK").with_cseq(request)
@@ -969,7 +1128,91 @@ fn route_request(
             );
             response(404, "Not Found").with_cseq(request)
         }
+    };
+
+    // --- Apple-Challenge → Apple-Response (classic AirPlay authentication) ---
+    if let Some(challenge_b64) = request.headers.get("Apple-Challenge")
+        && let Some(apple_response) =
+            build_apple_response(challenge_b64, session.local_addr, &config.device_id)
+    {
+        resp.headers
+            .push(("Apple-Response".to_string(), apple_response));
     }
+
+    resp
+}
+
+/// Build the `Apple-Response` header value from a base64-encoded challenge,
+/// the local socket address, and the device MAC address string.
+///
+/// Format (matching shairport-sync C):
+///   challenge(≤16) || local_ip(4/16) || ap1_prefix(6)  → padded to ≥32 bytes
+///   → RSA PKCS1v1.5 sign (unprefixed) with classic key
+///   → base64, strip trailing '='
+fn build_apple_response(
+    challenge_b64: &str,
+    local_addr: Option<SocketAddr>,
+    device_id: &str,
+) -> Option<String> {
+    use base64::Engine;
+
+    let challenge = crate::decoder::tolerant_base64_decode(challenge_b64.trim()).ok()?;
+    if challenge.len() > 16 {
+        warn!(
+            len = challenge.len(),
+            "oversized Apple-Challenge (>16 bytes)"
+        );
+        return None;
+    }
+
+    // Parse device MAC into 6 bytes (ap1_prefix equivalent)
+    let ap1_prefix = parse_mac_bytes(device_id)?;
+
+    // Build the to-be-signed buffer
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&challenge);
+    // Pad challenge to 16 bytes (C code doesn't pad explicitly, but the
+    // destination buffer is zeroed; we append the IP directly after).
+    match local_addr {
+        Some(SocketAddr::V4(v4)) => {
+            // IPv4: 4 bytes
+            buf.extend_from_slice(&v4.ip().octets());
+        }
+        Some(SocketAddr::V6(v6)) => {
+            // IPv6: 16 bytes
+            buf.extend_from_slice(&v6.ip().octets());
+        }
+        None => {
+            // Fallback: zero IPv4 address
+            buf.extend_from_slice(&[0u8; 4]);
+        }
+    }
+    buf.extend_from_slice(&ap1_prefix);
+
+    // Pad to at least 0x20 (32) bytes
+    while buf.len() < 32 {
+        buf.push(0u8);
+    }
+
+    let sig = decoder::classic_rsa_pkcs1_sign(&buf).ok()?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&sig);
+    // Strip padding '=' chars (matching C behaviour)
+    let trimmed = encoded.trim_end_matches('=').to_string();
+    Some(trimmed)
+}
+
+/// Parse a MAC address string "xx:xx:xx:xx:xx:xx" into 6 bytes.
+fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn log_request(peer: SocketAddr, request: &RtspRequest) {
@@ -1164,6 +1407,11 @@ struct RtspSession {
     dacp_id: Option<String>,
     active_remote: Option<String>,
     session_key: Option<Vec<u8>>,
+    /// true when this connection established (or currently controls) the
+    /// principal playback session — i.e. it sent a successful classic
+    /// ANNOUNCE with valid crypto, or a successful AP2 audio SETUP/RECORD.
+    /// Only owner connections may clear global playback state on close.
+    is_playback_owner: bool,
 }
 
 impl RtspSession {
@@ -1391,6 +1639,7 @@ fn handle_ap2_setup(
                             let mut key = [0u8; 32];
                             key.copy_from_slice(&shk[..32]);
                             *state.ap2_media_key.write() = Some(key);
+                            session.is_playback_owner = true;
                         } else {
                             warn!(shk_len = shk.len(), "AP2 buffered SETUP shk is too short");
                         }
@@ -2534,6 +2783,7 @@ impl RtspResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::pkcs1v15::Pkcs1v15Sign;
 
     #[test]
     fn parses_rtsp_request_with_body() {
@@ -2863,7 +3113,7 @@ mod tests {
         assert!(data_port > 0);
         assert!(control_port > 0);
         assert_ne!(data_port, control_port);
-        assert_eq!(*state.session_key.read(), None);
+        assert_eq!(*state.session_crypto.read(), None);
         assert_eq!(*state.ap2_media_key.read(), Some([7u8; 32]));
         assert_eq!(
             *state.ap2_audio_format.read(),
@@ -2922,5 +3172,454 @@ mod tests {
         assert_ne!(formats.buffer_stream & 0x0080_0000, 0);
         assert_eq!(formats.buffer_stream & 0x2700_0000, 0);
         assert_eq!(formats.buffer_stream & 0x2800_0000, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Apple-Challenge → Apple-Response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn apple_challenge_builds_response() {
+        // Known input: challenge = [0x01; 16], local IPv4 = 127.0.0.1,
+        // device_id = "00:11:22:33:44:55"
+        let challenge_bytes = [0x01u8; 16];
+        let challenge_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let device_id = "00:11:22:33:44:55";
+
+        let response = build_apple_response(&challenge_b64, Some(local), device_id);
+        assert!(response.is_some(), "must produce Apple-Response");
+        let resp = response.unwrap();
+
+        // Response should be valid base64 (no padding in the output)
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD_NO_PAD, &resp);
+        assert!(
+            decoded.is_ok(),
+            "Apple-Response must be valid base64, got: {resp}"
+        );
+        let sig = decoded.unwrap();
+
+        // Signature must be 256 bytes (2048-bit RSA)
+        assert_eq!(sig.len(), 256, "unexpected signature length");
+
+        // Verify the signature round-trips with the public key
+        let key = decoder::classic_rsa_private_key();
+        let pub_key: rsa::RsaPublicKey = key.clone().into();
+
+        // Reconstruct the exact input buffer that was signed
+        let mut expected_buf = Vec::new();
+        expected_buf.extend_from_slice(&challenge_bytes);
+        expected_buf.extend_from_slice(&[127, 0, 0, 1]); // IPv4
+        expected_buf.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // ap1_prefix
+        while expected_buf.len() < 32 {
+            expected_buf.push(0u8);
+        }
+
+        pub_key
+            .verify(Pkcs1v15Sign::new_unprefixed(), &expected_buf, &sig)
+            .expect("Apple-Response signature must verify");
+    }
+
+    #[test]
+    fn apple_challenge_rejects_oversized_challenge() {
+        // 17 bytes challenge (larger than the 16-byte max)
+        let challenge_bytes = [0x42u8; 17];
+        let challenge_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let response = build_apple_response(&challenge_b64, Some(local), "00:11:22:33:44:55");
+        assert!(response.is_none(), "oversized challenge must be rejected");
+    }
+
+    #[test]
+    fn parse_mac_bytes_valid() {
+        let mac = parse_mac_bytes("aa:bb:cc:dd:ee:ff");
+        assert_eq!(mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    }
+
+    #[test]
+    fn parse_mac_bytes_invalid() {
+        assert_eq!(parse_mac_bytes("not-a-mac"), None);
+        assert_eq!(parse_mac_bytes("aa:bb:cc"), None); // too short
+        assert_eq!(parse_mac_bytes("aa:bb:cc:dd:ee:ff:00"), None); // too long
+    }
+
+    // -------------------------------------------------------------------
+    // Unpadded Apple-Challenge
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn apple_challenge_accepts_unpadded_base64() {
+        // Apple strips trailing '=' from base64 challenge strings.
+        // The tolerant decoder must handle this.
+        let challenge_bytes = [0x42u8; 16];
+        let challenge_b64_padded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let challenge_b64_unpadded = challenge_b64_padded.trim_end_matches('=');
+
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let device_id = "00:11:22:33:44:55";
+
+        let response_padded = build_apple_response(&challenge_b64_padded, Some(local), device_id);
+        let response_unpadded =
+            build_apple_response(challenge_b64_unpadded, Some(local), device_id);
+
+        // Both padded and unpadded challenge must produce the same response,
+        // because they represent the same decoded bytes.
+        assert!(response_padded.is_some());
+        assert_eq!(response_padded, response_unpadded);
+    }
+
+    // -------------------------------------------------------------------
+    // Stale crypto replacement at ANNOUNCE + 456 for invalid crypto
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn announce_clears_stale_session_crypto() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Pre-populate with some stale crypto
+        *state.session_crypto.write() = SessionCrypto::new(&[1u8; 16], &[2u8; 16]);
+        assert!(state.session_crypto.read().is_some());
+
+        // Build a minimal ANNOUNCE request that does NOT contain crypto
+        // fields.  Unencrypted sessions are rejected with 456, but the
+        // stale crypto must still be cleared at the top of the handler.
+        let sdp_body =
+            b"v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\n";
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "1".to_string());
+        let request = RtspRequest {
+            method: "ANNOUNCE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: sdp_body.to_vec(),
+        };
+
+        let mut session = RtspSession::default();
+        let services = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            player: &player,
+            dacp: &dacp,
+        };
+        let response = route_request(&services, &mut session, &request);
+
+        // Unencrypted ANNOUNCE is rejected
+        assert_eq!(
+            response.code, 456,
+            "unencrypted ANNOUNCE must return 456 Parameter Not Understood"
+        );
+        // Stale crypto must still be cleared
+        assert_eq!(
+            *state.session_crypto.read(),
+            None,
+            "ANNOUNCE must clear stale session crypto even when rejected"
+        );
+        // Non-owner flag must NOT be set
+        assert!(!session.is_playback_owner);
+    }
+
+    #[test]
+    fn announce_with_partial_crypto_returns_456() {
+        // When rsaaeskey is provided but aesiv is missing, return 456.
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // SDP with rsaaeskey (encrypted with the classic key) but NO aesiv
+        let data = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x10\x11\x12\x13\x14\x15\x16";
+        let pub_key: rsa::RsaPublicKey = decoder::classic_rsa_private_key().clone().into();
+        let mut rng = rand_core::OsRng;
+        let encrypted = pub_key
+            .encrypt(&mut rng, rsa::Oaep::new::<sha1::Sha1>(), data)
+            .expect("encrypt");
+        let rsaaeskey_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted);
+
+        let sdp_body = format!(
+            "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=rsaaeskey:{rsaaeskey_b64}\r\n"
+        );
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "1".to_string());
+        let request = RtspRequest {
+            method: "ANNOUNCE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: sdp_body.into_bytes(),
+        };
+
+        let mut session = RtspSession::default();
+        let services = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            player: &player,
+            dacp: &dacp,
+        };
+        let response = route_request(&services, &mut session, &request);
+
+        assert_eq!(
+            response.code, 456,
+            "partial crypto (key without IV) must return 456"
+        );
+        assert!(!session.is_playback_owner);
+    }
+
+    // -------------------------------------------------------------------
+    // perform_connection_cleanup idempotency + ownership
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn connection_cleanup_owner_clears_global_state() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+
+        // Set up state that an owner cleanup should clear
+        *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
+        *state.ap2_media_key.write() = Some([5u8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+        state.set_active(true);
+        state.set_player_state(PlayerState::Playing);
+
+        let mut session = RtspSession::default();
+        session.is_playback_owner = true;
+
+        // Owner cleanup must clear global state
+        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        assert_eq!(*state.session_crypto.read(), None);
+        assert_eq!(*state.ap2_media_key.read(), None);
+        assert_eq!(*state.ap2_audio_format.read(), None);
+
+        // Second cleanup must not panic and must leave state unchanged (idempotent)
+        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        assert_eq!(*state.session_crypto.read(), None);
+        assert_eq!(*state.ap2_media_key.read(), None);
+        assert_eq!(*state.ap2_audio_format.read(), None);
+    }
+
+    #[test]
+    fn connection_cleanup_non_owner_preserves_global_state() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+
+        // Set up state representing an active session owned by someone else
+        *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
+        *state.ap2_media_key.write() = Some([5u8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+        state.set_active(true);
+        state.set_player_state(PlayerState::Playing);
+
+        let mut session = RtspSession::default();
+        // is_playback_owner defaults to false — this is a non-owner probe
+
+        // Non-owner cleanup must NOT clear global state
+        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        assert!(
+            state.session_crypto.read().is_some(),
+            "non-owner cleanup must not clear session_crypto"
+        );
+        assert!(
+            state.ap2_media_key.read().is_some(),
+            "non-owner cleanup must not clear ap2_media_key"
+        );
+        assert!(
+            state.ap2_audio_format.read().is_some(),
+            "non-owner cleanup must not clear ap2_audio_format"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stream TEARDOWN ownership gating
+    // -------------------------------------------------------------------
+
+    /// Non-owner stream TEARDOWN must abort only its own listener and leave
+    /// another active session's ap2_media_key + ap2_audio_format intact.
+    #[test]
+    fn stream_teardown_non_owner_preserves_ap2_key_and_format() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Seed global AP2 state representing an active owner session
+        *state.ap2_media_key.write() = Some([0xABu8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+
+        // Build a buffered-audio stream TEARDOWN body (type 103)
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamID".to_string(), plist_uint_value(1u64));
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "10".to_string());
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+
+        // Non-owner session (is_playback_owner defaults to false)
+        let mut session = RtspSession::default();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            player: &player,
+            dacp: &dacp,
+        };
+        route_request(&svc, &mut session, &request);
+
+        // Global AP2 state must remain intact
+        assert!(
+            state.ap2_media_key.read().is_some(),
+            "non-owner stream TEARDOWN must not clear ap2_media_key"
+        );
+        assert!(
+            state.ap2_audio_format.read().is_some(),
+            "non-owner stream TEARDOWN must not clear ap2_audio_format"
+        );
+    }
+
+    /// Owner stream TEARDOWN clears ap2_media_key, ap2_audio_format, and
+    /// session_key so the next SETUP can populate fresh values.
+    #[test]
+    fn stream_teardown_owner_clears_ap2_key_and_format() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let audio_engine = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Seed global AP2 state
+        *state.ap2_media_key.write() = Some([0xCDu8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+
+        // Build a buffered-audio stream TEARDOWN body (type 103)
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamID".to_string(), plist_uint_value(1u64));
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "10".to_string());
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+
+        let mut session = RtspSession::default();
+        session.is_playback_owner = true;
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            player: &player,
+            dacp: &dacp,
+        };
+        route_request(&svc, &mut session, &request);
+
+        // Owner stream TEARDOWN must clear global AP2 state
+        assert_eq!(
+            *state.ap2_media_key.read(),
+            None,
+            "owner stream TEARDOWN must clear ap2_media_key"
+        );
+        assert_eq!(
+            *state.ap2_audio_format.read(),
+            None,
+            "owner stream TEARDOWN must clear ap2_audio_format"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Sub-16-byte payload preservation (aes_cbc_decrypt_in_place)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn aes_cbc_short_payload_preserved() {
+        // Verify that aes_cbc_decrypt_in_place leaves sub-block payloads
+        // unchanged rather than dropping them.
+        let key = [0xabu8; 16];
+        let iv = [0x06u8; 16];
+
+        // 5 bytes: no complete block
+        let mut short = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let original = short;
+        crate::decoder::aes_cbc_decrypt_in_place(&key, &iv, &mut short).unwrap();
+        assert_eq!(
+            short, original,
+            "payload < 16 bytes must be preserved unchanged"
+        );
+
+        // 17 bytes: 1 full block + 1 trailing byte
+        let mut mixed = [0x42u8; 17];
+        crate::decoder::aes_cbc_decrypt_in_place(&key, &iv, &mut mixed).unwrap();
+        // The last byte must be unchanged; first 16 are decrypted
+        assert_eq!(mixed[16], 0x42, "trailing byte must be unchanged");
     }
 }

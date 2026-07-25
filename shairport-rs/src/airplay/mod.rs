@@ -6,5 +6,6 @@ pub mod pairing;
 pub mod rtp;
 pub mod rtsp;
 pub mod sdp;
+pub mod session_crypto;
 pub mod tlv;
 pub mod txt_records;

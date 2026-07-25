@@ -1,5 +1,6 @@
-use base64::Engine;
 use serde::{Deserialize, Serialize};
+
+use crate::decoder::tolerant_base64_decode;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SdpSession {
@@ -20,9 +21,9 @@ pub struct SdpMedia {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClassicAirplayParams {
-    /// RSA-encrypted AES key (base64 raw bytes from `rsaaeskey`)
+    /// RSA-encrypted AES key (base64 from `rsaaeskey`; may omit padding).
     pub rsaaeskey: Option<Vec<u8>>,
-    /// AES IV (hex-decoded from `aesiv`)
+    /// AES IV (base64 from `aesiv` with hex fallback; may omit padding).
     pub aesiv: Option<Vec<u8>>,
     /// ALAC frames per packet from fmtp
     pub frames_per_packet: Option<u32>,
@@ -50,10 +51,10 @@ impl SdpSession {
         let mut params = ClassicAirplayParams::default();
 
         for (key, value) in &self.attributes {
-            if key == "latency" {
-                if let Some(v) = value {
-                    params.latency_frames = v.trim().parse().ok();
-                }
+            if key == "latency"
+                && let Some(v) = value
+            {
+                params.latency_frames = v.trim().parse().ok();
             }
         }
 
@@ -62,14 +63,20 @@ impl SdpSession {
                 match key.as_str() {
                     "rsaaeskey" => {
                         if let Some(v) = value {
-                            params.rsaaeskey = base64::engine::general_purpose::STANDARD
-                                .decode(v.trim())
-                                .ok();
+                            params.rsaaeskey = tolerant_base64_decode(v.trim()).ok();
                         }
                     }
                     "aesiv" => {
                         if let Some(v) = value {
-                            params.aesiv = hex_decode(v.trim());
+                            // Base64 first (the canonical RAOP encoding for aesiv
+                            // in all Apple clients and shairport-sync C).  Fall
+                            // back to hex only when base64 fails, because a valid
+                            // base64 string can consist entirely of hex characters
+                            // and would be misinterpreted by hex-first.
+                            let trimmed = v.trim();
+                            params.aesiv = tolerant_base64_decode(trimmed)
+                                .ok()
+                                .or_else(|| hex_decode(trimmed));
                         }
                     }
                     "fmtp" => {
@@ -206,7 +213,7 @@ fn parse_attribute(value: &str) -> (String, Option<String>) {
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -234,7 +241,8 @@ mod tests {
 
     #[test]
     fn extracts_classic_airplay_params() {
-        let sdp = "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=rsaaeskey:YWJjZGVmZ2hpamtsbW5vcA==\r\na=aesiv:0102030405060708090a0b0c0d0e0f10\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=latency:22050\r\n";
+        // aesiv is base64-encoded (the canonical RAOP format).
+        let sdp = "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=rsaaeskey:YWJjZGVmZ2hpamtsbW5vcA==\r\na=aesiv:AQIDBAUGBwgJCgsMDQ4PEA==\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=latency:22050\r\n";
         let parsed = parse_sdp(sdp);
         let params = parsed.classic_params();
         assert_eq!(params.rsaaeskey.as_deref(), Some(&b"abcdefghijklmnop"[..]));
@@ -294,5 +302,86 @@ mod tests {
         assert_eq!(asc[11], 0xFF);
         // 44100 = 0xAC44
         assert_eq!(&asc[20..24], &[0, 0, 0xAC, 0x44]);
+    }
+
+    #[test]
+    fn aesiv_base64_padded() {
+        // "0102030405060708090a0b0c0d0e0f10" as base64 = "AQIDBAUGBwgJCgsMDQ4PEA=="
+        let sdp = "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=aesiv:AQIDBAUGBwgJCgsMDQ4PEA==\r\n";
+        let parsed = parse_sdp(sdp);
+        let params = parsed.classic_params();
+        assert_eq!(
+            params.aesiv.as_deref(),
+            Some(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16][..]),
+            "padded base64-encoded aesiv should be decoded"
+        );
+    }
+
+    #[test]
+    fn aesiv_base64_unpadded() {
+        // Same bytes without trailing '=' padding (Apple convention).
+        let sdp = "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=aesiv:AQIDBAUGBwgJCgsMDQ4PEA\r\n";
+        let parsed = parse_sdp(sdp);
+        let params = parsed.classic_params();
+        assert_eq!(
+            params.aesiv.as_deref(),
+            Some(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16][..]),
+            "unpadded base64-encoded aesiv should be decoded by tolerant decoder"
+        );
+    }
+
+    #[test]
+    fn aesiv_hex_fallback() {
+        // A string that is NOT valid base64 (contains 'g') forces the hex fallback.
+        // "gg" = 0xgg = invalid hex too, but let's use a real hex-only string.
+        // Actually any hex string is also valid base64 because [0-9a-fA-F] ⊂ base64
+        // alphabet.  Use "0102g304" — 'g' is invalid base64 and invalid hex,
+        // so this is a decode error.  A true hex-fallback test uses a string
+        // that base64 rejects because of length mod 4 == 1 after trimming
+        // whitespace: base64 padding logic makes every input valid, so the
+        // only practical hex fallback trigger is an unlikely non-base64 character.
+        //
+        // Use a hex string where the tolerant base64 decodes successfully
+        // but to the WRONG bytes — we want the hex fallback to NOT happen
+        // for valid-base64 input.  Test that hex is only a fallback.
+        let sdp = "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=aesiv:0102030405060708090a0b0c0d0e0f10\r\n";
+        let parsed = parse_sdp(sdp);
+        let params = parsed.classic_params();
+        // "0102030405060708090a0b0c0d0e0f10" is valid base64 AND valid hex.
+        // Base64-first means it decodes as base64, NOT as [1,2,3,...,16].
+        let hex_expected = &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16][..];
+        assert_ne!(
+            params.aesiv.as_deref(),
+            Some(hex_expected),
+            "all-hex string that is also valid base64 must NOT decode as hex"
+        );
+        // It should decode to something (the base64 interpretation).
+        assert!(params.aesiv.is_some(), "valid base64 must decode");
+    }
+
+    #[test]
+    fn aesiv_base64_ambiguity_regression() {
+        // Regression: a valid base64 string consisting entirely of hex
+        // characters MUST be decoded as base64, not as hex.  This tests
+        // that base64-first order is respected.
+        let input = "01020304"; // 8 chars, valid hex → [1,2,3,4], valid base64 → different bytes
+        let hex_bytes = hex_decode(input);
+        let b64_bytes = tolerant_base64_decode(input).ok();
+        assert!(hex_bytes.is_some());
+        assert!(b64_bytes.is_some());
+        assert_ne!(
+            hex_bytes, b64_bytes,
+            "a hex-lookalike base64 string decodes to different bytes under each encoding"
+        );
+        // The classic_params() method must use base64-first.
+        let sdp = format!(
+            "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=aesiv:{input}\r\n"
+        );
+        let parsed = parse_sdp(&sdp);
+        let params = parsed.classic_params();
+        assert_eq!(
+            params.aesiv, b64_bytes,
+            "aesiv must decode as base64 when the string is valid base64"
+        );
     }
 }

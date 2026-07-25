@@ -267,11 +267,7 @@ impl PairingService {
             "pairing response"
         );
 
-        let code = if out.first(TLV_ERROR).is_some() {
-            200 // Appple uses 200 with error TLV
-        } else {
-            200
-        };
+        let code = 200u16; // Appple uses 200 whether or not error TLV is present
 
         PairingReply {
             status_code: code,
@@ -441,7 +437,7 @@ impl PairingService {
 
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [4]);
-        out.insert(TLV_PROOF, verifier.proof().to_vec());
+        out.insert(TLV_PROOF, verifier.proof());
         out
     }
 
@@ -981,7 +977,7 @@ mod hex_serde {
     }
 
     fn hex_decode_impl(s: &str) -> Option<Vec<u8>> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return None;
         }
         (0..s.len())
@@ -1157,7 +1153,7 @@ mod tests {
 
         // M3 with valid signature but client not in DB
         let mut inner = Tlv::default();
-        inner.insert(TLV_IDENTIFIER, client_identifier.to_vec());
+        inner.insert(TLV_IDENTIFIER, client_identifier);
         inner.insert(TLV_SIGNATURE, signature);
 
         let encrypted = seal(&key, &nonce_from_label(b"PV-Msg03"), &[], &inner.encode()).unwrap();
@@ -1219,7 +1215,7 @@ mod tests {
         let signature = client_ed25519.sign(&signed_msg);
 
         let mut inner = Tlv::default();
-        inner.insert(TLV_IDENTIFIER, client_identifier.to_vec());
+        inner.insert(TLV_IDENTIFIER, client_identifier);
         inner.insert(TLV_SIGNATURE, signature);
 
         let encrypted = seal(&key, &nonce_from_label(b"PV-Msg03"), &[], &inner.encode()).unwrap();

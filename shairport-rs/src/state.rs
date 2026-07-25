@@ -12,13 +12,16 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::{audio::AudioDevice, codec::AudioFormat, config::Config};
+use crate::{
+    airplay::session_crypto::SessionCrypto, audio::AudioDevice, codec::AudioFormat, config::Config,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<StateSnapshot>>,
     events: broadcast::Sender<StateSnapshot>,
-    pub session_key: Arc<RwLock<Option<[u8; 16]>>>,
+    /// Classic AirPlay per-session AES key + IV (from SDP ANNOUNCE).
+    pub session_crypto: Arc<RwLock<Option<SessionCrypto>>>,
     pub ap2_media_key: Arc<RwLock<Option<[u8; 32]>>>,
     pub ap2_audio_format: Arc<RwLock<Option<AudioFormat>>>,
     pub alac_magic_cookie: Arc<RwLock<Option<Vec<u8>>>>,
@@ -179,7 +182,7 @@ impl AppState {
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
             events,
-            session_key: Arc::new(RwLock::new(None)),
+            session_crypto: Arc::new(RwLock::new(None)),
             ap2_media_key: Arc::new(RwLock::new(None)),
             ap2_audio_format: Arc::new(RwLock::new(None)),
             alac_magic_cookie: Arc::new(RwLock::new(None)),

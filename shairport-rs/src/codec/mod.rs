@@ -441,9 +441,7 @@ fn linear_resample(input: &[f32], input_rate: u32, output_rate: u32, channels: u
         return Vec::new();
     }
 
-    let output_frames = ((input_frames as f64 * ratio) as usize)
-        .max(1)
-        .min(1_000_000);
+    let output_frames = ((input_frames as f64 * ratio) as usize).clamp(1, 1_000_000);
     let mut output = vec![0.0f32; output_frames * channels as usize];
 
     for out_frame in 0..output_frames {

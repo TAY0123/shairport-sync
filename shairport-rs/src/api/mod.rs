@@ -191,7 +191,7 @@ async fn remote_command(
 }
 
 async fn apply_remote_command(context: &ApiContext, command: String) -> CommandResponse {
-    let local_applied = apply_local_remote_command(&context, &command);
+    let local_applied = apply_local_remote_command(context, &command);
     if let Some(dacp_command) = dacp_command_for_alias(&command) {
         match context.dacp.send(dacp_command).await {
             Ok(result) => {

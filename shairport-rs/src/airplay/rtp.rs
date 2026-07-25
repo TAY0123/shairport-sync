@@ -1,7 +1,6 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use anyhow::Context;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::{net::UdpSocket, task::JoinHandle};
 use tracing::{debug, info, warn};
@@ -59,8 +58,6 @@ async fn bind_audio_channel(
         .with_context(|| format!("failed to bind RTP Audio socket on {bind}"))?;
     Ok(tokio::spawn(async move {
         let mut buf = [0u8; 2048];
-        // AES-CBC uses chaining IV: start with aesiv from SDP, update per packet
-        let iv: Arc<RwLock<Option<[u8; 16]>>> = Arc::new(RwLock::new(None));
         let mut audio_decoder: Option<codec::AudioDecoder> = None;
         let mut decoder_epoch = state.track_transition_epoch();
 
@@ -78,7 +75,6 @@ async fn bind_audio_channel(
                     let current_epoch = state.track_transition_epoch();
                     if current_epoch != decoder_epoch {
                         audio_decoder = None;
-                        *iv.write() = None;
                         decoder_epoch = current_epoch;
                         info!(
                             epoch = decoder_epoch,
@@ -86,75 +82,34 @@ async fn bind_audio_channel(
                         );
                     }
 
-                    let rtp_payload_len = len - 12;
-                    if rtp_payload_len < 16 {
-                        continue;
-                    }
-
                     let payload = &buf[12..len];
 
-                    // Wait until session key is available
-                    let session_key = *state.session_key.read();
-                    let Some(key) = session_key else {
-                        debug!("no session key yet — buffering");
+                    // Wait until session crypto is available
+                    let session_crypto = state.session_crypto.read();
+                    let Some(ref crypto) = *session_crypto else {
+                        debug!("no session crypto yet — buffering");
                         continue;
                     };
+                    let aes_key = crypto.aes_key;
+                    let aes_iv = crypto.aes_iv; // reset IV per packet, matching C
 
-                    // Initialize IV from session state if not set
-                    {
-                        let mut iv_guard = iv.write();
-                        if iv_guard.is_none() {
-                            // For classic AP, the first IV comes from the SDP `a=aesiv`
-                            // but we need to start with the last ciphertext block as chaining.
-                            // If no SDP IV is set, use a zero IV.
-                            *iv_guard = Some(
-                                state
-                                    .alac_magic_cookie
-                                    .read()
-                                    .as_ref()
-                                    .and_then(|_| {
-                                        // The actual initial IV is stored in the SDP aesiv field
-                                        // which isn't in alac_magic_cookie. Use zero as fallback.
-                                        None
-                                    })
-                                    .unwrap_or([0u8; 16]),
-                            );
-                        }
-                    }
-
-                    // Decrypt the AES-CBC payload in place
+                    // Decrypt the AES-CBC payload in place.  aes_cbc_decrypt_in_place
+                    // only touches full 16-byte blocks; trailing / short payloads
+                    // are left unchanged (matching shairport-sync C behaviour).
                     let mut decrypted = payload.to_vec();
-                    if decrypted.len() < 16 {
-                        continue;
-                    }
-
                     let aes_len = decrypted.len() & !0xf;
-                    if aes_len == 0 {
-                        continue;
-                    }
 
-                    // Get current IV (will be updated in-place by AES-CBC)
-                    let current_iv = {
-                        let iv_guard = iv.read();
-                        iv_guard.unwrap_or([0u8; 16])
-                    };
-
+                    // Per-packet IV reset (not chained) — matches shairport-sync C
                     if let Err(e) = decoder::aes_cbc_decrypt_in_place(
-                        &key,
-                        &current_iv,
+                        &aes_key,
+                        &aes_iv,
                         &mut decrypted[..aes_len],
                     ) {
                         warn!(%e, "AES-CBC decrypt failed");
                         continue;
                     }
-
-                    // Update chaining IV from last ciphertext block
-                    let last_block_start = aes_len.saturating_sub(16);
-                    if last_block_start + 16 <= payload.len() {
-                        let mut new_iv = [0u8; 16];
-                        new_iv.copy_from_slice(&payload[last_block_start..last_block_start + 16]);
-                        *iv.write() = Some(new_iv);
-                    }
+                    // Trailing partial bytes (len - aes_len) are left unchanged
+                    // in `decrypted`, matching the C behaviour.
                     if state.is_waiting_for_track_title() {
                         debug!("RTP audio packet drained while waiting for new title");
                         continue;

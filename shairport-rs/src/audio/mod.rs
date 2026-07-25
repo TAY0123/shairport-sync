@@ -296,9 +296,8 @@ impl AudioEngine {
     #[allow(dead_code)]
     pub fn enqueue_interleaved(&self, samples: &[f32]) -> usize {
         let format = *self.output_format.lock();
-        return self
-            .enqueue_interleaved_for_output(samples, format.sample_rate, format.channels)
-            .0;
+        self.enqueue_interleaved_for_output(samples, format.sample_rate, format.channels)
+            .0
     }
 
     pub fn enqueue_interleaved_for_output(

@@ -273,11 +273,9 @@ impl MdnsBackend {
 fn auto_backend_candidates() -> Vec<MdnsBackend> {
     if cfg!(target_os = "linux") {
         vec![MdnsBackend::Avahi, MdnsBackend::DnsSd, MdnsBackend::Builtin]
-    } else if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-        vec![MdnsBackend::DnsSd, MdnsBackend::Avahi, MdnsBackend::Builtin]
     } else {
         vec![MdnsBackend::DnsSd, MdnsBackend::Avahi, MdnsBackend::Builtin]
-    }
+    } // macos/windows else also falls through to same default
 }
 
 fn command_exists(command: &str) -> bool {
