@@ -553,8 +553,8 @@ mod tests {
 
     #[test]
     fn constructs_stereo_symphonia_decoders() {
-        let alac_441 = alac_specific_config(44_100, 16);
-        let alac_480 = alac_specific_config(48_000, 24);
+        let alac_441 = alac_specific_config(AudioFormat::Alac44100S16Stereo);
+        let alac_480 = alac_specific_config(AudioFormat::Alac48000S24Stereo);
 
         assert!(AudioDecoder::new_for_format(AudioFormat::Aac44100F24Stereo, None).is_ok());
         assert!(AudioDecoder::new_for_format(AudioFormat::Aac48000F24Stereo, None).is_ok());
@@ -574,11 +574,13 @@ mod tests {
         assert!(decoder.decode(&[]).is_err());
     }
 
-    fn alac_specific_config(sample_rate: u32, sample_size: u32) -> [u8; 24] {
+    fn alac_specific_config(format: AudioFormat) -> [u8; 24] {
+        // Duplicated from airplay::playout_decoder for test convenience.
         let mut config = [0u8; 24];
-        config[0..4].copy_from_slice(&352u32.to_be_bytes());
+        let fps = format.frames_per_packet() as u32;
+        config[0..4].copy_from_slice(&fps.to_be_bytes());
         config[4] = 0;
-        config[5] = sample_size as u8;
+        config[5] = format.bits_per_sample() as u8;
         config[6] = 40;
         config[7] = 10;
         config[8] = 14;
@@ -586,7 +588,7 @@ mod tests {
         config[10..12].copy_from_slice(&255u16.to_be_bytes());
         config[12..16].copy_from_slice(&0u32.to_be_bytes());
         config[16..20].copy_from_slice(&0u32.to_be_bytes());
-        config[20..24].copy_from_slice(&sample_rate.to_be_bytes());
+        config[20..24].copy_from_slice(&format.sample_rate().to_be_bytes());
         config
     }
 }

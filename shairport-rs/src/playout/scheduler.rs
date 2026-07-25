@@ -937,6 +937,267 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Playout service — async task that drives SchedulerCore
+// ═══════════════════════════════════════════════════════════════════════
+
+use parking_lot::RwLock;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+
+use super::ingress::{IngressReceiver, IngressSender, packet_ingress};
+
+/// Commands sent to the playout service task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlayoutCommand {
+    /// Start the transport (enters Priming, gates off, flushes).
+    Start,
+    /// Pause the transport (gates off, preserves FIFO).
+    Pause,
+    /// Resume from pause.
+    Resume,
+    /// Flush the FIFO and restart priming.
+    Flush,
+    /// Stop the transport (gates off, flushes, resets decoder).
+    Stop,
+    /// Gracefully shut down the service task.
+    Shutdown,
+}
+
+/// Cloneable handle to a running playout service.
+///
+/// `PlayoutHandle` is cheap to clone and safe to share across threads.
+/// All packet insertion and command methods are non-blocking or
+/// properly async.
+#[derive(Clone, Debug)]
+pub struct PlayoutHandle {
+    /// Bounded ingress for packet submission.
+    ingress: IngressSender,
+    /// Unbounded command channel.
+    cmd_tx: mpsc::UnboundedSender<PlayoutCommand>,
+    /// Shared latest scheduler status.
+    status: Arc<RwLock<SchedulerStatus>>,
+}
+
+impl PlayoutHandle {
+    /// Non-blocking packet submission for AP1 (UDP receive loops).
+    ///
+    /// Returns [`IngressResult::Accepted`], [`Full`], or [`Closed`].
+    /// Never blocks — suitable for synchronous UDP socket loops.
+    ///
+    /// [`Full`]: super::ingress::IngressResult::Full
+    /// [`Closed`]: super::ingress::IngressResult::Closed
+    pub fn try_send_ap1(&self, packet: TimedPacket) -> super::ingress::IngressResult {
+        self.ingress.try_send(packet)
+    }
+
+    /// Async packet submission for AP2 (TCP backpressure).
+    ///
+    /// Awaits until the bounded channel has capacity.  Returns
+    /// [`IngressResult::Closed`] when the receiver has been dropped so
+    /// the caller can observe shutdown.
+    ///
+    /// [`IngressResult::Closed`]: super::ingress::IngressResult::Closed
+    pub async fn send_ap2(&self, packet: TimedPacket) -> super::ingress::IngressResult {
+        self.ingress.send(packet).await
+    }
+
+    /// Send a command to the service task.
+    fn send_cmd(&self, cmd: PlayoutCommand) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    /// Start the transport.
+    pub fn start(&self) {
+        self.send_cmd(PlayoutCommand::Start);
+    }
+
+    /// Pause the transport.
+    pub fn pause(&self) {
+        self.send_cmd(PlayoutCommand::Pause);
+    }
+
+    /// Resume from pause.
+    pub fn resume(&self) {
+        self.send_cmd(PlayoutCommand::Resume);
+    }
+
+    /// Flush the audio FIFO and re-prime.
+    pub fn flush(&self) {
+        self.send_cmd(PlayoutCommand::Flush);
+    }
+
+    /// Stop the transport.
+    pub fn stop(&self) {
+        self.send_cmd(PlayoutCommand::Stop);
+    }
+
+    /// Request graceful shutdown of the service task.
+    pub fn shutdown(&self) {
+        self.send_cmd(PlayoutCommand::Shutdown);
+    }
+
+    /// Snapshot the latest scheduler status.
+    pub fn status(&self) -> SchedulerStatus {
+        self.status.read().clone()
+    }
+}
+
+/// Spawn a playout service that owns and drives a [`SchedulerCore`].
+///
+/// Production entry point.  Takes an [`AudioEngine`] and wraps it in
+/// an [`AudioEngineSink`] internally.  Returns a cloneable
+/// [`PlayoutHandle`] and the task's [`JoinHandle<()>`].
+///
+/// The handle provides packet submission and lifecycle commands; the
+/// task serializes all decoder access, packet insertion, and PCM
+/// production.
+///
+/// The task ticks every 2 ms (with [`MissedTickBehavior::Skip`]).  On
+/// each packet arrival or tick it calls `process_ready` repeatedly
+/// (bounded at 64 blocks), then `observe_fifo`, and publishes the
+/// latest status.
+///
+/// When all [`IngressSender`] clones are dropped the task continues to
+/// service commands and ticks until either a [`PlayoutCommand::Shutdown`]
+/// is received or the command channel closes.
+pub fn spawn_playout_service<D>(
+    config: SchedulerConfig,
+    decoder: D,
+    audio_engine: AudioEngine,
+) -> (PlayoutHandle, JoinHandle<()>)
+where
+    D: PacketDecoder + Send + 'static,
+{
+    let sink = AudioEngineSink::new(audio_engine);
+    spawn_playout_service_with_sink(config, decoder, sink)
+}
+
+/// Internal helper: spawn the playout service with an explicit
+/// [`PcmSink`].  Used by production via [`spawn_playout_service`]
+/// and by tests that substitute a fake sink.
+fn spawn_playout_service_with_sink<D, S>(
+    config: SchedulerConfig,
+    decoder: D,
+    sink: S,
+) -> (PlayoutHandle, JoinHandle<()>)
+where
+    D: PacketDecoder + Send + 'static,
+    S: PcmSink + Send + 'static,
+{
+    let (ingress_tx, ingress_rx) = packet_ingress();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PlayoutCommand>();
+
+    // Build the core once and snapshot its initial status (reflects
+    // any prequeued data in the sink).
+    let core = SchedulerCore::new(config.clone(), decoder, sink);
+    let initial_status = core.status();
+
+    let status = Arc::new(RwLock::new(initial_status));
+
+    let handle = PlayoutHandle {
+        ingress: ingress_tx,
+        cmd_tx,
+        status: Arc::clone(&status),
+    };
+
+    let join_handle = tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status));
+
+    (handle, join_handle)
+}
+
+/// The main async task that owns and drives the scheduler.
+async fn playout_task<D, S>(
+    mut core: SchedulerCore<D, S>,
+    mut ingress_rx: IngressReceiver,
+    mut cmd_rx: mpsc::UnboundedReceiver<PlayoutCommand>,
+    status: Arc<RwLock<SchedulerStatus>>,
+) where
+    D: PacketDecoder + Send + 'static,
+    S: PcmSink + Send + 'static,
+{
+    let mut ticker = tokio::time::interval(Duration::from_millis(2));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Whether all ingress senders have been dropped.
+    let mut ingress_closed = false;
+
+    loop {
+        // Process any pending commands first, then wait for either a
+        // packet, a command, or the next tick.
+        let tick_fut = ticker.tick();
+
+        tokio::select! {
+            biased;
+
+            // ── commands (highest priority) ──────────────────────
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(PlayoutCommand::Shutdown) | None => break,
+                    Some(cmd) => {
+                        apply_command(&mut core, cmd);
+                        *status.write() = core.status();
+                        continue; // re-loop to drain any queued commands
+                    }
+                }
+            }
+
+            // ── packets ──────────────────────────────────────────
+            packet = ingress_rx.recv(), if !ingress_closed => {
+                match packet {
+                    Some(pkt) => {
+                        core.insert_packet(pkt);
+                    }
+                    None => {
+                        // All senders dropped — stop polling the ingress.
+                        ingress_closed = true;
+                    }
+                }
+                // Fall through to tick processing below.
+            }
+
+            // ── tick ─────────────────────────────────────────────
+            _ = tick_fut => {}
+        }
+
+        // After any event (packet or tick), drive the scheduler.
+        drive_scheduler(&mut core, &status);
+    }
+}
+
+/// Apply a single command to the scheduler core.
+fn apply_command<D: PacketDecoder, S: PcmSink>(
+    core: &mut SchedulerCore<D, S>,
+    cmd: PlayoutCommand,
+) {
+    match cmd {
+        PlayoutCommand::Start => core.start(),
+        PlayoutCommand::Pause => core.pause(),
+        PlayoutCommand::Resume => core.resume(),
+        PlayoutCommand::Flush => core.flush(),
+        PlayoutCommand::Stop => core.stop(),
+        PlayoutCommand::Shutdown => {} // handled at the select level
+    }
+}
+
+/// Drive `process_ready` (up to 64 blocks), then `observe_fifo`, then
+/// publish the latest status.
+fn drive_scheduler<D: PacketDecoder, S: PcmSink>(
+    core: &mut SchedulerCore<D, S>,
+    status: &Arc<RwLock<SchedulerStatus>>,
+) {
+    for _ in 0..64 {
+        if core.process_ready(std::time::Instant::now()) == 0 {
+            break;
+        }
+    }
+    core.observe_fifo();
+    *status.write() = core.status();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1678,6 +1939,9 @@ mod tests {
         conceal_count: usize,
         reset_count: usize,
         last_concealed_seq: Option<u64>,
+        /// Optional shared log: each successful decode pushes the
+        /// packet's extended sequence number (used by reorder tests).
+        decode_log: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>>,
     }
 
     impl FakeDecoder {
@@ -1692,7 +1956,13 @@ mod tests {
                 conceal_count: 0,
                 reset_count: 0,
                 last_concealed_seq: None,
+                decode_log: None,
             }
+        }
+
+        fn with_decode_log(mut self, log: std::sync::Arc<std::sync::Mutex<Vec<u64>>>) -> Self {
+            self.decode_log = Some(log);
+            self
         }
     }
 
@@ -1709,6 +1979,9 @@ mod tests {
             }
             self.decode_count += 1;
             let seq = packet.extended_sequence;
+            if let Some(ref log) = self.decode_log {
+                log.lock().unwrap().push(seq);
+            }
             let sample_count = self.frames_per_packet * self.channels as usize;
             Ok(DecodedAudio {
                 samples: vec![seq as f32; sample_count],
@@ -2564,5 +2837,463 @@ mod tests {
 
         // No overflow.
         assert_eq!(engine.status().producer_overflow_samples, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Playout-service async tests
+    // ═══════════════════════════════════════════════════════════════
+
+    /// A `Send` but `!Sync` decoder to verify that the service task
+    /// does not require `Sync` — only exclusive `Send` ownership.
+    struct NonSyncDecoder {
+        _marker: std::cell::Cell<()>,
+    }
+
+    impl NonSyncDecoder {
+        fn new() -> Self {
+            Self {
+                _marker: std::cell::Cell::new(()),
+            }
+        }
+    }
+
+    impl PacketDecoder for NonSyncDecoder {
+        fn reset(&mut self) {}
+        fn decode(&mut self, _packet: &TimedPacket) -> anyhow::Result<DecodedAudio> {
+            Ok(DecodedAudio {
+                samples: vec![0.0f32; 2],
+                sample_rate: 44100,
+                channels: 2,
+            })
+        }
+        fn conceal_missing(
+            &mut self,
+            _expected_sequence: u64,
+            _last_packet: Option<&TimedPacket>,
+        ) -> anyhow::Result<DecodedAudio> {
+            Ok(DecodedAudio {
+                samples: vec![0.0f32; 2],
+                sample_rate: 44100,
+                channels: 2,
+            })
+        }
+    }
+
+    // Cell<()> is Send but not Sync — verifies the service only needs Send.
+
+    /// Helper: spawn a real service and return the handle + a oneshot
+    /// for the task result.
+    async fn spawn_test_service() -> (PlayoutHandle, tokio::sync::oneshot::Receiver<()>) {
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+
+        let (handle, join_handle) = spawn_playout_service_with_sink(cfg, decoder, sink);
+
+        // Wrap the JoinHandle into a oneshot for convenient test
+        // checking.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = join_handle.await;
+            let _ = tx.send(());
+        });
+
+        // Give the service a tick to settle.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        (handle, rx)
+    }
+
+    // ── command lifecycle / status ───────────────────────────────
+
+    #[tokio::test]
+    async fn service_command_lifecycle() {
+        let (handle, _rx) = spawn_test_service().await;
+
+        // Initial state: Stopped.
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Stopped);
+
+        // Start → Priming.
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Priming);
+
+        // Stop → Stopped.
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Stopped);
+
+        // Start again, then pause.
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.pause();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Paused);
+
+        // Resume.
+        handle.resume();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = handle.status();
+        assert!(matches!(
+            s.state,
+            PlayoutState::Priming | PlayoutState::Playing
+        ));
+
+        // Flush.
+        handle.flush();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Priming);
+
+        // Stop and shutdown.
+        handle.stop();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        handle.shutdown();
+
+        // Task should exit.
+        let _ = _rx.await;
+    }
+
+    // ── AP1 try_send bounded / nonblocking ───────────────────────
+
+    #[tokio::test]
+    async fn ap1_try_send_bounded_nonblocking() {
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+
+        // Create with a very small internal channel capacity.
+        // We'll replace the default ingress with a custom one.
+        let (ingress_tx, ingress_rx) = crate::playout::ingress::packet_ingress_with_capacity(2);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(SchedulerStatus {
+            state: PlayoutState::Stopped,
+            jitter: Default::default(),
+            diag: SchedulerDiagnostics::default(),
+            queued_ms: 0,
+            has_pending_block: false,
+            pending_block_frames: 0,
+            expected_sequence: 0,
+        }));
+
+        let handle = PlayoutHandle {
+            ingress: ingress_tx,
+            cmd_tx,
+            status: Arc::clone(&status),
+        };
+
+        let join_handle = {
+            let core = SchedulerCore::new(cfg, decoder, sink);
+            tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status))
+        };
+
+        // Fill the 2-slot channel.
+        let pkt = seq_packet(0);
+        assert_eq!(
+            handle.try_send_ap1(pkt.clone()),
+            crate::playout::ingress::IngressResult::Accepted
+        );
+        assert_eq!(
+            handle.try_send_ap1(pkt.clone()),
+            crate::playout::ingress::IngressResult::Accepted
+        );
+        // Third send: channel is full.
+        assert_eq!(
+            handle.try_send_ap1(pkt.clone()),
+            crate::playout::ingress::IngressResult::Full
+        );
+
+        // Let the service drain the channel.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Now there should be room again.
+        let result = handle.try_send_ap1(pkt);
+        assert_eq!(result, crate::playout::ingress::IngressResult::Accepted);
+
+        handle.shutdown();
+        let _ = join_handle.await;
+    }
+
+    // ── AP2 send backpressure ────────────────────────────────────
+
+    #[tokio::test]
+    async fn ap2_send_backpressure() {
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+
+        let (ingress_tx, ingress_rx) = crate::playout::ingress::packet_ingress_with_capacity(1);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(SchedulerStatus {
+            state: PlayoutState::Stopped,
+            jitter: Default::default(),
+            diag: SchedulerDiagnostics::default(),
+            queued_ms: 0,
+            has_pending_block: false,
+            pending_block_frames: 0,
+            expected_sequence: 0,
+        }));
+
+        let handle = PlayoutHandle {
+            ingress: ingress_tx,
+            cmd_tx,
+            status: Arc::clone(&status),
+        };
+
+        // Fill the 1-slot channel before spawning the service so the
+        // service hasn't started draining yet.
+        let pkt = seq_packet(0);
+        assert_eq!(
+            handle.ingress.try_send(pkt.clone()),
+            crate::playout::ingress::IngressResult::Accepted
+        );
+
+        // Spawn a task that tries to send — it should block because the
+        // channel is full and the service hasn't been spawned yet.
+        let handle2 = handle.clone();
+        let pkt2 = seq_packet(1);
+        let send_task = tokio::spawn(async move { handle2.send_ap2(pkt2).await });
+
+        // The send should not complete within 10 ms.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !send_task.is_finished(),
+            "send_ap2 should block when channel is full"
+        );
+
+        // Now spawn the service which will drain the channel.
+        let join_handle = {
+            let core = SchedulerCore::new(cfg, decoder, sink);
+            tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status))
+        };
+
+        // The send should now complete (service drains the slot).
+        let result = tokio::time::timeout(Duration::from_secs(2), send_task).await;
+        assert!(
+            result.is_ok(),
+            "send_ap2 should complete after service drains the channel"
+        );
+        let ingress_result = result.unwrap().unwrap();
+        assert_eq!(
+            ingress_result,
+            crate::playout::ingress::IngressResult::Accepted
+        );
+
+        handle.shutdown();
+        let _ = join_handle.await;
+    }
+
+    #[tokio::test]
+    async fn ap2_send_returns_closed_when_receiver_dropped() {
+        let (tx, rx) = crate::playout::ingress::packet_ingress_with_capacity(4);
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(SchedulerStatus {
+            state: PlayoutState::Stopped,
+            jitter: Default::default(),
+            diag: SchedulerDiagnostics::default(),
+            queued_ms: 0,
+            has_pending_block: false,
+            pending_block_frames: 0,
+            expected_sequence: 0,
+        }));
+        let handle = PlayoutHandle {
+            ingress: tx,
+            cmd_tx,
+            status,
+        };
+
+        // Drop the receiver so the channel is closed.
+        drop(rx);
+
+        let result = handle.send_ap2(seq_packet(0)).await;
+        assert_eq!(result, crate::playout::ingress::IngressResult::Closed);
+    }
+
+    // ── Reordered packets decoded by service ─────────────────────
+
+    #[tokio::test]
+    async fn reordered_packets_decoded_in_order() {
+        use std::sync::{Arc, Mutex};
+
+        let cfg = sched_test_config();
+        let decode_log = Arc::new(Mutex::new(Vec::new()));
+        let decoder = FakeDecoder::new(1, 1000, 1).with_decode_log(Arc::clone(&decode_log));
+        let mut sink = FakeSink::new();
+        // Disable gate so we can observe the decoded output immediately.
+        sink.gate = true;
+
+        let (ingress_tx, ingress_rx) = crate::playout::ingress::packet_ingress_with_capacity(16);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(SchedulerStatus {
+            state: PlayoutState::Stopped,
+            jitter: Default::default(),
+            diag: SchedulerDiagnostics::default(),
+            queued_ms: 0,
+            has_pending_block: false,
+            pending_block_frames: 0,
+            expected_sequence: 0,
+        }));
+
+        let handle = PlayoutHandle {
+            ingress: ingress_tx,
+            cmd_tx,
+            status: Arc::clone(&status),
+        };
+
+        let join_handle = {
+            let core = SchedulerCore::new(cfg.clone(), decoder, sink);
+            tokio::spawn(playout_task(core, ingress_rx, cmd_rx, Arc::clone(&status)))
+        };
+
+        // Start the transport.
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Insert packets 10, 12, 11 out of order.
+        handle.try_send_ap1(seq_packet(10));
+        handle.try_send_ap1(seq_packet(12));
+        handle.try_send_ap1(seq_packet(11));
+
+        // Give the service time to process.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify exact decode order: 10, 11, 12.
+        {
+            let log = decode_log.lock().unwrap();
+            assert_eq!(
+                *log,
+                vec![10, 11, 12],
+                "reordered packets must decode in sequence order"
+            );
+        } // drop MutexGuard before awaiting
+
+        handle.shutdown();
+        let _ = join_handle.await;
+    }
+
+    // ── Shutdown exits ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_exits_service() {
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let (handle, join_handle) = spawn_playout_service_with_sink(cfg, decoder, sink);
+
+        // Verify the task is running (status is accessible).
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Stopped);
+
+        handle.shutdown();
+        let result = tokio::time::timeout(Duration::from_secs(2), join_handle).await;
+        assert!(result.is_ok(), "service task should exit after shutdown");
+    }
+
+    // ── Non-Sync decoder is accepted ─────────────────────────────
+
+    #[tokio::test]
+    async fn non_sync_decoder_accepted_by_service() {
+        let cfg = sched_test_config();
+        let decoder = NonSyncDecoder::new();
+        let sink = FakeSink::new();
+        let (handle, join_handle) = spawn_playout_service_with_sink(cfg, decoder, sink);
+
+        let s = handle.status();
+        assert_eq!(s.state, PlayoutState::Stopped);
+
+        handle.shutdown();
+        let _ = join_handle.await;
+    }
+
+    // ── All ingress senders close, service continues command handling ─
+
+    /// Verify the task remains alive and responsive to commands after
+    /// every ingress sender is dropped, and only exits on Shutdown.
+    #[tokio::test]
+    async fn service_continues_after_ingress_senders_close() {
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+
+        // Construct channels directly so we can drop the ingress
+        // sender independently of the command channel.
+        let (ingress_tx, ingress_rx) = packet_ingress();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PlayoutCommand>();
+
+        // Build the core once and snapshot initial status.
+        let core = SchedulerCore::new(cfg, decoder, sink);
+        let initial_status = core.status();
+        let status = Arc::new(RwLock::new(initial_status));
+
+        let join_handle = tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status.clone()));
+
+        // Drop the only ingress sender — task must stay alive.
+        drop(ingress_tx);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Send Start through cmd_tx — task must process it.
+        let _ = cmd_tx.send(PlayoutCommand::Start);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = status.read().clone();
+        assert_eq!(
+            s.state,
+            PlayoutState::Priming,
+            "task must transition to Priming after Start even with no ingress senders"
+        );
+
+        // Send Stop — task must process it.
+        let _ = cmd_tx.send(PlayoutCommand::Stop);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s = status.read().clone();
+        assert_eq!(
+            s.state,
+            PlayoutState::Stopped,
+            "task must transition to Stopped after Stop even with no ingress senders"
+        );
+
+        // Task must still be alive (not exited).
+        assert!(
+            !join_handle.is_finished(),
+            "task must remain alive after ingress senders close"
+        );
+
+        // Shutdown must exit the task cleanly.
+        let _ = cmd_tx.send(PlayoutCommand::Shutdown);
+        let result = tokio::time::timeout(Duration::from_secs(2), join_handle).await;
+        assert!(result.is_ok(), "service task should exit after Shutdown");
+    }
+
+    // ── Initial status from prequeued AudioEngine data ──────────
+
+    #[tokio::test]
+    async fn initial_status_reflects_prequeued_audio_engine_data() {
+        use crate::audio::AudioEngine;
+
+        let cfg = sched_test_config();
+        let decoder = FakeDecoder::new(352, 44100, 2);
+
+        // Create an AudioEngine with some prequeued data.
+        let (engine, _consumer) = AudioEngine::new(32_768);
+        engine.set_output_format(44100, 2);
+        let prequeued = vec![0.25f32; 44100 * 2 / 10]; // 100 ms of stereo 44.1 kHz
+        let (_, accepted) = engine.try_enqueue_output_frames_all_or_nothing(&prequeued, true);
+        assert!(accepted > 0, "prequeued data must be accepted");
+
+        let (handle, join_handle) = spawn_playout_service(cfg, decoder, engine);
+
+        // Initial status must reflect the prequeued ms.
+        let s = handle.status();
+        assert!(
+            s.queued_ms > 0,
+            "initial queued_ms must reflect prequeued AudioEngine data, got {}",
+            s.queued_ms
+        );
+        assert_eq!(s.state, PlayoutState::Stopped);
+
+        handle.shutdown();
+        let _ = join_handle.await;
     }
 }
