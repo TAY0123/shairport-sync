@@ -47,6 +47,14 @@ pub struct AudioEngine {
     resampler_cache: Arc<Mutex<codec::ResamplerCache>>,
     volume_gain_bits: Arc<AtomicU32>,
     playback_enabled: Arc<AtomicBool>,
+    /// Cumulative samples written as silence in the output callback due to ring-buffer underrun.
+    callback_underrun_samples: Arc<AtomicUsize>,
+    /// Cumulative samples the producer could not push because the ring buffer was full.
+    producer_overflow_samples: Arc<AtomicUsize>,
+    /// Number of times the output buffer was cleared (flush events).
+    flush_count: Arc<AtomicUsize>,
+    /// Maximum observed value of queued_samples (peak occupancy in samples).
+    max_observed_occupancy: Arc<AtomicUsize>,
 }
 
 pub struct AudioOutput {
@@ -58,10 +66,29 @@ pub struct AudioOutput {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AudioEngineStatus {
+    // ---- existing fields (preserved for API compatibility) ----
     pub queued_samples: usize,
     pub capacity_samples: usize,
     pub output_sample_rate: u32,
     pub output_channels: u16,
+
+    // ---- derived convenience fields ----
+    /// queued_samples / output_channels (0 when channels is 0)
+    pub queued_frames: usize,
+    /// queued_samples duration in milliseconds at the output rate
+    pub queued_ms: u64,
+    /// capacity_samples / output_channels (0 when channels is 0)
+    pub capacity_frames: usize,
+    /// capacity_samples duration in milliseconds at the output rate
+    pub capacity_ms: u64,
+
+    // ---- diagnostic counters ----
+    pub callback_underrun_samples: usize,
+    pub callback_underrun_frames: usize,
+    pub producer_overflow_samples: usize,
+    pub producer_overflow_frames: usize,
+    pub flush_count: u64,
+    pub max_observed_occupancy: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -262,6 +289,10 @@ impl AudioEngine {
             resampler_cache: Arc::new(Mutex::new(codec::ResamplerCache::new())),
             volume_gain_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             playback_enabled: Arc::new(AtomicBool::new(true)),
+            callback_underrun_samples: Arc::new(AtomicUsize::new(0)),
+            producer_overflow_samples: Arc::new(AtomicUsize::new(0)),
+            flush_count: Arc::new(AtomicUsize::new(0)),
+            max_observed_occupancy: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -348,7 +379,25 @@ impl AudioEngine {
             .copied()
             .take_while(|sample| producer.try_push(*sample).is_ok())
             .count();
-        self.queued_samples.fetch_add(pushed, Ordering::Release);
+        let overflow = samples.len() - pushed;
+        if overflow > 0 {
+            self.producer_overflow_samples
+                .fetch_add(overflow, Ordering::Release);
+        }
+        let new_occupancy = self.queued_samples.fetch_add(pushed, Ordering::Release) + pushed;
+        // Track max observed occupancy (best-effort, not strictly monotonic under races)
+        let mut prev = self.max_observed_occupancy.load(Ordering::Acquire);
+        while new_occupancy > prev {
+            match self.max_observed_occupancy.compare_exchange_weak(
+                prev,
+                new_occupancy,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => prev = current,
+            }
+        }
         pushed
     }
 
@@ -364,14 +413,22 @@ impl AudioEngine {
         let gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
         let mut consumer = self.consumer.lock();
         let mut filled = 0;
+        let mut underrun = 0usize;
         for sample in output.iter_mut() {
             match consumer.try_pop() {
                 Some(value) => {
                     *sample = value * gain;
                     filled += 1;
                 }
-                None => *sample = 0.0,
+                None => {
+                    *sample = 0.0;
+                    underrun += 1;
+                }
             }
+        }
+        if underrun > 0 {
+            self.callback_underrun_samples
+                .fetch_add(underrun, Ordering::Release);
         }
         if filled > 0 {
             self.queued_samples.fetch_sub(filled, Ordering::Release);
@@ -392,14 +449,22 @@ impl AudioEngine {
         let gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
         let mut consumer = self.consumer.lock();
         let mut filled = 0;
+        let mut underrun = 0usize;
         for sample in output.iter_mut() {
             match consumer.try_pop() {
                 Some(value) => {
                     *sample = T::from_sample(value * gain);
                     filled += 1;
                 }
-                None => *sample = T::from_sample(0.0),
+                None => {
+                    *sample = T::from_sample(0.0);
+                    underrun += 1;
+                }
             }
+        }
+        if underrun > 0 {
+            self.callback_underrun_samples
+                .fetch_add(underrun, Ordering::Release);
         }
         if filled > 0 {
             self.queued_samples.fetch_sub(filled, Ordering::Release);
@@ -411,15 +476,38 @@ impl AudioEngine {
         let mut consumer = self.consumer.lock();
         while consumer.try_pop().is_some() {}
         self.queued_samples.store(0, Ordering::Release);
+        self.flush_count.fetch_add(1, Ordering::Release);
     }
 
     pub fn status(&self) -> AudioEngineStatus {
         let output_format = *self.output_format.lock();
+        let channels = output_format.channels.max(1) as usize;
+        let rate = output_format.sample_rate.max(1) as u64;
+        let queued = self.queued_samples.load(Ordering::Acquire);
+        let capacity = self.capacity;
+        let und_run = self.callback_underrun_samples.load(Ordering::Acquire);
+        let over = self.producer_overflow_samples.load(Ordering::Acquire);
+        let flushes = self.flush_count.load(Ordering::Acquire) as u64;
+        let max_occ = self.max_observed_occupancy.load(Ordering::Acquire);
+
+        let ms_from_samples =
+            |samples: usize| -> u64 { (samples as u64 * 1000) / (channels as u64 * rate) };
+
         AudioEngineStatus {
-            queued_samples: self.queued_samples.load(Ordering::Acquire),
-            capacity_samples: self.capacity,
+            queued_samples: queued,
+            capacity_samples: capacity,
             output_sample_rate: output_format.sample_rate,
             output_channels: output_format.channels,
+            queued_frames: queued / channels,
+            queued_ms: ms_from_samples(queued),
+            capacity_frames: capacity / channels,
+            capacity_ms: ms_from_samples(capacity),
+            callback_underrun_samples: und_run,
+            callback_underrun_frames: und_run / channels,
+            producer_overflow_samples: over,
+            producer_overflow_frames: over / channels,
+            flush_count: flushes,
+            max_observed_occupancy: max_occ,
         }
     }
 }
@@ -497,9 +585,40 @@ fn host_to_cpal(host: AudioHostName) -> Option<cpal::HostId> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test-only helpers exposed to the test module below.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+impl AudioEngine {
+    /// Return the actual ring-buffer occupancy via the ringbuf `Observer` trait.
+    /// This is the ground-truth value that `queued_samples` SHOULD match.
+    fn ring_occupied_len(&self) -> usize {
+        use ringbuf::traits::Observer;
+        self.consumer.lock().occupied_len()
+    }
+
+    /// Directly overwrite the queued_samples counter (used to simulate the
+    /// unconditional store(0) in clear_output_samples).
+    fn set_queued_samples(&self, value: usize) {
+        self.queued_samples.store(value, Ordering::Release);
+    }
+
+    /// Drain the consumer ring buffer without touching the queued_samples
+    /// counter (used to simulate the first half of clear_output_samples).
+    fn drain_consumer_silently(&self) {
+        let mut consumer = self.consumer.lock();
+        while consumer.try_pop().is_some() {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::Player;
+
+    // ---------------------------------------------------------------------------
+    // Existing tests (preserved)
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn audio_engine_preserves_sample_order_and_zeros_underrun() {
@@ -551,5 +670,320 @@ mod tests {
         let mut out = [9.0; 8];
         engine.fill_output(&mut out);
         assert_eq!(out, [1.0, -1.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0]);
+    }
+
+    // ---------------------------------------------------------------------------
+    // New metric tests — non-failing, run with the normal test suite
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn status_derived_fields_match_output_format() {
+        // 48000 Hz stereo → each frame = 2 samples, ~0.0208 ms per sample
+        let engine = AudioEngine::new(960); // 480 frames = 10 ms
+        engine.set_output_format(48_000, 2);
+        engine.enqueue_interleaved(&[1.0; 480]); // 480 samples = 240 frames = 5 ms
+
+        let s = engine.status();
+        assert_eq!(s.output_sample_rate, 48_000);
+        assert_eq!(s.output_channels, 2);
+        assert_eq!(s.queued_samples, 480);
+        assert_eq!(s.queued_frames, 240);
+        assert_eq!(s.queued_ms, 5); // 480 samples / 2 ch / 48000 * 1000 = 5
+        assert_eq!(s.capacity_samples, 960);
+        assert_eq!(s.capacity_frames, 480);
+        assert_eq!(s.capacity_ms, 10); // 960 / 2 / 48000 * 1000 = 10
+    }
+
+    #[test]
+    fn status_derived_fields_zero_when_empty() {
+        let engine = AudioEngine::new(512);
+        engine.set_output_format(44_100, 2);
+        let s = engine.status();
+        assert_eq!(s.queued_samples, 0);
+        assert_eq!(s.queued_frames, 0);
+        assert_eq!(s.queued_ms, 0);
+        assert_eq!(s.capacity_ms, 5); // 512/2/44100*1000 = trunc(5.80) = 5
+    }
+
+    #[test]
+    fn status_derived_handles_mono_output() {
+        let engine = AudioEngine::new(441); // 10 ms at 44100 Hz mono
+        engine.set_output_format(44_100, 1);
+        engine.enqueue_interleaved(&[1.0; 441]);
+
+        let s = engine.status();
+        assert_eq!(s.queued_frames, 441);
+        assert_eq!(s.queued_ms, 10); // 441/1/44100*1000 = 10
+        assert_eq!(s.capacity_frames, 441);
+        assert_eq!(s.capacity_ms, 10);
+    }
+
+    #[test]
+    fn callback_underrun_counter_increments_on_empty_buffer() {
+        let engine = AudioEngine::new(8);
+        engine.set_output_format(48_000, 2);
+
+        // Nothing enqueued — all output slots are underruns.
+        let mut out = [0.0f32; 4];
+        engine.fill_output(&mut out);
+        assert_eq!(engine.status().callback_underrun_samples, 4);
+        assert_eq!(engine.status().callback_underrun_frames, 2);
+
+        // Second call accumulates.
+        let mut out2 = [0.0f32; 6];
+        engine.fill_output(&mut out2);
+        assert_eq!(engine.status().callback_underrun_samples, 10);
+    }
+
+    #[test]
+    fn callback_underrun_only_counts_playback_enabled() {
+        let engine = AudioEngine::new(8);
+        engine.set_playback_enabled(false);
+        let mut out = [0.0f32; 4];
+        engine.fill_output(&mut out);
+        // Zeros produced because playback was disabled, not because of underrun.
+        assert_eq!(engine.status().callback_underrun_samples, 0);
+    }
+
+    #[test]
+    fn producer_overflow_counter_increments_on_full_buffer() {
+        let engine = AudioEngine::new(4);
+        engine.set_output_format(48_000, 2);
+        // Fill completely.
+        assert_eq!(engine.enqueue_output_samples(&[0.5; 4]), 4);
+        // Try to push more — everything overflows.
+        assert_eq!(engine.enqueue_output_samples(&[0.5; 10]), 0);
+        assert_eq!(engine.status().producer_overflow_samples, 10);
+        assert_eq!(engine.status().producer_overflow_frames, 5);
+    }
+
+    #[test]
+    fn producer_overflow_partial_push_counts_remainder() {
+        let engine = AudioEngine::new(5);
+        // 3 fit, 4 overflow.
+        assert_eq!(engine.enqueue_output_samples(&[0.1; 7]), 5);
+        assert_eq!(engine.status().producer_overflow_samples, 2);
+    }
+
+    #[test]
+    fn flush_counter_increments_on_clear() {
+        let engine = AudioEngine::new(8);
+        engine.enqueue_interleaved(&[1.0; 4]);
+        engine.clear_output_samples();
+        assert_eq!(engine.status().flush_count, 1);
+        engine.clear_output_samples();
+        assert_eq!(engine.status().flush_count, 2);
+    }
+
+    #[test]
+    fn max_occupancy_tracks_peak() {
+        let engine = AudioEngine::new(100);
+        engine.set_output_format(48_000, 2);
+
+        engine.enqueue_output_samples(&[0.1; 30]);
+        assert_eq!(engine.status().max_observed_occupancy, 30);
+
+        engine.enqueue_output_samples(&[0.1; 50]);
+        assert_eq!(engine.status().max_observed_occupancy, 80);
+
+        // Drain some, then push less — peak should stay at 80.
+        let mut out = [0.0f32; 40];
+        engine.fill_output(&mut out);
+        engine.enqueue_output_samples(&[0.1; 10]);
+        assert_eq!(engine.status().max_observed_occupancy, 80);
+    }
+
+    #[test]
+    fn status_serde_roundtrip_preserves_all_fields() {
+        let engine = AudioEngine::new(1024);
+        engine.set_output_format(96_000, 6);
+        engine.enqueue_output_samples(&[0.5; 300]);
+        let mut out = [0.0f32; 64];
+        engine.fill_output(&mut out); // underrun: 300 enqueued, 64 drained
+        engine.clear_output_samples();
+
+        let s = engine.status();
+        let json = serde_json::to_string(&s).expect("serialize");
+        let roundtripped: AudioEngineStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(s, roundtripped);
+        // Spot-check a few derived fields.
+        assert_eq!(roundtripped.queued_frames, s.queued_frames);
+        assert_eq!(roundtripped.queued_ms, s.queued_ms);
+        assert_eq!(roundtripped.flush_count, 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Known-defect tests — #[ignore] with precise reason strings.
+    // These document current behaviour that is intentionally left unchanged
+    // in Phase 0 (diagnostics only).
+    // ---------------------------------------------------------------------------
+
+    /// The occupancy counter can diverge when enqueue and clear interleave:
+    /// `clear_output_samples()` drains the consumer under one mutex while the
+    /// producer can concurrently push under a separate mutex, and the final
+    /// `store(0)` unconditionally overwrites any concurrent increment.
+    ///
+    /// This test uses a deterministic three-step interleaving to simulate the
+    /// race without threads or timing loops:
+    ///   1. Drain the consumer silently (no counter change).
+    ///   2. Push more samples through the producer (counter increments).
+    ///   3. Apply the unconditional store(0) that `clear_output_samples` does.
+    ///
+    /// After these steps, the counter claims 0 but the ring buffer still holds
+    /// the samples from step 2.  We detect the divergence by comparing the
+    /// counter against `ring_occupied_len()` (the ground truth from the
+    /// ringbuf Observer).
+    #[test]
+    #[ignore = "bug: queued_samples can diverge after interleaved enqueue/clear due to separate producer/consumer locks and unconditional store(0)"]
+    fn occupancy_diverges_after_enqueue_clear_interleaving() {
+        let engine = AudioEngine::new(1024);
+        engine.enqueue_output_samples(&[1.0; 500]);
+
+        // Step 1: drain consumer without touching the counter
+        // (this is the first half of clear_output_samples).
+        engine.drain_consumer_silently();
+
+        // Step 2: a concurrent push arrives before the store(0)
+        // — exactly the interleaving that causes the divergence.
+        let pushed = engine.enqueue_output_samples(&[2.0; 200]);
+        assert_eq!(
+            pushed, 200,
+            "all 200 samples should fit in the now-empty ring"
+        );
+
+        // Step 3: the unconditional store(0) from clear_output_samples
+        // clobbers the increment from step 2.
+        engine.set_queued_samples(0);
+
+        // The counter now reports 0, but the ring buffer actually holds
+        // the 200 samples pushed in step 2.
+        let counter = engine.status().queued_samples;
+        let actual = engine.ring_occupied_len();
+        assert_eq!(
+            counter, actual,
+            "BUG: queued_samples counter ({counter}) diverged from actual ring \
+             occupancy ({actual}) after interleaved enqueue/clear. \
+             The store(0) in clear_output_samples clobbered a concurrent increment."
+        );
+    }
+
+    /// `enqueue_output_samples` operates on individual f32 samples, not audio
+    /// frames. When the output is stereo an odd-length slice produces a
+    /// dangling half-frame that the consumer reads as a lone left-channel
+    /// sample followed by zero (underrun) for the right channel.
+    ///
+    /// Desired frame-safe invariant: for stereo output (2 channels), every
+    /// enqueued sample count must be even — no partial frame is ever accepted.
+    #[test]
+    #[ignore = "bug: sample-oriented enqueue accepts an odd number of samples, producing a partial stereo frame"]
+    fn enqueue_rejects_partial_stereo_frame() {
+        let engine = AudioEngine::new(16);
+        engine.set_output_format(48_000, 2);
+        // Push 3 samples (= 1.5 stereo frames). A frame-aware API would
+        // reject the odd sample or pad to an even count.
+        let pushed = engine.enqueue_output_samples(&[0.1, 0.2, 0.3]);
+        // Desired invariant: for 2-channel output the enqueued count is even.
+        assert_eq!(
+            pushed % 2,
+            0,
+            "frame-safe invariant: sample count ({pushed}) must be even for stereo output"
+        );
+        let s = engine.status();
+        assert_eq!(
+            s.queued_samples % 2,
+            0,
+            "frame-safe invariant: queued_samples ({}) must be even for stereo; \
+             odd count means a partial frame was accepted",
+            s.queued_samples
+        );
+    }
+
+    /// The `Player` struct has a fully implemented `pull_samples()` method,
+    /// but the audio output callback (`fill_output`) reads directly from the
+    /// `AudioEngine` ring buffer — it never calls `Player::pull_samples`.
+    /// The `Player` accumulates timing-aware frames from the RTP path but has
+    /// no consumer in the production audio pipeline.
+    ///
+    /// Sentinel: this test encodes a desired invariant that cannot be satisfied
+    /// until `Player::pull_samples` is wired into the audio output callback.
+    /// It asserts that after audio output consumption, the Player's
+    /// `total_frames_played` counter should advance.  Today, because
+    /// `fill_output` bypasses the Player entirely, the counter stays at 0.
+    #[test]
+    #[ignore = "bug: Player::pull_samples has no call site in the audio output callback; the Player fills independently and is never drained"]
+    fn player_not_integrated_with_audio_output() {
+        // Set up a Player with a buffered audio frame (simulating the RTP path).
+        let mut player = Player::new();
+        player.start(100);
+        player.push_frame(200, vec![0.8; 960], 48_000, 2);
+        assert_eq!(
+            player.status().buffered_frames,
+            1,
+            "precondition: Player has data"
+        );
+
+        // Create an AudioEngine — in the desired architecture the output
+        // callback would pull from the Player and feed the engine.
+        let engine = AudioEngine::new(2048);
+        engine.set_output_format(48_000, 2);
+
+        // The real output callback runs fill_output, which today pulls
+        // directly from the engine's ring buffer, bypassing the Player.
+        let mut out = [0.0f32; 480];
+        engine.fill_output(&mut out);
+
+        // Sentinel assertion: in a correctly integrated system,
+        // total_frames_played would have advanced because the output
+        // callback consumed audio from the Player.  Because fill_output
+        // ignores the Player, total_frames_played remains 0.
+        assert!(
+            player.status().total_frames_played > 0,
+            "SENTINEL: total_frames_played = {} — Player::pull_samples must be \
+             called from the audio output path.  Today fill_output reads the \
+             AudioEngine ring buffer directly, so the Player is never drained.",
+            player.status().total_frames_played
+        );
+    }
+
+    /// In the AP2 buffered-audio path, `handle_buffered_stream` enables audio
+    /// playback (`set_playback_enabled(true)`) as soon as the first decoded
+    /// block is successfully enqueued (via `enqueue_decoded_frame_for_later`).
+    /// This means the output callback can start pulling from a near-empty ring
+    /// buffer after a single packet, causing an immediate underrun burst.
+    ///
+    /// Desired priming invariant: playback should not be enabled until at least
+    /// `MIN_START_WATERMARK_MS` of audio is buffered.  One typical AP2 packet
+    /// (~704 samples at 48 kHz stereo ≈ 7.3 ms) is far below any reasonable
+    /// start watermark, so this test encodes the invariant and fails today.
+    #[test]
+    #[ignore = "bug: AP2 enables playback after only one decoded packet, before enough audio is buffered for glitch-free start"]
+    fn ap2_playback_prematurely_enabled_after_one_packet() {
+        // Simulate the enqueue_decoded_frame_for_later path: unchecked enqueue
+        // while playback is disabled (the waiting_for_title state).
+        let engine = AudioEngine::new(4096);
+        engine.set_playback_enabled(false);
+        engine.set_output_format(48_000, 2);
+
+        // One typical AP2 audio frame is ~352 frames × 2 channels = 704 samples.
+        let one_frame = vec![0.25; 704];
+        let pushed = engine.enqueue_output_samples_unchecked(&one_frame);
+        assert!(pushed > 0, "first frame was enqueued");
+
+        // Production code would then call set_playback_enabled(true) after
+        // just one successful enqueue.  Desired: only enable when enough
+        // audio is buffered to avoid immediate underruns.
+
+        let status = engine.status();
+
+        // Desired priming invariant: at least 20 ms of audio must be buffered
+        // before enabling playback.  One packet is ~7.3 ms — far below this.
+        const MIN_START_WATERMARK_MS: u64 = 20;
+        assert!(
+            status.queued_ms >= MIN_START_WATERMARK_MS,
+            "priming invariant: need ≥ {MIN_START_WATERMARK_MS} ms buffered \
+             before enabling playback, got only {:.1} ms from one packet. \
+             This causes immediate underrun bursts on the first callback.",
+            status.queued_ms as f64
+        );
     }
 }
