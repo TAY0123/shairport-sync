@@ -1032,8 +1032,7 @@ fn route_request(
                 .unwrap_or(false);
 
             if is_ap2 && config.airplay2_enabled {
-                handle_ap2_setup(config, state, session, request, audio_engine, playout, dacp)
-                    .with_cseq(request)
+                handle_ap2_setup(config, state, session, request, playout, dacp).with_cseq(request)
             } else if is_ap2 {
                 // AP2 plist but AP2 is disabled - respond with error
                 warn!("AP2 SETUP received but airplay2_enabled is false");
@@ -1504,7 +1503,7 @@ impl RtspSession {
     fn ensure_buffered_audio_listener(
         &mut self,
         state: &AppState,
-        audio_engine: &AudioEngine,
+        playout: &PlayoutHandle,
     ) -> anyhow::Result<u16> {
         if let Some(port) = self.buffered_audio_port {
             return Ok(port);
@@ -1530,7 +1529,7 @@ impl RtspSession {
         let handle = crate::airplay::buffered_audio::spawn_buffered_accept_loop(
             listener,
             state.clone(),
-            audio_engine.clone(),
+            playout.clone(),
         );
         self.buffered_audio_port = Some(port);
         self.buffered_audio_listener = Some(handle);
@@ -1572,7 +1571,6 @@ fn handle_ap2_setup(
     state: &AppState,
     session: &mut RtspSession,
     request: &RtspRequest,
-    audio_engine: &AudioEngine,
     playout: &PlayoutHandle,
     dacp: &DacpController,
 ) -> RtspResponse {
@@ -1651,14 +1649,13 @@ fn handle_ap2_setup(
                 }
                 103 => {
                     session.ap2_streams.push(Ap2StreamType::BufferedAudio);
-                    let data_port =
-                        match session.ensure_buffered_audio_listener(state, audio_engine) {
-                            Ok(port) => port,
-                            Err(e) => {
-                                warn!(%e, "failed to open AP2 buffered audio TCP socket");
-                                return response(503, "Service Unavailable");
-                            }
-                        };
+                    let data_port = match session.ensure_buffered_audio_listener(state, playout) {
+                        Ok(port) => port,
+                        Err(e) => {
+                            warn!(%e, "failed to open AP2 buffered audio TCP socket");
+                            return response(503, "Service Unavailable");
+                        }
+                    };
                     if let Some(plist::Value::Data(shk)) = stream.get("shk") {
                         state.set_diagnostic("ap2_shk_len", shk.len().to_string());
                         if shk.len() >= 32 {
@@ -3414,7 +3411,6 @@ mod tests {
             body,
         };
 
-        let (audio_engine, _consumer) = AudioEngine::new(1024);
         let dacp = DacpController::disabled(state.clone());
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let response = handle_ap2_setup(
@@ -3422,7 +3418,6 @@ mod tests {
             &state,
             &mut session,
             &request,
-            &audio_engine,
             &playout,
             &dacp,
         );

@@ -1677,9 +1677,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Known-defect tests — #[ignore] with precise reason strings.
-    // These document current behaviour that is intentionally left unchanged
-    // in earlier phases.
+    // Frame-safety and scheduler regression tests.
     // ---------------------------------------------------------------------------
 
     /// After Phase 2 frame-safe enqueue, odd-length input for stereo output
@@ -1758,46 +1756,122 @@ mod tests {
         assert_eq!(s2.late_frames_dropped, 0);
     }
 
-    /// In the AP2 buffered-audio path, `handle_buffered_stream` enables audio
-    /// playback (`set_playback_enabled(true)`) as soon as the first decoded
-    /// block is successfully enqueued (via `enqueue_decoded_frame_for_later`).
-    /// This means the output callback can start pulling from a near-empty ring
-    /// buffer after a single packet, causing an immediate underrun burst.
-    ///
-    /// Desired priming invariant: playback should not be enabled until at least
-    /// `MIN_START_WATERMARK_MS` of audio is buffered.  One typical AP2 packet
-    /// (~704 samples at 48 kHz stereo ≈ 7.3 ms) is far below any reasonable
-    /// start watermark, so this test encodes the invariant and fails today.
-    #[test]
-    #[ignore = "bug: AP2 enables playback after only one decoded packet, before enough audio is buffered for glitch-free start"]
-    fn ap2_playback_prematurely_enabled_after_one_packet() {
-        // Simulate the enqueue_decoded_frame_for_later path: unchecked enqueue
-        // while playback is disabled (the waiting_for_title state).
-        let (engine, _consumer) = AudioEngine::new(4096);
-        engine.set_playback_enabled(false);
-        engine.set_output_format(48_000, 2);
+    struct Ap2PrimingTestDecoder;
 
-        // One typical AP2 audio frame is ~352 frames × 2 channels = 704 samples.
-        let one_frame = vec![0.25; 704];
-        let pushed = engine.enqueue_output_samples_unchecked(&one_frame);
-        assert!(pushed > 0, "first frame was enqueued");
+    impl crate::playout::scheduler::PacketDecoder for Ap2PrimingTestDecoder {
+        fn reset(&mut self) {}
 
-        // Production code would then call set_playback_enabled(true) after
-        // just one successful enqueue.  Desired: only enable when enough
-        // audio is buffered to avoid immediate underruns.
+        fn decode(
+            &mut self,
+            _packet: &crate::playout::packet::TimedPacket,
+        ) -> anyhow::Result<crate::playout::scheduler::DecodedAudio> {
+            Ok(crate::playout::scheduler::DecodedAudio {
+                // 352 stereo frames at 48 kHz is about 7.3 ms.
+                samples: vec![0.25; 352 * 2],
+                sample_rate: 48_000,
+                channels: 2,
+            })
+        }
 
-        let status = engine.status();
+        fn conceal_missing(
+            &mut self,
+            _expected_sequence: u64,
+            _last_packet: Option<&crate::playout::packet::TimedPacket>,
+        ) -> anyhow::Result<crate::playout::scheduler::DecodedAudio> {
+            self.decode(&_last_packet.cloned().unwrap_or_else(|| {
+                crate::playout::packet::TimedPacket::new(
+                    crate::playout::packet::StreamProtocol::AirPlay2Buffered,
+                    0,
+                    0,
+                    0,
+                    0x1500_0000,
+                    Some(crate::codec::AudioFormat::Alac48000S24Stereo),
+                    bytes::Bytes::new(),
+                    std::time::Instant::now(),
+                    false,
+                    0,
+                )
+            }))
+        }
+    }
 
-        // Desired priming invariant: at least 20 ms of audio must be buffered
-        // before enabling playback.  One packet is ~7.3 ms — far below this.
-        const MIN_START_WATERMARK_MS: u64 = 20;
-        assert!(
-            status.queued_ms >= MIN_START_WATERMARK_MS,
-            "priming invariant: need ≥ {MIN_START_WATERMARK_MS} ms buffered \
-             before enabling playback, got only {:.1} ms from one packet. \
-             This causes immediate underrun bursts on the first callback.",
-            status.queued_ms as f64
+    async fn wait_for_playout_status(
+        handle: &crate::playout::scheduler::PlayoutHandle,
+        predicate: impl Fn(&crate::playout::scheduler::SchedulerStatus) -> bool,
+    ) -> crate::playout::scheduler::SchedulerStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = handle.status();
+                if predicate(&status) {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("playout status did not reach expected state")
+    }
+
+    #[tokio::test]
+    async fn ap2_playback_waits_for_start_watermark() {
+        use crate::playout::{
+            packet::{StreamProtocol, TimedPacket},
+            scheduler::{PlayoutState, SchedulerConfig, spawn_playout_service},
+        };
+
+        let (engine, _consumer) = AudioEngine::new_for_output(48_000, 2, 100);
+        let config = SchedulerConfig {
+            start_watermark_ms: 20,
+            low_watermark_ms: 10,
+            target_watermark_ms: 15,
+            jitter_capacity_packets: 32,
+            reorder_grace_ms: 20,
+        };
+        let (handle, task) = spawn_playout_service(config, Ap2PrimingTestDecoder, engine.clone());
+        handle.start();
+        wait_for_playout_status(&handle, |status| status.state == PlayoutState::Priming).await;
+
+        let packet = |seq: u64| {
+            TimedPacket::new(
+                StreamProtocol::AirPlay2Buffered,
+                seq,
+                seq as u32,
+                seq as u32 * 352,
+                0x1500_0000,
+                Some(crate::codec::AudioFormat::Alac48000S24Stereo),
+                bytes::Bytes::from_static(&[0; 16]),
+                std::time::Instant::now(),
+                false,
+                0,
+            )
+        };
+
+        assert_eq!(
+            handle.send_ap2(packet(0)).await,
+            crate::playout::ingress::IngressResult::Accepted
         );
+        let after_one =
+            wait_for_playout_status(&handle, |status| status.diag.decoded_blocks >= 1).await;
+        assert_eq!(after_one.state, PlayoutState::Priming);
+        assert!(after_one.queued_ms < 20);
+        assert!(!engine.is_playback_enabled());
+
+        for seq in 1..=2 {
+            assert_eq!(
+                handle.send_ap2(packet(seq)).await,
+                crate::playout::ingress::IngressResult::Accepted
+            );
+        }
+        let primed =
+            wait_for_playout_status(&handle, |status| status.state == PlayoutState::Playing).await;
+        assert!(primed.queued_ms >= 20);
+        assert!(engine.is_playback_enabled());
+
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("playout service shutdown timed out")
+            .expect("playout service panicked");
     }
 
     #[test]
