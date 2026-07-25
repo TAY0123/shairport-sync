@@ -28,6 +28,7 @@ use crate::{
     config::{AdvertisedFormatPolicy, AirplayConfig},
     decoder,
     player::SharedPlayer,
+    playout::scheduler::PlayoutHandle,
     ptp,
     state::{AppState, PlayerState},
 };
@@ -55,6 +56,7 @@ pub async fn spawn_rtsp_server(
     audio_engine: AudioEngine,
     player: SharedPlayer,
     dacp: DacpController,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind: SocketAddr = config
         .bind
@@ -87,6 +89,7 @@ pub async fn spawn_rtsp_server(
                     let audio_engine = audio_engine.clone();
                     let player = player.clone();
                     let dacp = dacp.clone();
+                    let playout = playout.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
                             stream,
@@ -97,6 +100,7 @@ pub async fn spawn_rtsp_server(
                             audio_engine,
                             player,
                             dacp,
+                            playout,
                         )
                         .await
                         {
@@ -541,6 +545,7 @@ struct ConnectionServices<'a> {
     state: &'a AppState,
     pairing: &'a PairingService,
     audio_engine: &'a AudioEngine,
+    playout: &'a PlayoutHandle,
     player: &'a SharedPlayer,
     dacp: &'a DacpController,
 }
@@ -559,6 +564,7 @@ async fn handle_connection(
     audio_engine: AudioEngine,
     player: SharedPlayer,
     dacp: DacpController,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<()> {
     debug!(%peer, "RTSP connection opened");
     let mut session = RtspSession::default();
@@ -570,6 +576,7 @@ async fn handle_connection(
         state: &state,
         pairing: &pairing,
         audio_engine: &audio_engine,
+        playout: &playout,
         player: &player,
         dacp: &dacp,
     };
@@ -583,7 +590,14 @@ async fn handle_connection(
     // --- Idempotent per-connection cleanup (safe to call regardless of
     //     how the inner function exited).  TEARDOWN already performs an
     //     equivalent cleanup, so this is a safety-net for EOF/error exits. ---
-    perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+    perform_connection_cleanup(
+        &state,
+        &audio_engine,
+        &player,
+        &dacp,
+        &playout,
+        &mut session,
+    );
 
     match &result {
         Ok(()) => debug!(%peer, "RTSP connection closed cleanly"),
@@ -701,20 +715,22 @@ async fn process_rtsp_requests(
 /// in shairport-sync C but with explicit ownership gating.
 fn perform_connection_cleanup(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
     player: &SharedPlayer,
     dacp: &DacpController,
+    playout: &PlayoutHandle,
     session: &mut RtspSession,
 ) {
     if session.is_playback_owner {
         player.stop();
-        audio_engine.set_playback_enabled(false);
+        playout.stop();
         state.set_active(false);
         state.set_player_state(PlayerState::Stopped);
         *state.session_crypto.write() = None;
         *state.ap2_media_key.write() = None;
         *state.ap2_audio_format.write() = None;
         dacp.clear_session();
+        session.is_playback_owner = false;
     }
     session.abort_ap2_listeners();
 }
@@ -731,6 +747,7 @@ fn route_request(
     let state = svc.state;
     let pairing = svc.pairing;
     let audio_engine = svc.audio_engine;
+    let playout = svc.playout;
     let player = svc.player;
     let dacp = svc.dacp;
 
@@ -962,7 +979,7 @@ fn route_request(
         }
         ("POST", "/command") => {
             // Command endpoint receives encrypted plist commands
-            apply_ap2_command(state, audio_engine, player, dacp, request);
+            apply_ap2_command(state, audio_engine, playout, player, dacp, request);
             info!("received /command ({} bytes)", request.body.len());
             response(200, "OK")
                 .header("Content-Type", "application/octet-stream")
@@ -988,12 +1005,19 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("SETRATEANCHORTI", _) | ("SETRATEANCHORTIME", _) => {
-            apply_setrateanchortime(state, audio_engine, player, request);
+            apply_setrateanchortime(state, audio_engine, playout, player, request);
             response(200, "OK").with_cseq(request)
         }
         ("GET_PARAMETER", _) => response(200, "OK").with_cseq(request),
         ("SET_PARAMETER", _) => {
-            apply_set_parameter(state, audio_engine, dacp, session.peer_addr, request);
+            apply_set_parameter(
+                state,
+                audio_engine,
+                playout,
+                dacp,
+                session.peer_addr,
+                request,
+            );
             response(200, "OK").with_cseq(request)
         }
         ("SETUP", _) => {
@@ -1008,7 +1032,7 @@ fn route_request(
                 .unwrap_or(false);
 
             if is_ap2 && config.airplay2_enabled {
-                handle_ap2_setup(config, state, session, request, audio_engine, dacp)
+                handle_ap2_setup(config, state, session, request, audio_engine, playout, dacp)
                     .with_cseq(request)
             } else if is_ap2 {
                 // AP2 plist but AP2 is disabled - respond with error
@@ -1060,7 +1084,7 @@ fn route_request(
             let rate = state.alac_sample_rate.read().unwrap_or(44100);
             player.set_sample_rate(rate);
             player.start(latency);
-            enable_audio_when_track_ready(state, audio_engine);
+            enable_audio_when_track_ready(state, playout);
             state.set_player_state(PlayerState::Playing);
             state.set_diagnostic("ap1_latency", latency.to_string());
             info!(latency, "AP1 RECORD");
@@ -1072,13 +1096,14 @@ fn route_request(
         }
         ("FLUSH", _) => {
             player.flush();
-            audio_engine.set_playback_enabled(false);
+            playout.pause();
+            playout.flush();
             state.set_player_state(PlayerState::Paused);
             info!("AP1 FLUSH");
             response(200, "OK").with_cseq(request)
         }
         ("PAUSE", _) => {
-            pause_playback(state, audio_engine, player);
+            pause_playback(state, playout, player);
             info!("PAUSE");
             response(200, "OK").with_cseq(request)
         }
@@ -1090,7 +1115,7 @@ fn route_request(
             if let Some(stream_type) = ap2_teardown_stream_type(&request.body) {
                 if session.is_playback_owner {
                     player.stop();
-                    audio_engine.set_playback_enabled(false);
+                    playout.stop();
                     state.set_player_state(PlayerState::Stopped);
                 }
                 session.abort_ap2_stream_listener(stream_type);
@@ -1108,13 +1133,14 @@ fn route_request(
 
             if session.is_playback_owner {
                 player.stop();
-                audio_engine.set_playback_enabled(false);
+                playout.stop();
                 state.set_active(false);
                 state.set_player_state(PlayerState::Stopped);
                 *state.session_crypto.write() = None;
                 *state.ap2_media_key.write() = None;
                 *state.ap2_audio_format.write() = None;
                 dacp.clear_session();
+                session.is_playback_owner = false;
             }
             session.abort_ap2_listeners();
             info!("TEARDOWN");
@@ -1547,6 +1573,7 @@ fn handle_ap2_setup(
     session: &mut RtspSession,
     request: &RtspRequest,
     audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     dacp: &DacpController,
 ) -> RtspResponse {
     let plist_body = &request.body;
@@ -1613,7 +1640,7 @@ fn handle_ap2_setup(
                     stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
                     stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
                     state.set_active(true);
-                    enable_audio_when_track_ready(state, audio_engine);
+                    enable_audio_when_track_ready(state, playout);
                     state.set_player_state(PlayerState::Playing);
                     state.set_diagnostic("ap2_stream_type", "realtime");
                     state.set_diagnostic("ap2_realtime_audio_port", data_port.to_string());
@@ -1691,7 +1718,7 @@ fn handle_ap2_setup(
                         plist_uint_value(8 * 1024 * 1024u64),
                     );
                     state.set_active(true);
-                    enable_audio_when_track_ready(state, audio_engine);
+                    enable_audio_when_track_ready(state, playout);
                     state.set_player_state(PlayerState::Playing);
                     state.set_diagnostic("ap2_stream_type", "buffered");
                     state.set_diagnostic("ap2_buffered_audio_port", data_port.to_string());
@@ -1872,6 +1899,7 @@ fn handle_ap2_setup(
 fn apply_set_parameter(
     state: &AppState,
     audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     dacp: &DacpController,
     peer_addr: Option<SocketAddr>,
     request: &RtspRequest,
@@ -1888,6 +1916,7 @@ fn apply_set_parameter(
             apply_media_update(
                 state,
                 audio_engine,
+                playout,
                 None,
                 &extract_media_update(&plist::Value::Dictionary(dict.clone())),
             );
@@ -1936,13 +1965,25 @@ fn apply_set_parameter(
                 }
             }
         }
-        state.set_track_metadata(title, artist, album);
+        apply_media_update(
+            state,
+            audio_engine,
+            playout,
+            None,
+            &MediaUpdate {
+                title,
+                artist,
+                album,
+                ..MediaUpdate::default()
+            },
+        );
     }
 }
 
 fn apply_ap2_command(
     state: &AppState,
     audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     dacp: &DacpController,
     request: &RtspRequest,
@@ -1957,10 +1998,11 @@ fn apply_ap2_command(
             .or_else(|| dict.get("type").and_then(plist::Value::as_string));
         if let Some(command) = command {
             state.set_diagnostic("ap2_last_command", command.to_string());
-            apply_playback_command(state, audio_engine, player, command);
+            apply_playback_command(state, playout, player, command);
             if is_navigation_alias(command) {
                 player.flush();
-                audio_engine.set_playback_enabled(false);
+                playout.pause();
+                playout.flush();
                 state.clear_track_for_transition();
             }
             if let Some(dacp_command) = dacp_command_for_alias(command) {
@@ -1970,6 +2012,7 @@ fn apply_ap2_command(
         apply_media_update(
             state,
             audio_engine,
+            playout,
             Some(player),
             &extract_media_update(&plist::Value::Dictionary(dict.clone())),
         );
@@ -2049,7 +2092,8 @@ struct MediaUpdate {
 
 fn apply_media_update(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: Option<&SharedPlayer>,
     update: &MediaUpdate,
 ) {
@@ -2060,7 +2104,8 @@ fn apply_media_update(
     if title_changed {
         let was_waiting_for_title = state.is_waiting_for_track_title();
         if !was_waiting_for_title {
-            audio_engine.clear_output_samples();
+            playout.pause();
+            playout.flush();
             if let Some(player) = player {
                 player.flush();
             }
@@ -2078,7 +2123,7 @@ fn apply_media_update(
         );
     }
     if title_changed && update.title.is_some() {
-        enable_audio_when_track_ready(state, audio_engine);
+        enable_audio_when_track_ready(state, playout);
     }
     if let Some(duration_ms) = update.duration_ms {
         state.set_duration_ms(duration_ms);
@@ -2288,7 +2333,8 @@ fn apply_audio_mode(state: &AppState, request: &RtspRequest) {
 
 fn apply_setrateanchortime(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     request: &RtspRequest,
 ) {
@@ -2317,12 +2363,13 @@ fn apply_setrateanchortime(
         let sample_rate = state.alac_sample_rate.read().unwrap_or(44_100);
         player.set_sample_rate(sample_rate);
         player.start(0);
-        enable_audio_when_track_ready(state, audio_engine);
+        enable_audio_when_track_ready(state, playout);
         state.set_player_state(PlayerState::Playing);
         state.set_diagnostic("ap2_play_enabled", "true");
     } else {
         player.flush();
-        audio_engine.set_playback_enabled(false);
+        playout.pause();
+        playout.flush();
         state.set_player_state(PlayerState::Paused);
         state.set_diagnostic("ap2_play_enabled", "false");
     }
@@ -2330,59 +2377,60 @@ fn apply_setrateanchortime(
 
 fn apply_playback_command(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     command: &str,
 ) -> bool {
     let normalized = command.to_ascii_lowercase();
     if normalized.contains("toggle") {
         return match state.snapshot().player_state {
-            PlayerState::Playing => pause_playback(state, audio_engine, player),
-            _ => play_playback(state, audio_engine, player),
+            PlayerState::Playing => pause_playback(state, playout, player),
+            _ => play_playback(state, playout, player),
         };
     }
     if normalized.contains("pause") {
-        return pause_playback(state, audio_engine, player);
+        return pause_playback(state, playout, player);
     }
     if normalized.contains("stop") {
-        return stop_playback(state, audio_engine, player);
+        return stop_playback(state, playout, player);
     }
     if normalized.contains("play") || normalized.contains("resume") {
-        return play_playback(state, audio_engine, player);
+        return play_playback(state, playout, player);
     }
     false
 }
 
-fn play_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn play_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     let sample_rate = state.alac_sample_rate.read().unwrap_or(44_100);
     player.set_sample_rate(sample_rate);
     player.start(0);
-    enable_audio_when_track_ready(state, audio_engine);
+    enable_audio_when_track_ready(state, playout);
     state.set_player_state(PlayerState::Playing);
     true
 }
 
-fn enable_audio_when_track_ready(state: &AppState, audio_engine: &AudioEngine) -> bool {
+fn enable_audio_when_track_ready(state: &AppState, playout: &PlayoutHandle) -> bool {
     if state.is_waiting_for_track_title() {
         state.set_diagnostic("audio_waiting_for_track_title", "true");
-        audio_engine.clear_output_samples();
+        playout.flush();
         return false;
     }
     state.set_diagnostic("audio_waiting_for_track_title", "false");
-    audio_engine.set_playback_enabled(true);
+    playout.start();
     true
 }
 
-fn pause_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn pause_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     player.flush();
-    audio_engine.set_playback_enabled(false);
+    playout.pause();
+    playout.flush();
     state.set_player_state(PlayerState::Paused);
     true
 }
 
-fn stop_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn stop_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     player.stop();
-    audio_engine.set_playback_enabled(false);
+    playout.stop();
     state.set_player_state(PlayerState::Stopped);
     true
 }
@@ -2783,7 +2831,29 @@ impl RtspResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playout::scheduler::{PlayoutCommand, PlayoutHandle};
     use rsa::pkcs1v15::Pkcs1v15Sign;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// Create a test-only [`PlayoutHandle`] and its associated command and
+    /// ingress receivers.  Tests that need to assert exact command sequences
+    /// keep `cmd_rx`; others drop it.
+    fn test_playout() -> (
+        PlayoutHandle,
+        UnboundedReceiver<PlayoutCommand>,
+        crate::playout::ingress::IngressReceiver,
+    ) {
+        PlayoutHandle::command_channel_for_tests(64)
+    }
+
+    /// Drain all pending commands from the receiver and return them as a Vec.
+    fn drain_cmds(rx: &mut UnboundedReceiver<PlayoutCommand>) -> Vec<PlayoutCommand> {
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            cmds.push(cmd);
+        }
+        cmds
+    }
 
     #[test]
     fn parses_rtsp_request_with_body() {
@@ -2800,6 +2870,7 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         let (audio_engine, mut consumer) = AudioEngine::new(8);
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
         let request = RtspRequest {
@@ -2811,7 +2882,7 @@ mod tests {
         };
 
         let dacp = DacpController::disabled(state.clone());
-        apply_set_parameter(&state, &audio_engine, &dacp, None, &request);
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
 
         assert_eq!(state.snapshot().volume.airplay_db, -6.0);
         assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 2);
@@ -2825,6 +2896,7 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         let (audio_engine, _consumer) = AudioEngine::new(8);
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let dacp = DacpController::disabled(state.clone());
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
@@ -2836,34 +2908,77 @@ mod tests {
             body: b"Progress: 44100/88200/176400\r\n".to_vec(),
         };
 
-        apply_set_parameter(&state, &audio_engine, &dacp, None, &request);
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
 
         assert_eq!(state.snapshot().track.progress_ms, Some(1_000));
         assert_eq!(state.snapshot().track.duration_ms, Some(3_000));
     }
 
     #[test]
-    fn ap2_command_pause_and_play_gate_audio_engine() {
+    fn text_title_release_starts_playout() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config);
+        state.set_track_metadata(Some("Old song".to_string()), None, None);
+        state.clear_track_for_transition();
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+        let dacp = DacpController::disabled(state.clone());
+        let mut headers = BTreeMap::new();
+        headers.insert("Content-Type".to_string(), "text/parameters".to_string());
+        let request = RtspRequest {
+            method: "SET_PARAMETER".to_string(),
+            uri: "rtsp://x".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: b"title: New song\r\nartist: Singer\r\n".to_vec(),
+        };
+
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
+
+        assert!(!state.is_waiting_for_track_title());
+        assert_eq!(state.snapshot().track.title.as_deref(), Some("New song"));
+        assert_eq!(
+            drain_cmds(&mut cmd_rx).as_slice(),
+            &[PlayoutCommand::Start],
+            "text metadata title release must start playout"
+        );
+    }
+
+    #[test]
+    fn ap2_command_pause_and_play_gate_playout() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let pause = ap2_command_request("pause");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &pause);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &pause);
 
         assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 0);
+        // Pause emits exact [Pause, Flush]
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "pause must emit exactly [Pause, Flush]"
+        );
 
         let play = ap2_command_request("play");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &play);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &play);
 
         assert!(matches!(
             state.snapshot().player_state,
             PlayerState::Playing
         ));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        // Play emits Start (no waiting for title)
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Start],
+            "play must emit exactly [Start] when title is ready"
+        );
     }
 
     #[test]
@@ -2878,25 +2993,26 @@ mod tests {
         *state.alac_channels.write() = Some(2);
         *state.frames_per_packet.write() = Some(352);
         let epoch = state.track_transition_epoch();
-        let (audio_engine, mut consumer) = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0, 1.0]), 4);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let next = ap2_command_request("next");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &next);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &next);
 
-        // The "next" command requests a flush (incrementing flush epoch).
-        // Simulate what the audio callback would do: drain on next callback.
-        let mut dummy = [0.0f32; 8];
-        consumer.fill_output(&mut dummy);
+        // Navigation should send exact [Pause, Flush]
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "navigation must emit exactly [Pause, Flush]"
+        );
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.track.title, None);
         assert_eq!(snapshot.track.progress_ms, Some(0));
         assert!(snapshot.track.awaiting_title);
-        assert_eq!(audio_engine.status().queued_samples, 0);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 0);
         assert!(state.ap2_audio_format.read().is_none());
         assert!(state.alac_sample_rate.read().is_none());
         assert!(state.alac_sample_size.read().is_none());
@@ -2913,29 +3029,226 @@ mod tests {
         let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         apply_ap2_command(
             &state,
             &audio_engine,
+            &playout,
             &player,
             &dacp,
             &ap2_command_request("next"),
         );
+        // Navigation sends Pause + Flush; drain them
+        drain_cmds(&mut cmd_rx);
+
         apply_setrateanchortime(
             &state,
             &audio_engine,
+            &playout,
             &player,
             &setrateanchortime_request(1),
         );
 
         assert!(state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 0);
+        // Title not ready → no Start command emitted; Flush sent instead
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(!cmds.contains(&PlayoutCommand::Start));
+        assert!(cmds.contains(&PlayoutCommand::Flush));
 
         let metadata = ap2_now_playing_request("New song", "Singer", "Record");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &metadata);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &metadata);
 
         assert!(!state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 2);
+        // Title arrived → Start command emitted
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(cmds.contains(&PlayoutCommand::Start));
+    }
+
+    #[test]
+    fn ap1_record_emits_start_when_title_ready() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        state.set_track_metadata(Some("Song Title".to_string()), None, None);
+        *state.alac_sample_rate.write() = Some(44_100);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        // Title is set → enable_audio_when_track_ready emits Start
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            cmds.contains(&PlayoutCommand::Start),
+            "AP1 RECORD must emit Start when title is ready, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ap1_record_does_not_start_when_awaiting_title() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        state.clear_track_for_transition(); // sets awaiting_title = true
+        *state.alac_sample_rate.write() = Some(44_100);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        // Awaiting title → only Flush emitted, no Start
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            !cmds.contains(&PlayoutCommand::Start),
+            "AP1 RECORD must NOT emit Start when awaiting title, got {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&PlayoutCommand::Flush),
+            "AP1 RECORD must emit Flush when awaiting title, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn flush_emits_exact_pause_then_flush() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "FLUSH".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "FLUSH must emit exactly [Pause, Flush]"
+        );
+        assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
+    }
+
+    #[test]
+    fn pause_emits_exact_pause_then_flush() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "PAUSE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "PAUSE must emit exactly [Pause, Flush]"
+        );
+        assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
     }
 
     #[test]
@@ -2943,18 +3256,21 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
-        let (audio_engine, mut consumer) = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0, 1.0]), 4);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let request = ap2_now_playing_request("New song", "Singer", "Record");
 
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &request);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &request);
 
-        // The now-playing command requests a flush; simulate callback drain.
-        let mut dummy = [0.0f32; 8];
-        consumer.fill_output(&mut dummy);
+        // Title changed (Old → New) while not waiting for title:
+        // Pause + Flush sent, then enable_audio_when_track_ready → Start.
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(cmds.contains(&PlayoutCommand::Pause));
+        assert!(cmds.contains(&PlayoutCommand::Flush));
+        assert!(cmds.contains(&PlayoutCommand::Start));
 
         let track = state.snapshot().track;
         assert_eq!(track.title.as_deref(), Some("New song"));
@@ -2962,7 +3278,6 @@ mod tests {
         assert_eq!(track.album.as_deref(), Some("Record"));
         assert_eq!(track.progress_ms, Some(12_500));
         assert_eq!(track.duration_ms, Some(240_000));
-        assert_eq!(audio_engine.status().queued_samples, 0);
     }
 
     #[test]
@@ -3101,12 +3416,14 @@ mod tests {
 
         let (audio_engine, _consumer) = AudioEngine::new(1024);
         let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let response = handle_ap2_setup(
             &config.airplay,
             &state,
             &mut session,
             &request,
             &audio_engine,
+            &playout,
             &dacp,
         );
         let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
@@ -3319,11 +3636,13 @@ mod tests {
         };
 
         let mut session = RtspSession::default();
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let services = ConnectionServices {
             config: &config.airplay,
             state: &state,
             pairing: &pairing,
             audio_engine: &audio_engine,
+            playout: &playout,
             player: &player,
             dacp: &dacp,
         };
@@ -3383,11 +3702,13 @@ mod tests {
         };
 
         let mut session = RtspSession::default();
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let services = ConnectionServices {
             config: &config.airplay,
             state: &state,
             pairing: &pairing,
             audio_engine: &audio_engine,
+            playout: &playout,
             player: &player,
             dacp: &dacp,
         };
@@ -3411,6 +3732,7 @@ mod tests {
         let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         // Set up state that an owner cleanup should clear
         *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
@@ -3422,17 +3744,38 @@ mod tests {
         let mut session = RtspSession::default();
         session.is_playback_owner = true;
 
-        // Owner cleanup must clear global state
-        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        // Owner cleanup must clear global state and emit Stop
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
         assert_eq!(*state.session_crypto.read(), None);
         assert_eq!(*state.ap2_media_key.read(), None);
         assert_eq!(*state.ap2_audio_format.read(), None);
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Stop],
+            "owner cleanup must emit exactly one Stop"
+        );
 
-        // Second cleanup must not panic and must leave state unchanged (idempotent)
-        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        // Second cleanup must not repeat global cleanup or emit another command.
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
         assert_eq!(*state.session_crypto.read(), None);
         assert_eq!(*state.ap2_media_key.read(), None);
         assert_eq!(*state.ap2_audio_format.read(), None);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
     }
 
     #[test]
@@ -3442,6 +3785,7 @@ mod tests {
         let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         // Set up state representing an active session owned by someone else
         *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
@@ -3454,7 +3798,14 @@ mod tests {
         // is_playback_owner defaults to false — this is a non-owner probe
 
         // Non-owner cleanup must NOT clear global state
-        perform_connection_cleanup(&state, &audio_engine, &player, &dacp, &mut session);
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
         assert!(
             state.session_crypto.read().is_some(),
             "non-owner cleanup must not clear session_crypto"
@@ -3466,6 +3817,12 @@ mod tests {
         assert!(
             state.ap2_audio_format.read().is_some(),
             "non-owner cleanup must not clear ap2_audio_format"
+        );
+        // Non-owner must emit no commands
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            cmds.is_empty(),
+            "non-owner cleanup must not emit any playout command, got {cmds:?}"
         );
     }
 
@@ -3517,11 +3874,13 @@ mod tests {
         // Non-owner session (is_playback_owner defaults to false)
         let mut session = RtspSession::default();
 
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
             pairing: &pairing,
             audio_engine: &audio_engine,
+            playout: &playout,
             player: &player,
             dacp: &dacp,
         };
@@ -3582,11 +3941,13 @@ mod tests {
         let mut session = RtspSession::default();
         session.is_playback_owner = true;
 
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
             pairing: &pairing,
             audio_engine: &audio_engine,
+            playout: &playout,
             player: &player,
             dacp: &dacp,
         };

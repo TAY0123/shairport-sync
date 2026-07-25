@@ -7,13 +7,12 @@ use tokio::{net::UdpSocket, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::{
-    audio::AudioEngine,
-    codec,
     config::AirplayConfig,
     decoder,
     playout::{
-        ingress::{IngressReceiver, IngressResult, IngressSender, packet_ingress},
+        ingress::IngressResult,
         packet::{StreamProtocol, TimedPacket},
+        scheduler::PlayoutHandle,
         sequence::SequenceExtender16,
     },
     state::AppState,
@@ -41,29 +40,65 @@ pub struct RtpPacket {
 pub struct RtpReceiverHandles {
     /// Network I/O tasks (UDP recv loops for audio, control, timing).
     pub network: Vec<JoinHandle<()>>,
-    /// Transitional AP1 decode worker.
-    pub worker: JoinHandle<()>,
 }
 
 pub async fn spawn_rtp_receivers(
     config: AirplayConfig,
     state: AppState,
-    audio_engine: AudioEngine,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<RtpReceiverHandles> {
-    // Create a shared bounded ingress for the audio path.
-    let (tx, rx) = packet_ingress();
-    let ingress_tx = tx;
-
-    let audio_net = bind_audio_network(config.audio_port, state.clone(), ingress_tx).await?;
+    let audio_net = bind_audio_network(config.audio_port, state.clone(), playout).await?;
     let control = bind_channel(RtpChannel::Control, config.control_port, state.clone()).await?;
     let timing = bind_channel(RtpChannel::Timing, config.timing_port, state.clone()).await?;
 
-    let worker = spawn_ap1_decode_worker(rx, state, audio_engine);
-
     Ok(RtpReceiverHandles {
         network: vec![audio_net, control, timing],
-        worker,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ap1SubmitResult {
+    WaitingForTitle,
+    Accepted,
+    Full,
+    Closed,
+}
+
+/// Apply the AP1 title gate and submit one decrypted packet to the shared
+/// playout service. This keeps diagnostics and drop behavior in one path that
+/// can be tested without binding a UDP socket.
+fn submit_ap1_packet(
+    state: &AppState,
+    playout: &PlayoutHandle,
+    packet: TimedPacket,
+    rtp: RtpPacket,
+) -> Ap1SubmitResult {
+    if state.is_waiting_for_track_title() {
+        state.set_diagnostic("ap1_waiting_for_track_title", "true");
+        return Ap1SubmitResult::WaitingForTitle;
+    }
+    state.set_diagnostic("ap1_waiting_for_track_title", "false");
+
+    match playout.try_send_ap1(packet) {
+        IngressResult::Accepted => {
+            state.record_rtp_packet(RtpChannel::Audio, rtp);
+            let diag = playout.ingress_diagnostics();
+            state.set_diagnostic("ap1_ingress_max_depth", diag.max_depth.to_string());
+            Ap1SubmitResult::Accepted
+        }
+        IngressResult::Full => {
+            let diag = playout.ingress_diagnostics();
+            state.set_diagnostic("ap1_ingress_full_drops", diag.full_drops.to_string());
+            state.set_diagnostic("ap1_ingress_max_depth", diag.max_depth.to_string());
+            Ap1SubmitResult::Full
+        }
+        IngressResult::Closed => {
+            let diag = playout.ingress_diagnostics();
+            state.set_diagnostic("ap1_ingress_closed_drops", diag.closed_drops.to_string());
+            state.set_diagnostic("ap1_ingress_max_depth", diag.max_depth.to_string());
+            Ap1SubmitResult::Closed
+        }
+    }
 }
 
 /// UDP receive loop: parses RTP, decrypts AES-CBC, extends sequence,
@@ -72,7 +107,7 @@ pub async fn spawn_rtp_receivers(
 async fn bind_audio_network(
     port: u16,
     state: AppState,
-    ingress: IngressSender,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind = SocketAddr::from(([0, 0, 0, 0], port));
     let socket = UdpSocket::bind(bind)
@@ -131,41 +166,33 @@ async fn bind_audio_network(
                     let rtp = parse_rtp_packet_inner(&buf[..len]);
                     let seq_result = seq_ext.extend(rtp.sequence_number);
 
-                    // Record diagnostics for recording (still done in worker,
-                    // but we can also track at network level). The worker will
-                    // record the full RTP diagnostics.
                     let pkt = TimedPacket::new(
                         StreamProtocol::ClassicAp1,
                         seq_result.extended_sequence,
                         rtp.sequence_number as u32,
                         rtp.timestamp,
                         rtp.ssrc,
-                        None, // format determined by decoder in worker
+                        None, // AP1 format is resolved from AppState by the decoder
                         Bytes::from(decrypted),
                         std::time::Instant::now(),
                         retransmitted,
                         epoch,
                     );
 
-                    match ingress.try_send(pkt) {
-                        IngressResult::Accepted => {
+                    match submit_ap1_packet(&state, &playout, pkt, rtp) {
+                        Ap1SubmitResult::WaitingForTitle => {
+                            debug!("RTP audio packet drained while waiting for new title");
+                        }
+                        Ap1SubmitResult::Accepted => {
                             if first_packet {
                                 info!("AP1 ingress: first packet accepted");
                                 first_packet = false;
                             }
                         }
-                        IngressResult::Full => {
-                            state.set_diagnostic("ap1_ingress_full_drops", {
-                                let d = ingress.diagnostics();
-                                d.full_drops.to_string()
-                            });
+                        Ap1SubmitResult::Full => {
                             warn!("AP1 ingress full — packet dropped");
                         }
-                        IngressResult::Closed => {
-                            state.set_diagnostic("ap1_ingress_closed_drops", {
-                                let d = ingress.diagnostics();
-                                d.closed_drops.to_string()
-                            });
+                        Ap1SubmitResult::Closed => {
                             warn!("AP1 ingress closed — shutting down audio network loop");
                             break;
                         }
@@ -175,122 +202,6 @@ async fn bind_audio_network(
             }
         }
     }))
-}
-
-/// Transitional AP1 decode worker: owns the ingress receiver, ALAC decoder,
-/// transition-epoch resets, waiting-for-title policy, and AudioEngine
-/// conversion/enqueue.
-fn spawn_ap1_decode_worker(
-    mut rx: IngressReceiver,
-    state: AppState,
-    audio_engine: AudioEngine,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut audio_decoder: Option<codec::AudioDecoder> = None;
-        let mut decoder_epoch = state.track_transition_epoch();
-
-        while let Some(pkt) = rx.recv().await {
-            // Epoch transition → reset decoder.
-            let current_epoch = state.track_transition_epoch();
-            if current_epoch != decoder_epoch {
-                audio_decoder = None;
-                decoder_epoch = current_epoch;
-                info!(
-                    epoch = decoder_epoch,
-                    "RTP audio decoder reset for track transition"
-                );
-            }
-
-            // Skip stale packets from before the transition.
-            if pkt.transition_epoch != current_epoch {
-                debug!(
-                    seq = pkt.extended_sequence,
-                    "stale RTP packet drained after track transition"
-                );
-                continue;
-            }
-
-            if state.is_waiting_for_track_title() {
-                debug!("RTP audio packet drained while waiting for new title");
-                continue;
-            }
-
-            // Lazy-init ALAC decoder.
-            if audio_decoder.is_none() {
-                let cookie = state.alac_magic_cookie.read().clone();
-                if let Some(ref cookie) = cookie {
-                    let sample_size = state.alac_sample_size.read().unwrap_or(16);
-                    let channels = state.alac_channels.read().unwrap_or(2);
-                    let rate = state.alac_sample_rate.read().unwrap_or(44_100);
-                    let frames_per_packet = state.frames_per_packet.read().unwrap_or(352) as usize;
-                    match codec::AudioDecoder::new_alac(
-                        sample_size,
-                        channels,
-                        rate,
-                        frames_per_packet,
-                        cookie,
-                    ) {
-                        Ok(d) => {
-                            audio_decoder = Some(d);
-                            info!(sample_size, channels, rate, "ALAC decoder initialized");
-                        }
-                        Err(e) => {
-                            warn!(%e, "ALAC decoder init failed");
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Decode and enqueue.
-            if let Some(ref mut dec) = audio_decoder {
-                match dec.decode(&pkt.payload) {
-                    Ok(decoded) => {
-                        if !decoded.samples.is_empty() {
-                            let (enqueued, total_samples) = audio_engine
-                                .enqueue_interleaved_for_output(
-                                    &decoded.samples,
-                                    decoded.sample_rate,
-                                    decoded.channels,
-                                );
-                            if enqueued < total_samples {
-                                debug!(
-                                    "audio ring buffer full, dropped {} samples",
-                                    total_samples - enqueued
-                                );
-                            }
-                        }
-                        // Record RTP diagnostics.
-                        state.record_rtp_packet(
-                            RtpChannel::Audio,
-                            RtpPacket {
-                                version: 2,
-                                marker: false,
-                                payload_type: if pkt.retransmitted { 0x56 } else { 0x60 },
-                                sequence_number: pkt.raw_sequence as u16,
-                                timestamp: pkt.rtp_timestamp,
-                                ssrc: pkt.ssrc,
-                                payload_len: pkt.payload.len(),
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        warn!(%e, "ALAC decode failed");
-                    }
-                }
-            }
-
-            // Periodically update ingress depth diagnostics.
-            let diag = rx.diagnostics();
-            if diag.full_drops > 0 {
-                state.set_diagnostic("ap1_ingress_full_drops", diag.full_drops.to_string());
-            }
-            if diag.max_depth > 0 {
-                state.set_diagnostic("ap1_ingress_max_depth", diag.max_depth.to_string());
-            }
-        }
-        info!("AP1 decode worker exiting");
-    })
 }
 
 async fn bind_channel(
@@ -363,6 +274,37 @@ pub fn parse_rtp_packet(packet: &[u8]) -> Option<RtpPacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playout::packet::{StreamProtocol, TimedPacket};
+    use crate::playout::scheduler::PlayoutHandle;
+    use std::time::Instant;
+
+    /// Build a minimal AP1-style [`TimedPacket`] for ingress tests.
+    fn ap1_packet(seq: u64) -> TimedPacket {
+        TimedPacket::new(
+            StreamProtocol::ClassicAp1,
+            seq,
+            seq as u32,
+            seq as u32 * 352,
+            0,
+            None,
+            bytes::Bytes::from_static(&[0; 16]),
+            Instant::now(),
+            false,
+            0,
+        )
+    }
+
+    fn rtp_diagnostic(seq: u64) -> RtpPacket {
+        RtpPacket {
+            version: 2,
+            marker: false,
+            payload_type: 0x60,
+            sequence_number: seq as u16,
+            timestamp: seq as u32 * 352,
+            ssrc: 0x0102_0304,
+            payload_len: 16,
+        }
+    }
 
     #[test]
     fn parses_rtp_header() {
@@ -376,5 +318,130 @@ mod tests {
         assert_eq!(parsed.timestamp, 9);
         assert_eq!(parsed.ssrc, 0x01020304);
         assert_eq!(parsed.payload_len, 3);
+    }
+
+    #[test]
+    fn submit_ap1_accepted_records_rtp_and_max_depth() {
+        let state = AppState::new(crate::config::Config::default());
+        let (playout, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(64);
+
+        for seq in 0..5 {
+            assert_eq!(
+                submit_ap1_packet(&state, &playout, ap1_packet(seq), rtp_diagnostic(seq)),
+                Ap1SubmitResult::Accepted
+            );
+        }
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.rtp.audio_packets, 5);
+        assert_eq!(snapshot.rtp.last_audio_sequence, Some(4));
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap1_ingress_max_depth")
+                .map(String::as_str),
+            Some("5")
+        );
+        let diag = playout.ingress_diagnostics();
+        assert_eq!(diag.accepted, 5);
+        assert_eq!(diag.full_drops, 0);
+        assert_eq!(diag.closed_drops, 0);
+    }
+
+    #[test]
+    fn submit_ap1_full_updates_state_diagnostics() {
+        let state = AppState::new(crate::config::Config::default());
+        let (playout, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(1);
+
+        assert_eq!(
+            submit_ap1_packet(&state, &playout, ap1_packet(0), rtp_diagnostic(0)),
+            Ap1SubmitResult::Accepted
+        );
+        assert_eq!(
+            submit_ap1_packet(&state, &playout, ap1_packet(1), rtp_diagnostic(1)),
+            Ap1SubmitResult::Full
+        );
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.rtp.audio_packets, 1);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap1_ingress_full_drops")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap1_ingress_max_depth")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn submit_ap1_closed_updates_state_diagnostics() {
+        let state = AppState::new(crate::config::Config::default());
+        let (playout, _cmd_rx, ingress_rx) = PlayoutHandle::command_channel_for_tests(64);
+        drop(ingress_rx);
+
+        assert_eq!(
+            submit_ap1_packet(&state, &playout, ap1_packet(1), rtp_diagnostic(1)),
+            Ap1SubmitResult::Closed
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.rtp.audio_packets, 0);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap1_ingress_closed_drops")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn submit_ap1_waiting_title_uses_production_gate() {
+        let state = AppState::new(crate::config::Config::default());
+        state.clear_track_for_transition();
+        let (playout, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(64);
+
+        assert_eq!(
+            submit_ap1_packet(&state, &playout, ap1_packet(0), rtp_diagnostic(0)),
+            Ap1SubmitResult::WaitingForTitle
+        );
+        assert_eq!(playout.ingress_diagnostics().accepted, 0);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.rtp.audio_packets, 0);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap1_waiting_for_track_title")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn submit_ap1_title_ready_allows_production_submission() {
+        let state = AppState::new(crate::config::Config::default());
+        state.set_track_metadata(Some("Track".to_string()), None, None);
+        let (playout, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(64);
+
+        assert_eq!(
+            submit_ap1_packet(&state, &playout, ap1_packet(0), rtp_diagnostic(0)),
+            Ap1SubmitResult::Accepted
+        );
+        assert_eq!(playout.ingress_diagnostics().accepted, 1);
+        assert_eq!(state.snapshot().rtp.audio_packets, 1);
+        assert_eq!(
+            state
+                .snapshot()
+                .diagnostics
+                .get("ap1_waiting_for_track_title")
+                .map(String::as_str),
+            Some("false")
+        );
     }
 }

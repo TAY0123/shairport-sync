@@ -1043,6 +1043,46 @@ impl PlayoutHandle {
     pub fn status(&self) -> SchedulerStatus {
         self.status.read().clone()
     }
+
+    /// Snapshot the ingress diagnostic counters (accepted, full drops,
+    /// closed drops, max depth, current inflight).
+    pub fn ingress_diagnostics(&self) -> super::ingress::IngressDiagnostics {
+        self.ingress.diagnostics()
+    }
+
+    /// Return a test-only channel that receives every command sent to
+    /// the service, plus the ingress receiver so tests can observe
+    /// packet submission.
+    ///
+    /// The returned [`PlayoutHandle`] **does not** spawn a service task;
+    /// it is backed by an unbounded channel whose receiver is returned
+    /// alongside.  Tests use this to assert exact command sequences.
+    #[cfg(test)]
+    pub fn command_channel_for_tests(
+        capacity: usize,
+    ) -> (
+        PlayoutHandle,
+        tokio::sync::mpsc::UnboundedReceiver<PlayoutCommand>,
+        super::ingress::IngressReceiver,
+    ) {
+        let (ingress_tx, ingress_rx) = super::ingress::packet_ingress_with_capacity(capacity);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let status = Arc::new(RwLock::new(SchedulerStatus {
+            state: PlayoutState::Stopped,
+            jitter: JitterDiagnostics::default(),
+            diag: SchedulerDiagnostics::default(),
+            queued_ms: 0,
+            has_pending_block: false,
+            pending_block_frames: 0,
+            expected_sequence: 0,
+        }));
+        let handle = PlayoutHandle {
+            ingress: ingress_tx,
+            cmd_tx,
+            status,
+        };
+        (handle, cmd_rx, ingress_rx)
+    }
 }
 
 /// Spawn a playout service that owns and drives a [`SchedulerCore`].
