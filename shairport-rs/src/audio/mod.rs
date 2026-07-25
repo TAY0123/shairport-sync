@@ -552,8 +552,24 @@ impl AudioEngine {
             .store(gain.to_bits(), Ordering::Release);
     }
 
-    pub fn set_playback_enabled(&self, enabled: bool) {
+    /// Enable or disable the output gate without flushing the ring buffer.
+    ///
+    /// When disabled the output callback outputs silence but queued samples
+    /// are preserved.  Callers that need to discard the current FIFO should
+    /// use [`set_playback_enabled`] (which flushes on disable) or call
+    /// [`request_flush`] explicitly.
+    pub fn set_output_gate(&self, enabled: bool) {
         self.playback_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Enable or disable playback, requesting a flush of the ring buffer
+    /// when disabling.
+    ///
+    /// Delegates to [`set_output_gate`] and additionally calls
+    /// [`request_flush`] on the enabled→disabled transition so that stale
+    /// audio is discarded.
+    pub fn set_playback_enabled(&self, enabled: bool) {
+        self.set_output_gate(enabled);
         if !enabled {
             self.request_flush();
         }
@@ -1693,6 +1709,151 @@ mod tests {
              This causes immediate underrun bursts on the first callback.",
             status.queued_ms as f64
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 6A1 — set_output_gate vs set_playback_enabled semantics.
+    // ---------------------------------------------------------------------------
+
+    /// `set_output_gate(false)` must not flush: queued samples must survive
+    /// and be output once the gate is re-enabled.
+    #[test]
+    fn set_output_gate_off_preserves_queued_samples() {
+        let (engine, mut consumer) = AudioEngine::new(128);
+        engine.set_output_format(48_000, 2);
+
+        // Enqueue audio with playback enabled.
+        engine.enqueue_output_samples(&[0.42; 30]);
+        assert_eq!(engine.ring_occupied_len(), 30);
+
+        // Gate off — no flush.
+        let flushes_before = engine.flush_count.load(Ordering::Acquire);
+        engine.set_output_gate(false);
+        assert_eq!(
+            engine.flush_count.load(Ordering::Acquire),
+            flushes_before,
+            "set_output_gate(false) must not request a flush"
+        );
+        // Samples are still in the ring.
+        assert_eq!(engine.ring_occupied_len(), 30);
+
+        // A callback while gated off must output silence.
+        let mut out = [0.0f32; 20];
+        let filled = consumer.fill_output(&mut out);
+        assert_eq!(filled, 0, "gated-off callback must output silence");
+        assert!(out.iter().all(|&s| s == 0.0));
+        // Samples are still preserved.
+        assert_eq!(engine.ring_occupied_len(), 30);
+
+        // Gate back on — no flush.
+        engine.set_output_gate(true);
+        assert_eq!(engine.ring_occupied_len(), 30);
+
+        // Now the callback must output the preserved samples.
+        let mut out2 = [0.0f32; 40];
+        let filled2 = consumer.fill_output(&mut out2);
+        assert_eq!(filled2, 30, "all 30 preserved samples must be output");
+        assert!(
+            out2[..30].iter().all(|&s| (s - 0.42).abs() < 0.001),
+            "preserved samples must be the original 0.42 values"
+        );
+        assert!(out2[30..].iter().all(|&s| s == 0.0));
+    }
+
+    /// `set_playback_enabled(false)` must request a flush so that stale
+    /// audio is discarded.  This is the existing contract that callers
+    /// depend on for stream-switch / stop semantics.
+    #[test]
+    fn set_playback_enabled_false_requests_flush() {
+        let (engine, mut consumer) = AudioEngine::new(128);
+        engine.set_output_format(48_000, 2);
+
+        engine.enqueue_output_samples(&[0.99; 20]);
+        let flushes_before = engine.flush_count.load(Ordering::Acquire);
+        engine.set_playback_enabled(false);
+
+        assert!(
+            engine.flush_count.load(Ordering::Acquire) > flushes_before,
+            "set_playback_enabled(false) must request a flush"
+        );
+        // Gate is off.
+        assert!(!engine.is_playback_enabled());
+
+        // The flush epoch is now pending.  The callback drains the old
+        // samples when it processes the flush.
+        let mut out = [0.0f32; 30];
+        let filled = consumer.fill_output(&mut out);
+        // Flush drained the 20 pre-disable samples; output is silence.
+        assert_eq!(filled, 0, "flush drained stale samples; output is silence");
+        assert!(out.iter().all(|&s| s == 0.0));
+        assert_eq!(engine.ring_occupied_len(), 0);
+
+        // Re-enable, enqueue new data — must play normally.
+        engine.set_playback_enabled(true);
+        engine.enqueue_output_samples(&[0.11; 10]);
+        let mut out2 = [0.0f32; 10];
+        let filled2 = consumer.fill_output(&mut out2);
+        assert_eq!(filled2, 10);
+        assert!(out2.iter().all(|&s| (s - 0.11).abs() < 0.001));
+    }
+
+    /// `set_output_gate(true)` (re-enabling) does not request a flush
+    /// either — it should never touch the flush epoch.
+    #[test]
+    fn set_output_gate_true_never_flushes() {
+        let (engine, _consumer) = AudioEngine::new(64);
+        let flushes_before = engine.flush_count.load(Ordering::Acquire);
+
+        engine.set_output_gate(false);
+        assert_eq!(
+            engine.flush_count.load(Ordering::Acquire),
+            flushes_before,
+            "set_output_gate(false) must not flush"
+        );
+
+        engine.set_output_gate(true);
+        assert_eq!(
+            engine.flush_count.load(Ordering::Acquire),
+            flushes_before,
+            "set_output_gate(true) must not flush"
+        );
+    }
+
+    /// Gate-off / gate-on cycle preserves samples enqueued *while* gated
+    /// off (the unchecked-enqueue path used during priming).
+    #[test]
+    fn gate_cycle_preserves_samples_enqueued_while_gated_off() {
+        let (engine, mut consumer) = AudioEngine::new(256);
+        engine.set_output_format(48_000, 2);
+
+        // Start with some audio playing.
+        engine.enqueue_output_samples(&[0.5; 40]);
+        let mut out = [0.0f32; 20];
+        let filled = consumer.fill_output(&mut out);
+        assert_eq!(filled, 20);
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 0.001));
+        // 20 samples remain in ring.
+
+        // Gate off (no flush).
+        engine.set_output_gate(false);
+
+        // While gated off, priming samples arrive (unchecked path).
+        let priming = vec![0.77; 60];
+        let pushed = engine.enqueue_output_samples_unchecked(&priming);
+        assert_eq!(pushed, 60);
+
+        // Gate back on.
+        engine.set_output_gate(true);
+
+        // The 20 old samples + 60 priming = 80 should all be there.
+        let mut out2 = [0.0f32; 100];
+        let filled2 = consumer.fill_output(&mut out2);
+        assert_eq!(filled2, 80);
+        // First 20 are old 0.5 values.
+        assert!(out2[..20].iter().all(|&s| (s - 0.5).abs() < 0.001));
+        // Next 60 are priming 0.77 values.
+        assert!(out2[20..80].iter().all(|&s| (s - 0.77).abs() < 0.001));
+        assert!(out2[80..].iter().all(|&s| s == 0.0));
     }
 
     // ---------------------------------------------------------------------------
