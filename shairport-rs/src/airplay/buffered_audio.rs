@@ -478,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_decoded_frame_does_not_wait_when_playback_disabled() {
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         audio_engine.set_playback_enabled(false);
         let samples = vec![0.25; 4096];
 

@@ -93,10 +93,11 @@ async fn main() -> anyhow::Result<()> {
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
     let audio_engine = audio::AudioEngine::new(48_000 * 2 * 4);
+    let (audio_engine, audio_consumer) = audio_engine;
     let player = player::SharedPlayer::new();
     let dacp = airplay::dacp::DacpController::new(app_state.clone());
     app_state.update_audio_devices(audio_manager.list_devices());
-    let audio_output = match audio_manager.start_output(audio_engine.clone()) {
+    let audio_output = match audio_manager.start_output(&audio_engine, audio_consumer) {
         Ok(output) => Some(output),
         Err(err) => {
             warn!(%err, "audio output stream not started");

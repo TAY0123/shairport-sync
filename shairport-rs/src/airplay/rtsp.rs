@@ -2799,7 +2799,7 @@ mod tests {
     fn set_parameter_volume_updates_state_and_audio_gain() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, mut consumer) = AudioEngine::new(8);
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
         let request = RtspRequest {
@@ -2816,7 +2816,7 @@ mod tests {
         assert_eq!(state.snapshot().volume.airplay_db, -6.0);
         assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 1);
         let mut out = [0.0];
-        audio_engine.fill_output(&mut out);
+        consumer.fill_output(&mut out);
         assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
     }
 
@@ -2824,7 +2824,7 @@ mod tests {
     fn text_progress_uses_airplay_rtp_timestamps() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let dacp = DacpController::disabled(state.clone());
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
@@ -2846,7 +2846,7 @@ mod tests {
     fn ap2_command_pause_and_play_gate_audio_engine() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
@@ -2878,13 +2878,18 @@ mod tests {
         *state.alac_channels.write() = Some(2);
         *state.frames_per_packet.write() = Some(352);
         let epoch = state.track_transition_epoch();
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, mut consumer) = AudioEngine::new(8);
         assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
         let next = ap2_command_request("next");
         apply_ap2_command(&state, &audio_engine, &player, &dacp, &next);
+
+        // The "next" command requests a flush (incrementing flush epoch).
+        // Simulate what the audio callback would do: drain on next callback.
+        let mut dummy = [0.0f32; 8];
+        consumer.fill_output(&mut dummy);
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.track.title, None);
@@ -2905,7 +2910,7 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
@@ -2938,7 +2943,7 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, mut consumer) = AudioEngine::new(8);
         assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
@@ -2946,6 +2951,10 @@ mod tests {
         let request = ap2_now_playing_request("New song", "Singer", "Record");
 
         apply_ap2_command(&state, &audio_engine, &player, &dacp, &request);
+
+        // The now-playing command requests a flush; simulate callback drain.
+        let mut dummy = [0.0f32; 8];
+        consumer.fill_output(&mut dummy);
 
         let track = state.snapshot().track;
         assert_eq!(track.title.as_deref(), Some("New song"));
@@ -3090,7 +3099,7 @@ mod tests {
             body,
         };
 
-        let audio_engine = AudioEngine::new(1024);
+        let (audio_engine, _consumer) = AudioEngine::new(1024);
         let dacp = DacpController::disabled(state.clone());
         let response = handle_ap2_setup(
             &config.airplay,
@@ -3280,7 +3289,7 @@ mod tests {
     fn announce_clears_stale_session_crypto() {
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
         let pairing = Arc::new(PairingService::new(
@@ -3340,7 +3349,7 @@ mod tests {
         // When rsaaeskey is provided but aesiv is missing, return 456.
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
         let pairing = Arc::new(PairingService::new(
@@ -3399,7 +3408,7 @@ mod tests {
     fn connection_cleanup_owner_clears_global_state() {
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
@@ -3430,7 +3439,7 @@ mod tests {
     fn connection_cleanup_non_owner_preserves_global_state() {
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
@@ -3470,7 +3479,7 @@ mod tests {
     fn stream_teardown_non_owner_preserves_ap2_key_and_format() {
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
         let pairing = Arc::new(PairingService::new(
@@ -3535,7 +3544,7 @@ mod tests {
     fn stream_teardown_owner_clears_ap2_key_and_format() {
         let config = crate::config::Config::default();
         let state = AppState::new(config.clone());
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
         let pairing = Arc::new(PairingService::new(
