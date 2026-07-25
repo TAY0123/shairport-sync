@@ -8,6 +8,7 @@ mod config;
 mod decoder;
 mod mdns;
 mod player;
+mod playout;
 mod ptp;
 mod state;
 mod web;
@@ -143,14 +144,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let rtp_handles = if config.airplay.enabled {
-        airplay::rtp::spawn_rtp_receivers(
-            config.airplay.clone(),
-            app_state.clone(),
-            audio_engine.clone(),
+        Some(
+            airplay::rtp::spawn_rtp_receivers(
+                config.airplay.clone(),
+                app_state.clone(),
+                audio_engine.clone(),
+            )
+            .await?,
         )
-        .await?
     } else {
-        Vec::new()
+        None
     };
 
     // AP2 audio listeners are session-owned and opened during RTSP stream SETUP.
@@ -204,8 +207,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = rtsp_handle {
         handle.abort();
     }
-    for handle in rtp_handles {
-        handle.abort();
+    if let Some(rtp_handles) = rtp_handles {
+        for handle in rtp_handles.network {
+            handle.abort();
+        }
+        rtp_handles.worker.abort();
     }
     drop(audio_output);
     Ok(())
