@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -16,6 +16,14 @@ use crate::{
     airplay::session_crypto::SessionCrypto, audio::AudioDevice, codec::AudioFormat, config::Config,
 };
 
+/// Runtime-only AP1 remote transport endpoints (control + timing).
+/// Not serialized — reconstructed from SETUP Transport header at runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ap1RemoteEndpoints {
+    pub control: SocketAddr,
+    pub timing: SocketAddr,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<StateSnapshot>>,
@@ -30,6 +38,9 @@ pub struct AppState {
     pub alac_channels: Arc<RwLock<Option<u16>>>,
     pub frames_per_packet: Arc<RwLock<Option<u32>>>,
     pub track_transition_epoch: Arc<AtomicU64>,
+    /// AP1 remote transport endpoints (control + timing UDP), set during
+    /// classic SETUP and cleared on owner teardown / connection cleanup.
+    pub ap1_remote_endpoints: Arc<RwLock<Option<Ap1RemoteEndpoints>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,6 +202,7 @@ impl AppState {
             alac_channels: Arc::new(RwLock::new(None)),
             frames_per_packet: Arc::new(RwLock::new(None)),
             track_transition_epoch: Arc::new(AtomicU64::new(0)),
+            ap1_remote_endpoints: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -432,6 +444,39 @@ impl AppState {
         });
     }
 
+    /// Store the AP1 remote control and timing endpoints from a classic SETUP
+    /// Transport header.  Publishes `ap1_remote_control` and `ap1_remote_timing`
+    /// diagnostics.
+    pub fn set_ap1_remote_endpoints(&self, peer_ip: IpAddr, control_port: u16, timing_port: u16) {
+        let control = SocketAddr::new(peer_ip, control_port);
+        let timing = SocketAddr::new(peer_ip, timing_port);
+        let endpoints = Ap1RemoteEndpoints { control, timing };
+        *self.ap1_remote_endpoints.write() = Some(endpoints);
+        self.mutate(|state| {
+            state
+                .diagnostics
+                .insert("ap1_remote_control".into(), control.to_string());
+            state
+                .diagnostics
+                .insert("ap1_remote_timing".into(), timing.to_string());
+        });
+    }
+
+    /// Return a snapshot of the current AP1 remote transport endpoints, if any.
+    pub fn ap1_remote_endpoints(&self) -> Option<Ap1RemoteEndpoints> {
+        *self.ap1_remote_endpoints.read()
+    }
+
+    /// Clear the AP1 remote transport endpoints (owner teardown / cleanup).
+    /// Removes `ap1_remote_control` and `ap1_remote_timing` diagnostics.
+    pub fn clear_ap1_remote_endpoints(&self) {
+        *self.ap1_remote_endpoints.write() = None;
+        self.mutate(|state| {
+            state.diagnostics.remove("ap1_remote_control");
+            state.diagnostics.remove("ap1_remote_timing");
+        });
+    }
+
     pub fn set_dacp_endpoint(&self, endpoint: Option<SocketAddr>) {
         self.mutate(|state| {
             state.remote_control.dacp_addr = endpoint.map(|addr| addr.to_string());
@@ -460,5 +505,74 @@ impl AppState {
             state.clone()
         };
         let _ = self.events.send(snapshot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ap1_remote_endpoints_default_none() {
+        let state = AppState::new(crate::config::Config::default());
+        assert!(state.ap1_remote_endpoints().is_none());
+    }
+
+    #[test]
+    fn ap1_remote_endpoints_set_and_retrieve() {
+        let state = AppState::new(crate::config::Config::default());
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        state.set_ap1_remote_endpoints(ip, 6001, 6002);
+
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(ip, 6001));
+        assert_eq!(eps.timing, SocketAddr::new(ip, 6002));
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.diagnostics
+                .get("ap1_remote_control")
+                .map(String::as_str),
+            Some("192.168.1.100:6001")
+        );
+        assert_eq!(
+            snap.diagnostics
+                .get("ap1_remote_timing")
+                .map(String::as_str),
+            Some("192.168.1.100:6002")
+        );
+    }
+
+    #[test]
+    fn ap1_remote_endpoints_clear_removes_diagnostics() {
+        let state = AppState::new(crate::config::Config::default());
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        state.set_ap1_remote_endpoints(ip, 5000, 5001);
+
+        state.clear_ap1_remote_endpoints();
+        assert!(state.ap1_remote_endpoints().is_none());
+
+        let snap = state.snapshot();
+        assert!(!snap.diagnostics.contains_key("ap1_remote_control"));
+        assert!(!snap.diagnostics.contains_key("ap1_remote_timing"));
+    }
+
+    #[test]
+    fn ap1_remote_endpoints_ipv6() {
+        let state = AppState::new(crate::config::Config::default());
+        let ip: IpAddr = "fd00::1".parse().unwrap();
+        state.set_ap1_remote_endpoints(ip, 7000, 7001);
+
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(ip, 7000));
+        assert_eq!(eps.timing, SocketAddr::new(ip, 7001));
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.diagnostics
+                .get("ap1_remote_control")
+                .map(String::as_str),
+            Some("[fd00::1]:7000")
+        );
     }
 }

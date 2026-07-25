@@ -729,6 +729,9 @@ fn perform_connection_cleanup(
         *state.session_crypto.write() = None;
         *state.ap2_media_key.write() = None;
         *state.ap2_audio_format.write() = None;
+        state.clear_ap1_remote_endpoints();
+        session.ap1_remote_control_port = None;
+        session.ap1_remote_timing_port = None;
         dacp.clear_session();
         session.is_playback_owner = false;
     }
@@ -1021,9 +1024,6 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("SETUP", _) => {
-            session.session_id = Some("1".to_string());
-            state.set_active(true);
-
             // Detect AP2 SETUP from Content-Type
             let is_ap2 = request
                 .headers
@@ -1032,7 +1032,13 @@ fn route_request(
                 .unwrap_or(false);
 
             if is_ap2 && config.airplay2_enabled {
-                handle_ap2_setup(config, state, session, request, playout, dacp).with_cseq(request)
+                let response = handle_ap2_setup(config, state, session, request, playout, dacp)
+                    .with_cseq(request);
+                if (200..300).contains(&response.code) {
+                    session.session_id = Some("1".to_string());
+                    state.set_active(true);
+                }
+                response
             } else if is_ap2 {
                 // AP2 plist but AP2 is disabled - respond with error
                 warn!("AP2 SETUP received but airplay2_enabled is false");
@@ -1046,6 +1052,47 @@ fn route_request(
                 let server_port = config.audio_port;
                 let control_port = config.control_port;
                 let timing_port = config.timing_port;
+
+                // Parse remote control/timing ports from the Transport header.
+                // If the client does not supply valid ports we MUST return 400
+                // rather than advertise a transport that cannot support timing/resend.
+                let Some(transport_val) = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("Transport"))
+                    .map(|(_, value)| value)
+                else {
+                    warn!("AP1 SETUP missing Transport header");
+                    return response(400, "Bad Request")
+                        .header("X-Reason", "missing Transport header")
+                        .with_cseq(request);
+                };
+                let params = match parse_ap1_transport_header(transport_val) {
+                    Ok(params) => params,
+                    Err(err) => {
+                        warn!(%err, transport_val, "AP1 SETUP invalid Transport header");
+                        return response(400, "Bad Request")
+                            .header("X-Reason", format!("invalid transport: {err}"))
+                            .with_cseq(request);
+                    }
+                };
+                let Some(peer) = session.peer_addr else {
+                    warn!("AP1 SETUP has no connection peer address");
+                    return response(400, "Bad Request")
+                        .header("X-Reason", "missing peer address")
+                        .with_cseq(request);
+                };
+                info!(
+                    remote_control = params.control_port,
+                    remote_timing = params.timing_port,
+                    "AP1 SETUP remote ports parsed"
+                );
+                state.set_ap1_remote_endpoints(peer.ip(), params.control_port, params.timing_port);
+                session.ap1_remote_control_port = Some(params.control_port);
+                session.ap1_remote_timing_port = Some(params.timing_port);
+                session.session_id = Some("1".to_string());
+                state.set_active(true);
+
                 info!(server_port, control_port, timing_port, "AP1 SETUP");
                 response(200, "OK")
                     .header("Session", "1")
@@ -1138,6 +1185,9 @@ fn route_request(
                 *state.session_crypto.write() = None;
                 *state.ap2_media_key.write() = None;
                 *state.ap2_audio_format.write() = None;
+                state.clear_ap1_remote_endpoints();
+                session.ap1_remote_control_port = None;
+                session.ap1_remote_timing_port = None;
                 dacp.clear_session();
                 session.is_playback_owner = false;
             }
@@ -1165,6 +1215,71 @@ fn route_request(
     }
 
     resp
+}
+
+/// Result of parsing a classic SETUP Transport header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ap1TransportParams {
+    control_port: u16,
+    timing_port: u16,
+}
+
+/// Parse the classic SETUP `Transport` header value.
+///
+/// Expected format:
+///   `RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002`
+///
+/// Keys are matched case-insensitively.  Both `control_port` / `controlPort`
+/// and `timing_port` / `timingPort` are accepted.  Zero, out-of-range, and
+/// non-numeric port values are rejected.  Unrelated tokens (e.g. the RTP
+/// profile, `unicast`, `mode=record`) are silently ignored.
+fn parse_ap1_transport_header(value: &str) -> Result<Ap1TransportParams, String> {
+    let mut control_port: Option<u16> = None;
+    let mut timing_port: Option<u16> = None;
+
+    for token in value.split(';') {
+        let token = token.trim();
+        if let Some((key, val)) = token.split_once('=') {
+            let key = key.trim().to_ascii_lowercase();
+            let val = val.trim();
+            match key.as_str() {
+                "control_port" | "controlport" => {
+                    if control_port.is_some() {
+                        return Err("duplicate control_port parameter".into());
+                    }
+                    let port: u16 = val
+                        .parse()
+                        .map_err(|_| format!("invalid control_port value: {val}"))?;
+                    if port == 0 {
+                        return Err(format!("control_port must not be zero: {val}"));
+                    }
+                    control_port = Some(port);
+                }
+                "timing_port" | "timingport" => {
+                    if timing_port.is_some() {
+                        return Err("duplicate timing_port parameter".into());
+                    }
+                    let port: u16 = val
+                        .parse()
+                        .map_err(|_| format!("invalid timing_port value: {val}"))?;
+                    if port == 0 {
+                        return Err(format!("timing_port must not be zero: {val}"));
+                    }
+                    timing_port = Some(port);
+                }
+                _ => { /* tolerate unrelated key=value tokens */ }
+            }
+        }
+        // Bare tokens (no '=') are tolerated
+    }
+
+    let control_port = control_port.ok_or_else(|| "missing control_port parameter".to_string())?;
+    let timing_port = timing_port.ok_or_else(|| "missing timing_port parameter".to_string())?;
+
+    Ok(Ap1TransportParams {
+        control_port,
+        timing_port,
+    })
 }
 
 /// Build the `Apple-Response` header value from a base64-encoded challenge,
@@ -1432,6 +1547,10 @@ struct RtspSession {
     dacp_id: Option<String>,
     active_remote: Option<String>,
     session_key: Option<Vec<u8>>,
+    /// AP1 remote control port parsed from classic SETUP Transport header.
+    ap1_remote_control_port: Option<u16>,
+    /// AP1 remote timing port parsed from classic SETUP Transport header.
+    ap1_remote_timing_port: Option<u16>,
     /// true when this connection established (or currently controls) the
     /// principal playback session — i.e. it sent a successful classic
     /// ANNOUNCE with valid crypto, or a successful AP2 audio SETUP/RECORD.
@@ -2830,6 +2949,7 @@ mod tests {
     use super::*;
     use crate::playout::scheduler::{PlayoutCommand, PlayoutHandle};
     use rsa::pkcs1v15::Pkcs1v15Sign;
+    use std::sync::Arc;
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Create a test-only [`PlayoutHandle`] and its associated command and
@@ -3986,5 +4106,393 @@ mod tests {
         crate::decoder::aes_cbc_decrypt_in_place(&key, &iv, &mut mixed).unwrap();
         // The last byte must be unchanged; first 16 are decrypted
         assert_eq!(mixed[16], 0x42, "trailing byte must be unchanged");
+    }
+
+    // -------------------------------------------------------------------
+    // AP1 Transport header parser
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_ap1_transport_ipv4_lowercase() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 6001);
+        assert_eq!(params.timing_port, 6002);
+    }
+
+    #[test]
+    fn parse_ap1_transport_mixed_case_keys() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;Control_Port=7000;TimingPort=7001",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 7000);
+        assert_eq!(params.timing_port, 7001);
+    }
+
+    #[test]
+    fn parse_ap1_transport_extra_tokens_tolerated() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=5000;timing_port=5001;foo=bar;baz",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 5000);
+        assert_eq!(params.timing_port, 5001);
+    }
+
+    #[test]
+    fn parse_ap1_transport_missing_control_port() {
+        let err = parse_ap1_transport_header("RTP/AVP/UDP;unicast;mode=record;timing_port=6002")
+            .unwrap_err();
+        assert!(err.contains("missing control_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_missing_timing_port() {
+        let err = parse_ap1_transport_header("RTP/AVP/UDP;unicast;mode=record;control_port=6001")
+            .unwrap_err();
+        assert!(err.contains("missing timing_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_zero_control_port() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=0;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("must not be zero"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_non_numeric_port() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=abc;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid control_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_port_out_of_range() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=99999;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid control_port"));
+    }
+
+    // -------------------------------------------------------------------
+    // AP1 SETUP stores remote endpoints, advertises local ports
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ap1_setup_stores_endpoints_and_returns_local_ports() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "192.168.1.50:51234".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.local_addr = Some("0.0.0.0:5000".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "tRaNsPoRt".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+
+        assert_eq!(resp.code, 200);
+
+        // Response must advertise local ports
+        let transport = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Transport"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert!(transport.contains(&format!("server_port={}", config.airplay.audio_port)));
+        assert!(transport.contains(&format!("control_port={}", config.airplay.control_port)));
+        assert!(transport.contains(&format!("timing_port={}", config.airplay.timing_port)));
+        assert!(state.snapshot().active);
+        assert_eq!(session.session_id.as_deref(), Some("1"));
+
+        // AppState must have the remote endpoints
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(peer.ip(), 6001));
+        assert_eq!(eps.timing, SocketAddr::new(peer.ip(), 6002));
+
+        // Session must have the remote ports
+        assert_eq!(session.ap1_remote_control_port, Some(6001));
+        assert_eq!(session.ap1_remote_timing_port, Some(6002));
+    }
+
+    #[test]
+    fn ap1_setup_ipv6_stores_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "[fd00::1]:51234".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.local_addr = Some("[::]:5000".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=7000;timing_port=7001".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 200);
+
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(peer.ip(), 7000));
+        assert_eq!(eps.timing, SocketAddr::new(peer.ip(), 7001));
+    }
+
+    #[test]
+    fn ap1_setup_missing_transport_returns_400() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        session.peer_addr = Some("10.0.0.1:12345".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn ap1_setup_invalid_transport_returns_400() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        session.peer_addr = Some("10.0.0.1:12345".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=0;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn ap1_setup_missing_peer_returns_400_without_activation() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn owner_cleanup_clears_ap1_remote_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.is_playback_owner = true;
+
+        // Set up remote endpoints first
+        state.set_ap1_remote_endpoints(peer.ip(), 6001, 6002);
+        assert!(state.ap1_remote_endpoints().is_some());
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+
+        assert!(state.ap1_remote_endpoints().is_none());
+        let snap = state.snapshot();
+        assert!(!snap.diagnostics.contains_key("ap1_remote_control"));
+        assert!(!snap.diagnostics.contains_key("ap1_remote_timing"));
+    }
+
+    #[test]
+    fn non_owner_cleanup_preserves_ap1_remote_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        session.peer_addr = Some(peer);
+        // is_playback_owner defaults to false — non-owner probe
+
+        // Set up remote endpoints
+        state.set_ap1_remote_endpoints(peer.ip(), 6001, 6002);
+        assert!(state.ap1_remote_endpoints().is_some());
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+
+        // Non-owner cleanup must NOT clear AP1 remote endpoints
+        assert!(state.ap1_remote_endpoints().is_some());
+        let snap = state.snapshot();
+        assert!(snap.diagnostics.contains_key("ap1_remote_control"));
+        assert!(snap.diagnostics.contains_key("ap1_remote_timing"));
     }
 }
