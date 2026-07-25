@@ -6,7 +6,7 @@ use cpal::{
 use parking_lot::Mutex;
 use ringbuf::{
     HeapRb,
-    traits::{Consumer, Producer, Split},
+    traits::{Consumer, Split},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -15,7 +15,11 @@ use std::sync::{
 };
 
 use crate::codec;
-use crate::config::{AudioConfig, AudioHostName};
+use crate::config::{AudioConfig, AudioHostName, MAX_PCM_FIFO_MS};
+
+/// Maximum ring-buffer size in f32 samples (~32 MiB for 8_388_608 samples).
+/// Caps allocations regardless of sample rate, channel count, or duration.
+const MAX_CAPACITY_SAMPLES: usize = 8_388_608;
 
 #[derive(Clone)]
 pub struct AudioManager {
@@ -36,6 +40,47 @@ pub struct SelectAudioDeviceRequest {
     pub device_id: Option<String>,
 }
 
+/// Result of a frame-oriented enqueue operation.
+///
+/// Most fields are expressed in **frames** (one frame = `channels` samples).
+/// `trailing_samples` captures any incomplete frame at the end of the input
+/// that cannot be enqueued — it is always < `channels`.
+/// Use the sample-count helpers when a flat sample count is needed:
+/// they include `trailing_samples` in `requested_samples` and
+/// `rejected_samples` for a faithful total.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EnqueueResult {
+    /// Number of complete frames presented for enqueue.
+    pub requested_frames: usize,
+    /// Number of complete frames actually enqueued.
+    pub accepted_frames: usize,
+    /// Number of complete frames rejected (full buffer).
+    pub rejected_frames: usize,
+    /// Incomplete trailing samples (0 ≤ trailing_samples < channels) that
+    /// were presented but could not form a complete frame.
+    pub trailing_samples: usize,
+    /// Output channel count used for the operation.
+    pub channels: u16,
+}
+
+impl EnqueueResult {
+    /// Total samples presented (`requested_frames * channels + trailing_samples`).
+    pub fn requested_samples(&self) -> usize {
+        self.requested_frames * self.channels as usize + self.trailing_samples
+    }
+
+    /// Samples successfully enqueued (`accepted_frames * channels`).
+    /// Trailing samples are never accepted.
+    pub fn accepted_samples(&self) -> usize {
+        self.accepted_frames * self.channels as usize
+    }
+
+    /// Samples rejected (`rejected_frames * channels + trailing_samples`).
+    pub fn rejected_samples(&self) -> usize {
+        self.rejected_frames * self.channels as usize + self.trailing_samples
+    }
+}
+
 /// Producer/control side of the audio pipeline.
 ///
 /// Cloneable and shared across the application. Owns the ring-buffer
@@ -53,6 +98,10 @@ pub struct AudioEngine {
     callback_underrun_samples: Arc<AtomicUsize>,
     /// Cumulative samples the producer could not push because the ring buffer was full.
     producer_overflow_samples: Arc<AtomicUsize>,
+    /// Cumulative samples rejected solely because playback was disabled.
+    /// Tracked independently of [`producer_overflow_samples`] so callers can
+    /// distinguish "we chose not to play" from a genuine FIFO overflow.
+    playback_disabled_rejected_samples: Arc<AtomicUsize>,
     /// Number of times a flush was requested (clear-output/flush events).
     flush_count: Arc<AtomicU64>,
     /// Monotonically incrementing flush epoch. Each clear_output_samples / request_flush
@@ -116,6 +165,12 @@ pub struct AudioEngineStatus {
     pub callback_underrun_frames: usize,
     pub producer_overflow_samples: usize,
     pub producer_overflow_frames: usize,
+    /// Samples rejected solely because playback was disabled.
+    #[serde(default)]
+    pub playback_disabled_rejected_samples: usize,
+    /// playback_disabled_rejected_samples / output_channels (0 when channels is 0)
+    #[serde(default)]
+    pub playback_disabled_rejected_frames: usize,
     pub flush_count: u64,
     pub max_observed_occupancy: usize,
 }
@@ -179,10 +234,179 @@ impl AudioManager {
             .collect()
     }
 
+    /// Select the CPAL device, create an [`AudioEngine`] with capacity
+    /// derived from `config.audio.pcm_fifo_ms` and the actual sample rate /
+    /// channel count, build the output stream, and return both.
+    ///
+    /// The [`AudioConsumer`] is created internally and moved into the
+    /// output callback — the caller only receives the engine (for the
+    /// producer path) and the output handle (to keep the stream alive).
+    ///
+    /// If the output stream cannot be created the engine is still returned
+    /// so the application can continue (RTP enqueue will still function;
+    /// samples will overflow once the ring is full).
+    pub fn create_engine_and_output(&self) -> (AudioEngine, anyhow::Result<AudioOutput>) {
+        // normalize() is idempotent — Config::load already normalized, but
+        // tests may construct AudioConfig directly, so keep this safety net.
+        let mut config = self.config.clone();
+        config.normalize();
+
+        let device_result = self.open_device();
+        let (device, stream_config, sample_format) = match device_result {
+            Ok(t) => t,
+            Err(err) => {
+                let (engine, _consumer) = AudioEngine::new_for_output(44100, 2, config.pcm_fifo_ms);
+                return (engine, Err(err));
+            }
+        };
+
+        let (engine, consumer) = AudioEngine::new_for_output(
+            stream_config.sample_rate,
+            stream_config.channels,
+            config.pcm_fifo_ms,
+        );
+
+        tracing::info!(
+            sample_rate = stream_config.sample_rate,
+            channels = stream_config.channels,
+            sample_format = ?sample_format,
+            pcm_fifo_ms = config.pcm_fifo_ms,
+            "CPAL output stream format"
+        );
+
+        let output = self.build_stream(device, &stream_config, sample_format, consumer);
+        (engine, output)
+    }
+
+    /// Select the CPAL host and output device; return the device, its
+    /// stream config, and sample format.
+    fn open_device(&self) -> anyhow::Result<(cpal::Device, cpal::StreamConfig, SampleFormat)> {
+        let host_id = match self.config.host {
+            AudioHostName::Default => cpal::default_host().id(),
+            host => host_to_cpal(host)
+                .context("requested CPAL host is not available on this platform")?,
+        };
+        let host = cpal::host_from_id(host_id).context("failed to initialise CPAL host")?;
+        let device = if let Some(selected) = &self.config.device {
+            host.output_devices()?
+                .find(|device| {
+                    #[allow(deprecated)]
+                    let name = device.name().unwrap_or_default();
+                    format!("{host_id:?}:{name}") == *selected
+                })
+                .or_else(|| host.default_output_device())
+        } else {
+            host.default_output_device()
+        }
+        .context("no CPAL output device available")?;
+        let (stream_config, sample_format) = choose_stream_config(&device)?;
+        Ok((device, stream_config, sample_format))
+    }
+
+    /// Build and start the output stream, moving `consumer` into the
+    /// real-time callback.
+    fn build_stream(
+        &self,
+        device: cpal::Device,
+        stream_config: &cpal::StreamConfig,
+        sample_format: SampleFormat,
+        mut consumer: AudioConsumer,
+    ) -> anyhow::Result<AudioOutput> {
+        let err_fn = |err| tracing::warn!(%err, "CPAL output stream error");
+        let stream = match sample_format {
+            SampleFormat::F32 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [f32], _| {
+                    consumer.fill_output(data);
+                },
+                err_fn,
+                None,
+            )?,
+            SampleFormat::F64 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [f64], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::I8 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [i8], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::I16 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [i16], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::I24 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [I24], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::I32 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [i32], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::I64 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [i64], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U8 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [u8], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U16 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [u16], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U24 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [U24], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U32 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [u32], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            SampleFormat::U64 => device.build_output_stream(
+                stream_config,
+                move |data: &mut [u64], _| fill_converted(data, &mut consumer),
+                err_fn,
+                None,
+            )?,
+            sample_format => anyhow::bail!("unsupported CPAL sample format {sample_format:?}"),
+        };
+        stream.play()?;
+        Ok(AudioOutput {
+            _stream: stream,
+            sample_rate: stream_config.sample_rate,
+            channels: stream_config.channels,
+            sample_format,
+        })
+    }
+
+    /// Legacy API — create an output stream from a pre-existing engine and consumer.
+    ///
+    /// Prefer [`create_engine_and_output`] for new code; this method
+    /// exists for backward compatibility and tests.
     pub fn start_output(
         &self,
         engine: &AudioEngine,
-        mut consumer: AudioConsumer,
+        consumer: AudioConsumer,
     ) -> anyhow::Result<AudioOutput> {
         let host_id = match self.config.host {
             AudioHostName::Default => cpal::default_host().id(),
@@ -211,91 +435,7 @@ impl AudioManager {
             sample_format = ?sample_format,
             "CPAL output stream format"
         );
-        let err_fn = |err| tracing::warn!(%err, "CPAL output stream error");
-        let stream = match sample_format {
-            SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| {
-                    consumer.fill_output(data);
-                },
-                err_fn,
-                None,
-            )?,
-            SampleFormat::F64 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f64], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I8 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i8], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i16], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I24 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [I24], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i32], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::I64 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i64], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U8 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u8], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u16], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U24 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [U24], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u32], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            SampleFormat::U64 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u64], _| fill_converted(data, &mut consumer),
-                err_fn,
-                None,
-            )?,
-            sample_format => anyhow::bail!("unsupported CPAL sample format {sample_format:?}"),
-        };
-        stream.play()?;
-        Ok(AudioOutput {
-            _stream: stream,
-            sample_rate: stream_config.sample_rate,
-            channels: stream_config.channels,
-            sample_format,
-        })
+        self.build_stream(device, &stream_config, sample_format, consumer)
     }
 }
 
@@ -329,6 +469,7 @@ impl AudioEngine {
             playback_enabled: Arc::clone(&playback_enabled),
             callback_underrun_samples: Arc::clone(&callback_underrun_samples),
             producer_overflow_samples: Arc::new(AtomicUsize::new(0)),
+            playback_disabled_rejected_samples: Arc::new(AtomicUsize::new(0)),
             flush_count: Arc::new(AtomicU64::new(0)),
             flush_epoch: Arc::clone(&flush_epoch),
             flush_target_write_index: Arc::clone(&flush_target_write_index),
@@ -346,6 +487,43 @@ impl AudioEngine {
         (engine, audio_consumer)
     }
 
+    /// Create a new audio pipeline with capacity derived from a duration.
+    ///
+    /// `capacity_samples = ceil(sample_rate * fifo_ms / 1000) * channels`,
+    /// computed with overflow-safe u128 arithmetic.  The output format is
+    /// automatically set to `(sample_rate, channels)`.
+    ///
+    /// Capacity is clamped to [`MAX_CAPACITY_SAMPLES`] to prevent
+    /// unreasonable allocations from extreme inputs.  When clamping,
+    /// channel alignment is preserved and at least one frame is
+    /// guaranteed.
+    pub fn new_for_output(sample_rate: u32, channels: u16, fifo_ms: u32) -> (Self, AudioConsumer) {
+        let rate = sample_rate.max(1) as u128;
+        let ch = channels.max(1) as u128;
+        let ms = (fifo_ms.max(1) as u128).min(MAX_PCM_FIFO_MS as u128);
+
+        // Ceil division with u128 — safe for any realistic (rate, ms) pair.
+        let frames = (rate * ms).div_ceil(1000);
+        let samples = frames * ch;
+
+        // Clamp to the documented absolute maximum, preserving channel
+        // alignment and guaranteeing at least one frame.
+        let capacity_samples = if samples > MAX_CAPACITY_SAMPLES as u128 {
+            let max_aligned = (MAX_CAPACITY_SAMPLES as u128 / ch) * ch;
+            if max_aligned < ch {
+                ch as usize
+            } else {
+                max_aligned as usize
+            }
+        } else {
+            samples as usize
+        };
+
+        let (engine, consumer) = Self::new(capacity_samples);
+        engine.set_output_format(sample_rate, channels);
+        (engine, consumer)
+    }
+
     /// Return the current ring-buffer occupancy by observing the producer.
     fn occupied_len(&self) -> usize {
         use ringbuf::traits::Observer;
@@ -357,6 +535,11 @@ impl AudioEngine {
             sample_rate: sample_rate.max(1),
             channels: channels.max(1),
         };
+    }
+
+    /// Return the output channel count (≥ 1).
+    fn output_channels(&self) -> u16 {
+        self.output_format.lock().channels.max(1)
     }
 
     pub fn set_volume_db(&self, db: f64) {
@@ -396,8 +579,8 @@ impl AudioEngine {
         let converted =
             self.convert_interleaved_for_output(samples, input_sample_rate, input_channels);
         let total = converted.len();
-        let enqueued = self.enqueue_output_samples(&converted);
-        (enqueued, total)
+        let result = self.enqueue_output_frames(&converted);
+        (result.accepted_samples(), total)
     }
 
     pub fn convert_interleaved_for_output(
@@ -421,27 +604,78 @@ impl AudioEngine {
         }
     }
 
-    pub fn enqueue_output_samples(&self, samples: &[f32]) -> usize {
+    // -----------------------------------------------------------------------
+    // Frame-safe enqueue (core, new public API)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue complete audio frames, respecting `playback_enabled`.
+    ///
+    /// Returns an [`EnqueueResult`] with frame-level accounting.
+    /// Incomplete trailing samples (< `channels`) are never pushed;
+    /// they are counted as rejected.
+    pub fn enqueue_output_frames(&self, samples: &[f32]) -> EnqueueResult {
         if !self.playback_enabled.load(Ordering::Acquire) {
-            return 0;
+            let channels = self.output_channels() as usize;
+            let total_frames = samples.len() / channels.max(1);
+            let trailing = samples.len() % channels.max(1);
+            // All samples are rejected when playback is disabled;
+            // count both complete frames and trailing samples exactly once
+            // on a dedicated counter — not as a producer overflow.
+            let total_rejected = trailing + total_frames * channels.max(1);
+            if total_rejected > 0 {
+                self.playback_disabled_rejected_samples
+                    .fetch_add(total_rejected, Ordering::Release);
+            }
+            return EnqueueResult {
+                requested_frames: total_frames,
+                accepted_frames: 0,
+                rejected_frames: total_frames,
+                trailing_samples: trailing,
+                channels: channels as u16,
+            };
         }
-        self.enqueue_output_samples_unchecked(samples)
+        self.enqueue_output_frames_unchecked(samples)
     }
 
-    pub fn enqueue_output_samples_unchecked(&self, samples: &[f32]) -> usize {
+    /// Enqueue complete audio frames without checking `playback_enabled`.
+    ///
+    /// Same frame-safe semantics as [`enqueue_output_frames`] but skips
+    /// the playback-enabled guard.
+    pub fn enqueue_output_frames_unchecked(&self, samples: &[f32]) -> EnqueueResult {
+        let channels = self.output_channels() as usize;
+        let total_frames = samples.len() / channels; // floor-div → complete frames only
+        let trailing_samples = samples.len() % channels;
+
         let mut producer = self.producer.lock();
-        let pushed = samples
-            .iter()
-            .copied()
-            .take_while(|sample| producer.try_push(*sample).is_ok())
-            .count();
-        let overflow = samples.len() - pushed;
-        if overflow > 0 {
+
+        use ringbuf::traits::{Observer, Producer};
+        let occupied = producer.occupied_len();
+        let available_samples = self.capacity.saturating_sub(occupied);
+        let available_frames = available_samples / channels;
+
+        let frames_to_push = total_frames.min(available_frames);
+        let samples_to_push = frames_to_push * channels;
+
+        // Bulk write — push_slice returns the number of elements actually
+        // written, which must equal samples_to_push because we pre-computed
+        // the available space while holding the producer lock.
+        let pushed = producer.push_slice(&samples[..samples_to_push]);
+        debug_assert_eq!(
+            pushed, samples_to_push,
+            "push_slice wrote {pushed} of {samples_to_push} pre-computed samples"
+        );
+
+        let accepted_frames = pushed / channels;
+        let rejected_frames = total_frames - accepted_frames;
+
+        // Count all rejected samples: trailing incomplete frame + buffer-full.
+        let total_rejected_samples = trailing_samples + rejected_frames * channels;
+        if total_rejected_samples > 0 {
             self.producer_overflow_samples
-                .fetch_add(overflow, Ordering::Release);
+                .fetch_add(total_rejected_samples, Ordering::Release);
         }
-        // Track max observed occupancy from the ring buffer's true occupancy.
-        use ringbuf::traits::Observer;
+
+        // Track max observed occupancy.
         let current_occupancy = producer.occupied_len();
         let mut prev = self.max_observed_occupancy.load(Ordering::Acquire);
         while current_occupancy > prev {
@@ -455,12 +689,47 @@ impl AudioEngine {
                 Err(current) => prev = current,
             }
         }
-        pushed
+
+        EnqueueResult {
+            requested_frames: total_frames,
+            accepted_frames,
+            rejected_frames,
+            trailing_samples,
+            channels: channels as u16,
+        }
     }
 
-    /// Number of samples that can still be enqueued without overflow.
+    // -----------------------------------------------------------------------
+    // Legacy sample-oriented enqueue (delegates to frame-safe internals)
+    // -----------------------------------------------------------------------
+
+    /// Enqueue samples (legacy). Delegates to the frame-safe API and
+    /// returns the number of **samples** accepted.
+    ///
+    /// Incomplete trailing samples are rejected.  Prefer
+    /// [`enqueue_output_frames`] for new code.
+    pub fn enqueue_output_samples(&self, samples: &[f32]) -> usize {
+        self.enqueue_output_frames(samples).accepted_samples()
+    }
+
+    /// Enqueue samples without playback-enabled check (legacy).
+    /// Delegates to the frame-safe API.
+    pub fn enqueue_output_samples_unchecked(&self, samples: &[f32]) -> usize {
+        self.enqueue_output_frames_unchecked(samples)
+            .accepted_samples()
+    }
+
+    /// Number of **complete frames** that can still be enqueued without overflow.
+    pub fn available_frames(&self) -> usize {
+        let channels = self.output_channels() as usize;
+        self.capacity.saturating_sub(self.occupied_len()) / channels
+    }
+
+    /// Number of frame-aligned samples that can still be enqueued without overflow.
+    ///
+    /// The value is always a multiple of the output channel count.
     pub fn available_samples(&self) -> usize {
-        self.capacity.saturating_sub(self.occupied_len())
+        self.available_frames() * self.output_channels() as usize
     }
 
     /// Request the consumer to drain the ring buffer up to the current
@@ -507,6 +776,9 @@ impl AudioEngine {
         let capacity = self.capacity;
         let und_run = self.callback_underrun_samples.load(Ordering::Acquire);
         let over = self.producer_overflow_samples.load(Ordering::Acquire);
+        let disabled_rej = self
+            .playback_disabled_rejected_samples
+            .load(Ordering::Acquire);
         let flushes = self.flush_count.load(Ordering::Acquire);
         let max_occ = self.max_observed_occupancy.load(Ordering::Acquire);
 
@@ -526,6 +798,8 @@ impl AudioEngine {
             callback_underrun_frames: und_run / channels,
             producer_overflow_samples: over,
             producer_overflow_frames: over / channels,
+            playback_disabled_rejected_samples: disabled_rej,
+            playback_disabled_rejected_frames: disabled_rej / channels,
             flush_count: flushes,
             max_observed_occupancy: max_occ,
         }
@@ -756,10 +1030,10 @@ mod tests {
     fn audio_engine_preserves_sample_order_and_zeros_underrun() {
         let (engine, mut consumer) = AudioEngine::new(4);
         engine.set_output_format(48_000, 2);
-        assert_eq!(engine.enqueue_interleaved(&[0.1, 0.2, 0.3]), 3);
-        let mut out = [1.0; 5];
-        assert_eq!(consumer.fill_output(&mut out), 3);
-        assert_eq!(out, [0.1, 0.2, 0.3, 0.0, 0.0]);
+        assert_eq!(engine.enqueue_interleaved(&[0.1, 0.2, 0.3, 0.4]), 4);
+        let mut out = [1.0; 6];
+        assert_eq!(consumer.fill_output(&mut out), 4);
+        assert_eq!(out, [0.1, 0.2, 0.3, 0.4, 0.0, 0.0]);
     }
 
     #[test]
@@ -767,10 +1041,11 @@ mod tests {
         let (engine, mut consumer) = AudioEngine::new(4);
         engine.set_output_format(48_000, 2);
         engine.set_volume_db(-6.0);
-        assert_eq!(engine.enqueue_interleaved(&[1.0]), 1);
-        let mut out = [0.0; 1];
+        assert_eq!(engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        let mut out = [0.0; 2];
         consumer.fill_output(&mut out);
         assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
+        assert!((out[1] - 0.501_187_2).abs() < 0.000_01);
     }
 
     #[test]
@@ -782,6 +1057,27 @@ mod tests {
         let mut out = [1.0; 2];
         assert_eq!(consumer.fill_output(&mut out), 0);
         assert_eq!(out, [0.0, 0.0]);
+
+        // Disabled rejection is counted separately, not as overflow.
+        let s = engine.status();
+        assert_eq!(s.playback_disabled_rejected_samples, 2);
+        assert_eq!(s.playback_disabled_rejected_frames, 1);
+        assert_eq!(s.producer_overflow_samples, 0);
+    }
+
+    #[test]
+    fn disabled_rejection_does_not_increase_producer_overflow() {
+        let (engine, _consumer) = AudioEngine::new(4);
+        engine.set_output_format(48_000, 2);
+        engine.set_playback_enabled(false);
+
+        // Enqueue several frames while disabled — includes trailing sample.
+        engine.enqueue_output_samples(&[0.5; 7]); // 3 frames + 1 trailing, all rejected
+        let s = engine.status();
+        assert_eq!(s.playback_disabled_rejected_samples, 7);
+        assert_eq!(s.playback_disabled_rejected_frames, 3);
+        // producer_overflow must stay 0 — the ring buffer wasn't full.
+        assert_eq!(s.producer_overflow_samples, 0);
     }
 
     #[test]
@@ -895,9 +1191,12 @@ mod tests {
     #[test]
     fn producer_overflow_partial_push_counts_remainder() {
         let (engine, _consumer) = AudioEngine::new(5);
-        // Only 5 fit (capacity), the rest overflow.
-        assert_eq!(engine.enqueue_output_samples(&[0.1; 7]), 5);
-        assert_eq!(engine.status().producer_overflow_samples, 2);
+        engine.set_output_format(48_000, 2);
+        // Capacity 5 samples = 2 complete stereo frames (4 samples).
+        // Input 7 samples → 3 frames + 1 trailing → accepts 2 frames (4 samples).
+        // Rejected: 1 trailing + 2 over-capacity = 3 samples.
+        assert_eq!(engine.enqueue_output_samples(&[0.1; 7]), 4);
+        assert_eq!(engine.status().producer_overflow_samples, 3);
     }
 
     #[test]
@@ -1116,17 +1415,17 @@ mod tests {
         engine.request_flush(); // target advances to ≈ 50
 
         // Batch 3: enqueued after both flushes → must survive.
-        engine.enqueue_output_samples(&[3.0; 15]);
+        engine.enqueue_output_samples(&[3.0; 14]);
 
         let mut out = [0.0f32; 32];
         let filled = consumer.fill_output(&mut out);
-        assert_eq!(filled, 15, "only the 15 post-flush samples survive");
+        assert_eq!(filled, 14, "only the 14 post-flush samples survive");
         assert!(
-            out[..15].iter().all(|&s| (s - 3.0).abs() < 0.001),
+            out[..14].iter().all(|&s| (s - 3.0).abs() < 0.001),
             "surviving samples are from the last batch (value 3.0)"
         );
         assert!(
-            out[15..].iter().all(|&s| s.abs() < 0.001),
+            out[14..].iter().all(|&s| s.abs() < 0.001),
             "remaining slots are underrun zeros"
         );
     }
@@ -1195,7 +1494,7 @@ mod tests {
         }
         assert_eq!(consumer.consumer.occupied_len(), 0);
 
-        engine.enqueue_output_samples(&[0.8; 3]);
+        engine.enqueue_output_samples(&[0.8; 4]);
         let read = consumer.consumer.read_index();
         let target = engine.flush_target_write_index.load(Ordering::Acquire);
         let occupied = consumer.consumer.occupied_len();
@@ -1206,11 +1505,11 @@ mod tests {
             "pending boundary must be behind the current occupied region"
         );
 
-        let mut out = [0.0f32; 5];
+        let mut out = [0.0f32; 6];
         let filled = consumer.fill_output(&mut out);
-        assert_eq!(filled, 3);
-        assert!(out[..3].iter().all(|&s| (s - 0.8).abs() < 0.001));
-        assert!(out[3..].iter().all(|&s| s == 0.0));
+        assert_eq!(filled, 4);
+        assert!(out[..4].iter().all(|&s| (s - 0.8).abs() < 0.001));
+        assert!(out[4..].iter().all(|&s| s == 0.0));
     }
 
     // ---------------------------------------------------------------------------
@@ -1250,22 +1549,22 @@ mod tests {
         });
 
         for round in 0..40 {
-            engine.enqueue_output_samples(&[0.1; 5]);
+            engine.enqueue_output_samples(&[0.1; 6]);
             engine.request_flush();
             let post_value = 0.5 + round as f32 / 1000.0;
-            engine.enqueue_output_samples(&[post_value; 3]);
+            engine.enqueue_output_samples(&[post_value; 2]);
             assert!(engine.ring_occupied_len() <= CAP);
 
             command_tx.send(Command::Callback).unwrap();
             let (filled, output) = result_rx.recv().unwrap();
-            assert_eq!(filled, 3, "round {round}");
+            assert_eq!(filled, 2, "round {round}");
             assert!(
-                output[..3]
+                output[..2]
                     .iter()
                     .all(|&sample| (sample - post_value).abs() < 0.000_01),
                 "round {round}: post-boundary samples were not preserved"
             );
-            assert!(output[3..].iter().all(|&sample| sample == 0.0));
+            assert!(output[2..].iter().all(|&sample| sample == 0.0));
             assert_eq!(engine.ring_occupied_len(), 0, "round {round}");
         }
 
@@ -1279,15 +1578,10 @@ mod tests {
     // in earlier phases.
     // ---------------------------------------------------------------------------
 
-    /// `enqueue_output_samples` operates on individual f32 samples, not audio
-    /// frames. When the output is stereo an odd-length slice produces a
-    /// dangling half-frame that the consumer reads as a lone left-channel
-    /// sample followed by zero (underrun) for the right channel.
-    ///
-    /// Desired frame-safe invariant: for stereo output (2 channels), every
-    /// enqueued sample count must be even — no partial frame is ever accepted.
+    /// After Phase 2 frame-safe enqueue, odd-length input for stereo output
+    /// is rejected: only complete frames are accepted, and the trailing
+    /// sample is counted as overflow.
     #[test]
-    #[ignore = "bug: sample-oriented enqueue accepts an odd number of samples, producing a partial stereo frame"]
     fn enqueue_rejects_partial_stereo_frame() {
         let (engine, _consumer) = AudioEngine::new(16);
         engine.set_output_format(48_000, 2);
@@ -1397,5 +1691,210 @@ mod tests {
              This causes immediate underrun bursts on the first callback.",
             status.queued_ms as f64
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 2 — frame-safe enqueue, bulk writes, and duration sizing tests.
+    // ---------------------------------------------------------------------------
+
+    /// Four-channel output: incomplete trailing frame (< 4 samples) must be
+    /// rejected and counted as overflow.
+    #[test]
+    fn enqueue_rejects_partial_4_channel_frame() {
+        let (engine, _consumer) = AudioEngine::new(32);
+        engine.set_output_format(48_000, 4);
+        // 7 samples = 1 complete 4-ch frame + 3 trailing
+        let result = engine.enqueue_output_frames(&[0.1; 7]);
+        assert_eq!(result.channels, 4);
+        assert_eq!(result.requested_frames, 1); // floor(7/4)
+        assert_eq!(result.accepted_frames, 1);
+        assert_eq!(result.rejected_frames, 0);
+        assert_eq!(result.trailing_samples, 3);
+        assert_eq!(result.requested_samples(), 7); // 1*4 + 3
+        assert_eq!(result.accepted_samples(), 4);
+        assert_eq!(result.rejected_samples(), 3); // 0*4 + 3
+
+        let s = engine.status();
+        assert_eq!(s.queued_samples, 4);
+        // The 3 trailing samples are counted as overflow.
+        assert_eq!(s.producer_overflow_samples, 3);
+    }
+
+    /// When ring-buffer vacancy is smaller than one complete frame, no
+    /// samples are accepted and everything is counted as overflow.
+    #[test]
+    fn vacancy_smaller_than_one_frame_rejects_all() {
+        // Capacity 3 samples, stereo → 1 complete frame (2 samples).
+        let (engine, _consumer) = AudioEngine::new(3);
+        engine.set_output_format(48_000, 2);
+        // Fill with 1 frame (2 samples) → vacancy = 1 sample < 1 frame.
+        assert_eq!(engine.enqueue_output_samples(&[1.0, 2.0]), 2);
+        assert_eq!(engine.available_frames(), 0);
+        assert_eq!(engine.available_samples(), 0);
+
+        // Try to push 2 frames (4 samples) → rejected entirely.
+        let result = engine.enqueue_output_frames(&[3.0; 4]);
+        assert_eq!(result.requested_frames, 2);
+        assert_eq!(result.accepted_frames, 0);
+        assert_eq!(result.rejected_frames, 2);
+        assert_eq!(engine.status().producer_overflow_samples, 4);
+    }
+
+    /// Bulk enqueue preserves sample order when pushing multiple frames at once.
+    #[test]
+    fn bulk_enqueue_preserves_sample_order() {
+        let (engine, mut consumer) = AudioEngine::new(1024);
+        engine.set_output_format(48_000, 2);
+        // Push 100 stereo frames in one call.
+        let mut input = Vec::with_capacity(200);
+        for i in 0..200 {
+            input.push(i as f32 * 0.01);
+        }
+        let result = engine.enqueue_output_frames(&input);
+        assert_eq!(result.accepted_frames, 100);
+        assert_eq!(result.rejected_frames, 0);
+
+        // Read back — order must be preserved.
+        let mut out = vec![0.0f32; 200];
+        let filled = consumer.fill_output(&mut out);
+        assert_eq!(filled, 200);
+        for (i, &s) in out.iter().enumerate() {
+            assert!(
+                (s - i as f32 * 0.01).abs() < 0.0001,
+                "sample {i}: expected {}, got {s}",
+                i as f32 * 0.01
+            );
+        }
+    }
+
+    /// Duration-based sizing at 44.1 kHz stereo with 150 ms → ceil(44100*150/1000)*2.
+    #[test]
+    fn duration_sizing_44100_stereo_150ms() {
+        let (engine, _consumer) = AudioEngine::new_for_output(44_100, 2, 150);
+        let s = engine.status();
+        assert_eq!(s.output_sample_rate, 44_100);
+        assert_eq!(s.output_channels, 2);
+        // ceil(44100 * 150 / 1000) * 2 = ceil(6615.0) * 2 = 6615 * 2 = 13230
+        assert_eq!(s.capacity_samples, 13230);
+        assert_eq!(s.capacity_frames, 6615);
+    }
+
+    /// Duration-based sizing at 48 kHz, 6-channel with 200 ms.
+    #[test]
+    fn duration_sizing_48000_6ch_200ms() {
+        let (engine, _consumer) = AudioEngine::new_for_output(48_000, 6, 200);
+        let s = engine.status();
+        assert_eq!(s.output_sample_rate, 48_000);
+        assert_eq!(s.output_channels, 6);
+        // ceil(48000 * 200 / 1000) * 6 = ceil(9600.0) * 6 = 9600 * 6 = 57600
+        assert_eq!(s.capacity_samples, 57600);
+        assert_eq!(s.capacity_frames, 9600);
+    }
+
+    /// Duration sizing with a sub-millisecond rounding case.
+    #[test]
+    fn duration_sizing_rounds_up_to_next_frame() {
+        // 48 kHz, 2 ch, 1 ms → ceil(48) * 2 = 96
+        let (engine, _consumer) = AudioEngine::new_for_output(48_000, 2, 1);
+        let s = engine.status();
+        assert_eq!(s.capacity_samples, 96);
+        assert_eq!(s.capacity_frames, 48);
+    }
+
+    /// new_for_output with zero or extreme values is clamped safely.
+    #[test]
+    fn duration_sizing_clamps_zero_values() {
+        let (engine, _consumer) = AudioEngine::new_for_output(0, 0, 0);
+        // Everything clamped to max(1).
+        let s = engine.status();
+        assert_eq!(s.output_sample_rate, 1);
+        assert_eq!(s.output_channels, 1);
+        assert_eq!(s.capacity_samples, 1); // ceil(1*1/1000)*1 = 1
+    }
+
+    /// EnqueueResult sample helpers return correct values including trailing samples.
+    #[test]
+    fn enqueue_result_sample_helpers() {
+        let result = EnqueueResult {
+            requested_frames: 10,
+            accepted_frames: 7,
+            rejected_frames: 3,
+            trailing_samples: 2,
+            channels: 4,
+        };
+        assert_eq!(result.requested_samples(), 42); // 10*4 + 2
+        assert_eq!(result.accepted_samples(), 28); // 7*4
+        assert_eq!(result.rejected_samples(), 14); // 3*4 + 2
+    }
+
+    /// available_frames and available_samples are channel-aligned.
+    #[test]
+    fn available_frames_is_channel_aligned() {
+        let (engine, _consumer) = AudioEngine::new(10);
+        engine.set_output_format(48_000, 2);
+
+        // 10 samples capacity → 5 frames. All available.
+        assert_eq!(engine.available_frames(), 5);
+        assert_eq!(engine.available_samples(), 10);
+
+        // Enqueue 4 samples (2 frames) → 3 frames remain.
+        engine.enqueue_output_samples(&[1.0; 4]);
+        assert_eq!(engine.available_frames(), 3);
+        assert_eq!(engine.available_samples(), 6);
+    }
+
+    /// Stereo output: incomplete trailing sample must be reflected in
+    /// the EnqueueResult and counted as overflow.
+    #[test]
+    fn enqueue_rejects_partial_stereo_frame_with_trailing() {
+        let (engine, _consumer) = AudioEngine::new(16);
+        engine.set_output_format(48_000, 2);
+        // 5 samples = 2 complete stereo frames + 1 trailing
+        let result = engine.enqueue_output_frames(&[0.1; 5]);
+        assert_eq!(result.channels, 2);
+        assert_eq!(result.requested_frames, 2);
+        assert_eq!(result.accepted_frames, 2);
+        assert_eq!(result.rejected_frames, 0);
+        assert_eq!(result.trailing_samples, 1);
+        assert_eq!(result.requested_samples(), 5); // 2*2 + 1
+        assert_eq!(result.rejected_samples(), 1); // 0*2 + 1
+
+        let s = engine.status();
+        assert_eq!(s.queued_samples, 4);
+        assert_eq!(s.producer_overflow_samples, 1);
+    }
+
+    /// new_for_output with u32::MAX / u16::MAX inputs must not panic,
+    /// must allocate bounded channel-aligned capacity ≥ 1 frame.
+    #[test]
+    fn new_for_output_extreme_inputs_bounded() {
+        let (engine, _consumer) = AudioEngine::new_for_output(u32::MAX, u16::MAX, u32::MAX);
+        let s = engine.status();
+        assert!(s.capacity_samples > 0);
+        assert!(s.capacity_samples <= MAX_CAPACITY_SAMPLES);
+        // Channel-aligned.
+        assert_eq!(s.capacity_samples % s.output_channels.max(1) as usize, 0);
+    }
+
+    /// new_for_output with an enormous fifo_ms clamps to the
+    /// MAX_PCM_FIFO_MS ceiling and does not exceed MAX_CAPACITY_SAMPLES.
+    #[test]
+    fn new_for_output_max_fifo_clamped() {
+        // 10_000 ms at 192 kHz stereo → would be huge but must be capped.
+        let (engine, _consumer) = AudioEngine::new_for_output(192_000, 2, 50_000);
+        let s = engine.status();
+        assert!(s.capacity_samples > 0);
+        assert!(s.capacity_samples <= MAX_CAPACITY_SAMPLES);
+        assert_eq!(s.capacity_samples % 2, 0);
+    }
+
+    /// new_for_output with MAX_PCM_FIFO_MS at max channel count is bounded.
+    #[test]
+    fn new_for_output_max_channels_bounded() {
+        let (engine, _consumer) = AudioEngine::new_for_output(384_000, u16::MAX, MAX_PCM_FIFO_MS);
+        let s = engine.status();
+        assert!(s.capacity_samples > 0);
+        assert!(s.capacity_samples <= MAX_CAPACITY_SAMPLES);
+        assert_eq!(s.capacity_samples % s.output_channels.max(1) as usize, 0);
     }
 }

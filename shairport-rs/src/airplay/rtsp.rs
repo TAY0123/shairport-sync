@@ -2814,8 +2814,8 @@ mod tests {
         apply_set_parameter(&state, &audio_engine, &dacp, None, &request);
 
         assert_eq!(state.snapshot().volume.airplay_db, -6.0);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 1);
-        let mut out = [0.0];
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        let mut out = [0.0; 2];
         consumer.fill_output(&mut out);
         assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
     }
@@ -2854,7 +2854,7 @@ mod tests {
         apply_ap2_command(&state, &audio_engine, &player, &dacp, &pause);
 
         assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 0);
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 0);
 
         let play = ap2_command_request("play");
         apply_ap2_command(&state, &audio_engine, &player, &dacp, &play);
@@ -2863,7 +2863,7 @@ mod tests {
             state.snapshot().player_state,
             PlayerState::Playing
         ));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 1);
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 2);
     }
 
     #[test]
@@ -2879,7 +2879,7 @@ mod tests {
         *state.frames_per_packet.write() = Some(352);
         let epoch = state.track_transition_epoch();
         let (audio_engine, mut consumer) = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0, 1.0]), 4);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 
@@ -2896,7 +2896,7 @@ mod tests {
         assert_eq!(snapshot.track.progress_ms, Some(0));
         assert!(snapshot.track.awaiting_title);
         assert_eq!(audio_engine.status().queued_samples, 0);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 0);
+        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 0);
         assert!(state.ap2_audio_format.read().is_none());
         assert!(state.alac_sample_rate.read().is_none());
         assert!(state.alac_sample_size.read().is_none());
@@ -2929,13 +2929,13 @@ mod tests {
         );
 
         assert!(state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 0);
+        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 0);
 
         let metadata = ap2_now_playing_request("New song", "Singer", "Record");
         apply_ap2_command(&state, &audio_engine, &player, &dacp, &metadata);
 
         assert!(!state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 1);
+        assert_eq!(audio_engine.enqueue_interleaved(&[0.5, 0.5]), 2);
     }
 
     #[test]
@@ -2944,7 +2944,7 @@ mod tests {
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
         let (audio_engine, mut consumer) = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0, 1.0]), 4);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
 

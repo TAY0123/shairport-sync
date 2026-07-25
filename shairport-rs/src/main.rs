@@ -92,19 +92,17 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState::new(config.clone());
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
-    let audio_engine = audio::AudioEngine::new(48_000 * 2 * 4);
-    let (audio_engine, audio_consumer) = audio_engine;
+    let (audio_engine, audio_output) = match audio_manager.create_engine_and_output() {
+        (engine, Ok(output)) => (engine, Some(output)),
+        (engine, Err(err)) => {
+            warn!(%err, "audio output stream not started");
+            app_state.set_diagnostic("audio_output_error", err.to_string());
+            (engine, None)
+        }
+    };
     let player = player::SharedPlayer::new();
     let dacp = airplay::dacp::DacpController::new(app_state.clone());
     app_state.update_audio_devices(audio_manager.list_devices());
-    let audio_output = match audio_manager.start_output(&audio_engine, audio_consumer) {
-        Ok(output) => Some(output),
-        Err(err) => {
-            warn!(%err, "audio output stream not started");
-            app_state.set_diagnostic("audio_output_error", err.to_string());
-            None
-        }
-    };
 
     let ptp_handle =
         if config.airplay.enabled && config.airplay.airplay2_enabled && config.ptp.enabled {
