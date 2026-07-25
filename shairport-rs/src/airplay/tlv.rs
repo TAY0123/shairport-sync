@@ -134,10 +134,10 @@ mod tests {
         // Apple HAP uses fragmentation: [type][len=255][255 bytes][type][len=129][129 bytes]
         // This test verifies the parser handles fragmented values via joined()
         let mut encoded = vec![0x03, 255];
-        encoded.extend_from_slice(&vec![0x42u8; 255]);
+        encoded.extend_from_slice(&[0x42u8; 255]);
         encoded.push(0x03);
         encoded.push(129);
-        encoded.extend_from_slice(&vec![0x42u8; 129]);
+        encoded.extend_from_slice(&[0x42u8; 129]);
         encoded.push(0x06);
         encoded.push(0x01);
         encoded.push(0x03);
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn tlv_small_value_uses_single_byte_length() {
         let mut tlv = Tlv::default();
-        tlv.insert(1, &[0x42u8; 100]);
+        tlv.insert(1, [0x42u8; 100]);
         let encoded = tlv.encode();
         assert_eq!(encoded[1], 100);
         let parsed = Tlv::parse(&encoded);
@@ -159,8 +159,8 @@ mod tests {
     #[test]
     fn tlv_multiple_values_same_type() {
         let mut tlv = Tlv::default();
-        tlv.insert(1, &[1u8; 10]);
-        tlv.insert(1, &[2u8; 20]);
+        tlv.insert(1, [1u8; 10]);
+        tlv.insert(1, [2u8; 20]);
         let encoded = tlv.encode();
         let parsed = Tlv::parse(&encoded);
         assert_eq!(parsed.joined(1).unwrap().len(), 30);

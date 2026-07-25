@@ -8,6 +8,7 @@ mod config;
 mod decoder;
 mod mdns;
 mod player;
+mod playout;
 mod ptp;
 mod state;
 mod web;
@@ -22,9 +23,11 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::{
+    airplay::playout_decoder::AirPlayPacketDecoder,
     api::ApiContext,
     config::{Config, PtpBackendName},
     mdns::{MdnsAdvertiser, MdnsBackend},
+    playout::scheduler::SchedulerConfig,
     state::AppState,
 };
 
@@ -92,18 +95,25 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState::new(config.clone());
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
-    let audio_engine = audio::AudioEngine::new(48_000 * 2 * 4);
+    let (audio_engine, audio_output) = match audio_manager.create_engine_and_output() {
+        (engine, Ok(output)) => (engine, Some(output)),
+        (engine, Err(err)) => {
+            warn!(%err, "audio output stream not started");
+            app_state.set_diagnostic("audio_output_error", err.to_string());
+            (engine, None)
+        }
+    };
     let player = player::SharedPlayer::new();
     let dacp = airplay::dacp::DacpController::new(app_state.clone());
     app_state.update_audio_devices(audio_manager.list_devices());
-    let audio_output = match audio_manager.start_output(audio_engine.clone()) {
-        Ok(output) => Some(output),
-        Err(err) => {
-            warn!(%err, "audio output stream not started");
-            app_state.set_diagnostic("audio_output_error", err.to_string());
-            None
-        }
-    };
+
+    // Create the shared playout service immediately after AudioEngine.
+    // It owns the decoder, ingress channel, and watermark state machine,
+    // and is the single authority for audio lifecycle commands.
+    let scheduler_config = SchedulerConfig::from_audio_config(&config.audio);
+    let decoder = AirPlayPacketDecoder::new(app_state.clone());
+    let (playout_handle, playout_task) =
+        playout::scheduler::spawn_playout_service(scheduler_config, decoder, audio_engine.clone());
 
     let ptp_handle =
         if config.airplay.enabled && config.airplay.airplay2_enabled && config.ptp.enabled {
@@ -137,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
                 audio_engine.clone(),
                 player.clone(),
                 dacp.clone(),
+                playout_handle.clone(),
             )
             .await?,
         )
@@ -144,15 +155,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let rtp_handles = if config.airplay.enabled {
-        airplay::rtp::spawn_rtp_receivers(
-            config.airplay.clone(),
-            app_state.clone(),
-            audio_engine.clone(),
-            player.clone(),
+        Some(
+            airplay::rtp::spawn_rtp_receivers(
+                config.airplay.clone(),
+                app_state.clone(),
+                playout_handle.clone(),
+            )
+            .await?,
         )
-        .await?
     } else {
-        Vec::new()
+        None
     };
 
     // AP2 audio listeners are session-owned and opened during RTSP stream SETUP.
@@ -206,9 +218,27 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = rtsp_handle {
         handle.abort();
     }
-    for handle in rtp_handles {
-        handle.abort();
+    if let Some(rtp_handles) = rtp_handles {
+        for handle in rtp_handles.network {
+            handle.abort();
+        }
     }
+
+    // Graceful shutdown: tell the playout service to stop, then await
+    // the task with a bounded timeout.  Do not abort it first.
+    playout_handle.shutdown();
+    let mut playout_task = playout_task;
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut playout_task).await {
+        Ok(Ok(())) => info!("playout service stopped cleanly"),
+        Ok(Err(err)) if err.is_cancelled() => info!("playout service task cancelled"),
+        Ok(Err(err)) => warn!(%err, "playout service task panicked"),
+        Err(_elapsed) => {
+            warn!("playout service shutdown timed out after 2 s; aborting task");
+            playout_task.abort();
+            let _ = playout_task.await;
+        }
+    }
+
     drop(audio_output);
     Ok(())
 }

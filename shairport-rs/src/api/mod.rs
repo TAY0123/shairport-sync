@@ -191,7 +191,7 @@ async fn remote_command(
 }
 
 async fn apply_remote_command(context: &ApiContext, command: String) -> CommandResponse {
-    let local_applied = apply_local_remote_command(&context, &command);
+    let local_applied = apply_local_remote_command(context, &command);
     if let Some(dacp_command) = dacp_command_for_alias(&command) {
         match context.dacp.send(dacp_command).await {
             Ok(result) => {
@@ -378,10 +378,11 @@ mod tests {
         let config = Config::default();
         let state = AppState::new(config.clone());
         let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
         let app = router(ApiContext::new(
             state,
             AudioManager::new(config.audio.clone()),
-            AudioEngine::new(16),
+            audio_engine,
             MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
             dacp,
         ));
@@ -404,10 +405,11 @@ mod tests {
         let config = Config::default();
         let state = AppState::new(config.clone());
         let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
         let app = router(ApiContext::new(
             state,
             AudioManager::new(config.audio.clone()),
-            AudioEngine::new(16),
+            audio_engine,
             MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
             dacp,
         ));
@@ -445,10 +447,11 @@ mod tests {
             Some("Album".to_string()),
         );
         let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
         let app = router(ApiContext::new(
             state,
             AudioManager::new(config.audio.clone()),
-            AudioEngine::new(16),
+            audio_engine,
             MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
             dacp,
         ));
@@ -481,10 +484,11 @@ mod tests {
         let config = Config::default();
         let state = AppState::new(config.clone());
         let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
         let app = router(ApiContext::new(
             state,
             AudioManager::new(config.audio.clone()),
-            AudioEngine::new(16),
+            audio_engine,
             MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
             dacp,
         ));

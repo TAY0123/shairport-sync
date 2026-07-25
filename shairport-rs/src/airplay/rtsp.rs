@@ -18,6 +18,7 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     airplay::pairing::{PairingEndpoint, PairingService, PairingSession},
     airplay::sdp::parse_sdp,
+    airplay::session_crypto::SessionCrypto,
     airplay::{
         crypto::{IdentityKey, PairCipher},
         dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
@@ -27,6 +28,7 @@ use crate::{
     config::{AdvertisedFormatPolicy, AirplayConfig},
     decoder,
     player::SharedPlayer,
+    playout::scheduler::PlayoutHandle,
     ptp,
     state::{AppState, PlayerState},
 };
@@ -54,6 +56,7 @@ pub async fn spawn_rtsp_server(
     audio_engine: AudioEngine,
     player: SharedPlayer,
     dacp: DacpController,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind: SocketAddr = config
         .bind
@@ -86,6 +89,7 @@ pub async fn spawn_rtsp_server(
                     let audio_engine = audio_engine.clone();
                     let player = player.clone();
                     let dacp = dacp.clone();
+                    let playout = playout.clone();
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
                             stream,
@@ -96,6 +100,7 @@ pub async fn spawn_rtsp_server(
                             audio_engine,
                             player,
                             dacp,
+                            playout,
                         )
                         .await
                         {
@@ -531,8 +536,27 @@ fn local_non_loopback_interface_addresses() -> Vec<IpAddr> {
     Vec::new()
 }
 
+/// Bundles the set of shared services / configuration that almost every RTSP
+/// handler needs.  This keeps function signatures under the clippy
+/// `too_many_arguments` limit (7) without burying the ownership / cleanup
+/// logic inside an opaque mega-struct.
+struct ConnectionServices<'a> {
+    config: &'a AirplayConfig,
+    state: &'a AppState,
+    pairing: &'a PairingService,
+    audio_engine: &'a AudioEngine,
+    playout: &'a PlayoutHandle,
+    player: &'a SharedPlayer,
+    dacp: &'a DacpController,
+}
+
+/// Entry point for a per-peer RTSP connection.  This function receives owned
+/// values and creates the borrowed [`ConnectionServices`] context; it has 8
+/// parameters by design (the spawned-task boundary requires ownership transfer).
+/// All downstream functions use the slimmer context struct.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: AirplayConfig,
     state: AppState,
@@ -540,13 +564,60 @@ async fn handle_connection(
     audio_engine: AudioEngine,
     player: SharedPlayer,
     dacp: DacpController,
+    playout: PlayoutHandle,
 ) -> anyhow::Result<()> {
     debug!(%peer, "RTSP connection opened");
-    let mut buf = Vec::with_capacity(8192);
-    let mut encrypted_buf = Vec::with_capacity(8192);
     let mut session = RtspSession::default();
     session.local_addr = stream.local_addr().ok();
     session.peer_addr = Some(peer);
+
+    let services = ConnectionServices {
+        config: &config,
+        state: &state,
+        pairing: &pairing,
+        audio_engine: &audio_engine,
+        playout: &playout,
+        player: &player,
+        dacp: &dacp,
+    };
+
+    // Run the inner request/response loop.  Every exit from this inner
+    // function — whether clean EOF, read error, write error, or encryption
+    // error — flows through the idempotent cleanup block below, matching
+    // the pthread cleanup handler in shairport-sync C.
+    let result = process_rtsp_requests(stream, peer, &services, &mut session).await;
+
+    // --- Idempotent per-connection cleanup (safe to call regardless of
+    //     how the inner function exited).  TEARDOWN already performs an
+    //     equivalent cleanup, so this is a safety-net for EOF/error exits. ---
+    perform_connection_cleanup(
+        &state,
+        &audio_engine,
+        &player,
+        &dacp,
+        &playout,
+        &mut session,
+    );
+
+    match &result {
+        Ok(()) => debug!(%peer, "RTSP connection closed cleanly"),
+        Err(e) => warn!(%peer, %e, "RTSP connection closed with error (cleanup performed)"),
+    }
+
+    result
+}
+
+/// Inner request/response loop extracted from [`handle_connection`] so that
+/// every exit path (EOF, read/write error, encryption failure) returns to a
+/// single point where per-connection cleanup is guaranteed.
+async fn process_rtsp_requests(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    svc: &ConnectionServices<'_>,
+    session: &mut RtspSession,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut encrypted_buf = Vec::with_capacity(8192);
     loop {
         let mut chunk = [0u8; 4096];
         let read = stream.read(&mut chunk).await?;
@@ -596,16 +667,7 @@ async fn handle_connection(
             // requests while its own M4 response is still plaintext.
             let encrypt_response = session.control_cipher.is_some();
 
-            let response = route_request(
-                &config,
-                &state,
-                &pairing,
-                &mut session,
-                &request,
-                &audio_engine,
-                &player,
-                &dacp,
-            );
+            let response = route_request(svc, session, &request);
 
             log_response(peer, &request, &response);
             let mut wire = response.to_bytes();
@@ -639,16 +701,59 @@ async fn handle_connection(
         }
     }
 }
-fn route_request(
-    config: &AirplayConfig,
+
+/// Idempotent per-connection cleanup.  Safe to call multiple times (TEARDOWN
+/// may have already run an equivalent cleanup; subsequent calls are no-ops).
+///
+/// Only a connection that actually established / controlled the principal
+/// playback session (marked via [`RtspSession::is_playback_owner`]) may clear
+/// global playback state, crypto, and DACP.  Non-owner connections — e.g.
+/// OPTIONS-only probes or ancillary AP2 control sockets that never issued a
+/// successful ANNOUNCE / audio SETUP — only abort their own listener tasks.
+///
+/// Matches the pthread cleanup handler `rtsp_conversation_thread_cleanup_function`
+/// in shairport-sync C but with explicit ownership gating.
+fn perform_connection_cleanup(
     state: &AppState,
-    pairing: &PairingService,
-    session: &mut RtspSession,
-    request: &RtspRequest,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
     player: &SharedPlayer,
     dacp: &DacpController,
+    playout: &PlayoutHandle,
+    session: &mut RtspSession,
+) {
+    if session.is_playback_owner {
+        player.stop();
+        playout.stop();
+        state.set_active(false);
+        state.set_player_state(PlayerState::Stopped);
+        *state.session_crypto.write() = None;
+        *state.ap2_media_key.write() = None;
+        *state.ap2_audio_format.write() = None;
+        state.clear_ap1_remote_endpoints();
+        session.ap1_remote_control_port = None;
+        session.ap1_remote_timing_port = None;
+        dacp.clear_session();
+        session.is_playback_owner = false;
+    }
+    session.abort_ap2_listeners();
+}
+
+fn route_request(
+    svc: &ConnectionServices<'_>,
+    session: &mut RtspSession,
+    request: &RtspRequest,
 ) -> RtspResponse {
+    // Unpack the services bundle so the rest of the function body stays
+    // readable and unchanged.  The function signature is the part clippy
+    // inspects for `too_many_arguments`.
+    let config = svc.config;
+    let state = svc.state;
+    let pairing = svc.pairing;
+    let audio_engine = svc.audio_engine;
+    let playout = svc.playout;
+    let player = svc.player;
+    let dacp = svc.dacp;
+
     if let Some(client_name) = request.headers.get("X-Apple-Client-Name") {
         state.set_client_name(client_name.clone());
     }
@@ -666,7 +771,7 @@ fn route_request(
         );
     }
 
-    match (request.method.as_str(), request.uri.as_str()) {
+    let mut resp = match (request.method.as_str(), request.uri.as_str()) {
         ("OPTIONS", _) => {
             let public = if config.airplay2_enabled {
                 "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, PUT, SETPEERS"
@@ -683,35 +788,105 @@ fn route_request(
             .with_cseq(request),
         ("ANNOUNCE", _) => {
             info!("AP1 ANNOUNCE received ({} bytes body)", request.body.len());
+            // Clear any stale session crypto from a previous ANNOUNCE before
+            // populating fresh key material.  This matches the C behaviour
+            // where conn->stream.aeskey / aesiv are simply overwritten each
+            // ANNOUNCE, and the player thread sees the latest values atomically.
+            *state.session_crypto.write() = None;
+            // Also clear ALAC state so the RTP decoder re-initialises on the
+            // first packet of the new stream.
+            *state.alac_magic_cookie.write() = None;
+            *state.alac_sample_rate.write() = None;
+            *state.alac_sample_size.write() = None;
+            *state.alac_channels.write() = None;
+            *state.frames_per_packet.write() = None;
+            state
+                .track_transition_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
             let sdp = String::from_utf8_lossy(&request.body);
             let parsed = parse_sdp(&sdp);
             state.set_source_format(parsed.source_format_description());
             let params = parsed.classic_params();
 
+            // --- Classic AirPlay crypto: unwrap rsaaeskey with the well-known
+            //     Shairport Sync / AirPort Express RSA private key, then pair
+            //     it with aesiv into a SessionCrypto stored on the app state.
+            //
+            //     RSA-OAEP output MUST be exactly 16 bytes (matching rtsp.c);
+            //     any other length is rejected rather than truncated.  Partial
+            //     key/IV material returns RTSP 456 (Parameter Not Understood)
+            //     and leaves the classic crypto slot cleared. ---
+            let has_encryption = params.rsaaeskey.is_some();
+            let mut crypto_err: Option<&'static str> = None;
+            let mut aes_key: Option<[u8; 16]> = None;
+            let mut aes_iv: Option<[u8; 16]> = None;
+
             if let Some(encrypted_key) = &params.rsaaeskey {
-                let rsa_key = decoder::generate_rsa_key();
-                match decoder::rsa_oaep_decrypt(&rsa_key, encrypted_key) {
-                    Ok(mut aes_key_bytes) => {
-                        if aes_key_bytes.len() >= 16 {
-                            aes_key_bytes.truncate(16);
-                            let mut key = [0u8; 16];
-                            key.copy_from_slice(&aes_key_bytes);
-                            *state.session_key.write() = Some(key);
+                match decoder::classic_rsa_oaep_decrypt(encrypted_key) {
+                    Ok(aes_key_bytes) => {
+                        if aes_key_bytes.len() == 16 {
+                            let mut k = [0u8; 16];
+                            k.copy_from_slice(&aes_key_bytes);
+                            aes_key = Some(k);
                             info!("classic AirPlay AES session key derived");
+                        } else {
+                            warn!(
+                                len = aes_key_bytes.len(),
+                                "RSA-OAEP output not exactly 16 bytes"
+                            );
+                            crypto_err = Some("decrypted AES key has wrong length");
                         }
                     }
                     Err(e) => {
-                        warn!(%e, "RSA-OAEP decryption of AES key failed");
+                        warn!(%e, "RSA-OAEP decryption of AES key failed with classic key");
+                        crypto_err = Some("RSA-OAEP decryption failed");
                     }
                 }
             }
 
             if let Some(iv) = &params.aesiv {
                 if iv.len() == 16 {
-                    state.set_diagnostic("aes_iv_set", "yes");
+                    let mut v = [0u8; 16];
+                    v.copy_from_slice(iv);
+                    aes_iv = Some(v);
+                } else {
+                    warn!(len = iv.len(), "aesiv is not 16 bytes");
+                    crypto_err = Some("aesiv wrong length");
                 }
             }
 
+            // If the sender provides encryption material, all of it must be
+            // valid.  A partial key (rsaaeskey without aesiv, or vice-versa)
+            // is an error.  Unencrypted sessions (no rsaaeskey at all) are
+            // also rejected because our classic RTP path requires AES-CBC;
+            // accepting them would succeed the ANNOUNCE but silently drop
+            // every audio packet.
+            if crypto_err.is_none() && has_encryption && aes_key.is_none() {
+                crypto_err = Some("rsaaeskey provided but decryption produced no valid key");
+            }
+            if crypto_err.is_none() && has_encryption && aes_iv.is_none() {
+                crypto_err = Some("rsaaeskey provided but aesiv is missing or invalid");
+            }
+            if crypto_err.is_none() && !has_encryption {
+                crypto_err = Some("unencrypted classic AirPlay sessions are not supported");
+            }
+
+            if let Some(err) = crypto_err {
+                warn!(%err, "ANNOUNCE crypto rejected");
+                return response(456, "Parameter Not Understood").with_cseq(request);
+            }
+
+            // Both key and IV are valid — store session crypto.
+            if let (Some(key), Some(iv)) = (aes_key, aes_iv)
+                && let Some(crypto) = SessionCrypto::new(&key, &iv)
+            {
+                *state.session_crypto.write() = Some(crypto);
+                session.is_playback_owner = true;
+                info!("classic AirPlay session crypto stored");
+            }
+
+            // --- ALAC format parameters ---
             if let Some(asc) = &params.alac_specific_config {
                 state
                     .alac_magic_cookie
@@ -807,7 +982,7 @@ fn route_request(
         }
         ("POST", "/command") => {
             // Command endpoint receives encrypted plist commands
-            apply_ap2_command(state, audio_engine, player, dacp, request);
+            apply_ap2_command(state, audio_engine, playout, player, dacp, request);
             info!("received /command ({} bytes)", request.body.len());
             response(200, "OK")
                 .header("Content-Type", "application/octet-stream")
@@ -833,18 +1008,22 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("SETRATEANCHORTI", _) | ("SETRATEANCHORTIME", _) => {
-            apply_setrateanchortime(state, audio_engine, player, request);
+            apply_setrateanchortime(state, audio_engine, playout, player, request);
             response(200, "OK").with_cseq(request)
         }
         ("GET_PARAMETER", _) => response(200, "OK").with_cseq(request),
         ("SET_PARAMETER", _) => {
-            apply_set_parameter(state, audio_engine, dacp, session.peer_addr, request);
+            apply_set_parameter(
+                state,
+                audio_engine,
+                playout,
+                dacp,
+                session.peer_addr,
+                request,
+            );
             response(200, "OK").with_cseq(request)
         }
         ("SETUP", _) => {
-            session.session_id = Some("1".to_string());
-            state.set_active(true);
-
             // Detect AP2 SETUP from Content-Type
             let is_ap2 = request
                 .headers
@@ -853,8 +1032,13 @@ fn route_request(
                 .unwrap_or(false);
 
             if is_ap2 && config.airplay2_enabled {
-                handle_ap2_setup(config, state, session, request, audio_engine, dacp)
-                    .with_cseq(request)
+                let response = handle_ap2_setup(config, state, session, request, playout, dacp)
+                    .with_cseq(request);
+                if (200..300).contains(&response.code) {
+                    session.session_id = Some("1".to_string());
+                    state.set_active(true);
+                }
+                response
             } else if is_ap2 {
                 // AP2 plist but AP2 is disabled - respond with error
                 warn!("AP2 SETUP received but airplay2_enabled is false");
@@ -868,6 +1052,47 @@ fn route_request(
                 let server_port = config.audio_port;
                 let control_port = config.control_port;
                 let timing_port = config.timing_port;
+
+                // Parse remote control/timing ports from the Transport header.
+                // If the client does not supply valid ports we MUST return 400
+                // rather than advertise a transport that cannot support timing/resend.
+                let Some(transport_val) = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("Transport"))
+                    .map(|(_, value)| value)
+                else {
+                    warn!("AP1 SETUP missing Transport header");
+                    return response(400, "Bad Request")
+                        .header("X-Reason", "missing Transport header")
+                        .with_cseq(request);
+                };
+                let params = match parse_ap1_transport_header(transport_val) {
+                    Ok(params) => params,
+                    Err(err) => {
+                        warn!(%err, transport_val, "AP1 SETUP invalid Transport header");
+                        return response(400, "Bad Request")
+                            .header("X-Reason", format!("invalid transport: {err}"))
+                            .with_cseq(request);
+                    }
+                };
+                let Some(peer) = session.peer_addr else {
+                    warn!("AP1 SETUP has no connection peer address");
+                    return response(400, "Bad Request")
+                        .header("X-Reason", "missing peer address")
+                        .with_cseq(request);
+                };
+                info!(
+                    remote_control = params.control_port,
+                    remote_timing = params.timing_port,
+                    "AP1 SETUP remote ports parsed"
+                );
+                state.set_ap1_remote_endpoints(peer.ip(), params.control_port, params.timing_port);
+                session.ap1_remote_control_port = Some(params.control_port);
+                session.ap1_remote_timing_port = Some(params.timing_port);
+                session.session_id = Some("1".to_string());
+                state.set_active(true);
+
                 info!(server_port, control_port, timing_port, "AP1 SETUP");
                 response(200, "OK")
                     .header("Session", "1")
@@ -905,7 +1130,7 @@ fn route_request(
             let rate = state.alac_sample_rate.read().unwrap_or(44100);
             player.set_sample_rate(rate);
             player.start(latency);
-            enable_audio_when_track_ready(state, audio_engine);
+            enable_audio_when_track_ready(state, playout);
             state.set_player_state(PlayerState::Playing);
             state.set_diagnostic("ap1_latency", latency.to_string());
             info!(latency, "AP1 RECORD");
@@ -917,13 +1142,14 @@ fn route_request(
         }
         ("FLUSH", _) => {
             player.flush();
-            audio_engine.set_playback_enabled(false);
+            playout.pause();
+            playout.flush();
             state.set_player_state(PlayerState::Paused);
             info!("AP1 FLUSH");
             response(200, "OK").with_cseq(request)
         }
         ("PAUSE", _) => {
-            pause_playback(state, audio_engine, player);
+            pause_playback(state, playout, player);
             info!("PAUSE");
             response(200, "OK").with_cseq(request)
         }
@@ -933,11 +1159,13 @@ fn route_request(
         }
         ("TEARDOWN", _) => {
             if let Some(stream_type) = ap2_teardown_stream_type(&request.body) {
-                player.stop();
-                audio_engine.set_playback_enabled(false);
-                state.set_player_state(PlayerState::Stopped);
+                if session.is_playback_owner {
+                    player.stop();
+                    playout.stop();
+                    state.set_player_state(PlayerState::Stopped);
+                }
                 session.abort_ap2_stream_listener(stream_type);
-                if stream_type == Ap2StreamType::BufferedAudio {
+                if session.is_playback_owner && stream_type == Ap2StreamType::BufferedAudio {
                     player.flush();
                     state.clear_track_for_transition();
                     state.set_diagnostic("audio_waiting_for_track_title", "true");
@@ -949,14 +1177,20 @@ fn route_request(
                 return response(200, "OK").with_cseq(request);
             }
 
-            player.stop();
-            audio_engine.set_playback_enabled(false);
-            state.set_active(false);
-            state.set_player_state(PlayerState::Stopped);
-            *state.session_key.write() = None;
-            *state.ap2_media_key.write() = None;
-            *state.ap2_audio_format.write() = None;
-            dacp.clear_session();
+            if session.is_playback_owner {
+                player.stop();
+                playout.stop();
+                state.set_active(false);
+                state.set_player_state(PlayerState::Stopped);
+                *state.session_crypto.write() = None;
+                *state.ap2_media_key.write() = None;
+                *state.ap2_audio_format.write() = None;
+                state.clear_ap1_remote_endpoints();
+                session.ap1_remote_control_port = None;
+                session.ap1_remote_timing_port = None;
+                dacp.clear_session();
+                session.is_playback_owner = false;
+            }
             session.abort_ap2_listeners();
             info!("TEARDOWN");
             response(200, "OK").with_cseq(request)
@@ -969,7 +1203,156 @@ fn route_request(
             );
             response(404, "Not Found").with_cseq(request)
         }
+    };
+
+    // --- Apple-Challenge → Apple-Response (classic AirPlay authentication) ---
+    if let Some(challenge_b64) = request.headers.get("Apple-Challenge")
+        && let Some(apple_response) =
+            build_apple_response(challenge_b64, session.local_addr, &config.device_id)
+    {
+        resp.headers
+            .push(("Apple-Response".to_string(), apple_response));
     }
+
+    resp
+}
+
+/// Result of parsing a classic SETUP Transport header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Ap1TransportParams {
+    control_port: u16,
+    timing_port: u16,
+}
+
+/// Parse the classic SETUP `Transport` header value.
+///
+/// Expected format:
+///   `RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002`
+///
+/// Keys are matched case-insensitively.  Both `control_port` / `controlPort`
+/// and `timing_port` / `timingPort` are accepted.  Zero, out-of-range, and
+/// non-numeric port values are rejected.  Unrelated tokens (e.g. the RTP
+/// profile, `unicast`, `mode=record`) are silently ignored.
+fn parse_ap1_transport_header(value: &str) -> Result<Ap1TransportParams, String> {
+    let mut control_port: Option<u16> = None;
+    let mut timing_port: Option<u16> = None;
+
+    for token in value.split(';') {
+        let token = token.trim();
+        if let Some((key, val)) = token.split_once('=') {
+            let key = key.trim().to_ascii_lowercase();
+            let val = val.trim();
+            match key.as_str() {
+                "control_port" | "controlport" => {
+                    if control_port.is_some() {
+                        return Err("duplicate control_port parameter".into());
+                    }
+                    let port: u16 = val
+                        .parse()
+                        .map_err(|_| format!("invalid control_port value: {val}"))?;
+                    if port == 0 {
+                        return Err(format!("control_port must not be zero: {val}"));
+                    }
+                    control_port = Some(port);
+                }
+                "timing_port" | "timingport" => {
+                    if timing_port.is_some() {
+                        return Err("duplicate timing_port parameter".into());
+                    }
+                    let port: u16 = val
+                        .parse()
+                        .map_err(|_| format!("invalid timing_port value: {val}"))?;
+                    if port == 0 {
+                        return Err(format!("timing_port must not be zero: {val}"));
+                    }
+                    timing_port = Some(port);
+                }
+                _ => { /* tolerate unrelated key=value tokens */ }
+            }
+        }
+        // Bare tokens (no '=') are tolerated
+    }
+
+    let control_port = control_port.ok_or_else(|| "missing control_port parameter".to_string())?;
+    let timing_port = timing_port.ok_or_else(|| "missing timing_port parameter".to_string())?;
+
+    Ok(Ap1TransportParams {
+        control_port,
+        timing_port,
+    })
+}
+
+/// Build the `Apple-Response` header value from a base64-encoded challenge,
+/// the local socket address, and the device MAC address string.
+///
+/// Format (matching shairport-sync C):
+///   challenge(≤16) || local_ip(4/16) || ap1_prefix(6)  → padded to ≥32 bytes
+///   → RSA PKCS1v1.5 sign (unprefixed) with classic key
+///   → base64, strip trailing '='
+fn build_apple_response(
+    challenge_b64: &str,
+    local_addr: Option<SocketAddr>,
+    device_id: &str,
+) -> Option<String> {
+    use base64::Engine;
+
+    let challenge = crate::decoder::tolerant_base64_decode(challenge_b64.trim()).ok()?;
+    if challenge.len() > 16 {
+        warn!(
+            len = challenge.len(),
+            "oversized Apple-Challenge (>16 bytes)"
+        );
+        return None;
+    }
+
+    // Parse device MAC into 6 bytes (ap1_prefix equivalent)
+    let ap1_prefix = parse_mac_bytes(device_id)?;
+
+    // Build the to-be-signed buffer
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&challenge);
+    // Pad challenge to 16 bytes (C code doesn't pad explicitly, but the
+    // destination buffer is zeroed; we append the IP directly after).
+    match local_addr {
+        Some(SocketAddr::V4(v4)) => {
+            // IPv4: 4 bytes
+            buf.extend_from_slice(&v4.ip().octets());
+        }
+        Some(SocketAddr::V6(v6)) => {
+            // IPv6: 16 bytes
+            buf.extend_from_slice(&v6.ip().octets());
+        }
+        None => {
+            // Fallback: zero IPv4 address
+            buf.extend_from_slice(&[0u8; 4]);
+        }
+    }
+    buf.extend_from_slice(&ap1_prefix);
+
+    // Pad to at least 0x20 (32) bytes
+    while buf.len() < 32 {
+        buf.push(0u8);
+    }
+
+    let sig = decoder::classic_rsa_pkcs1_sign(&buf).ok()?;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&sig);
+    // Strip padding '=' chars (matching C behaviour)
+    let trimmed = encoded.trim_end_matches('=').to_string();
+    Some(trimmed)
+}
+
+/// Parse a MAC address string "xx:xx:xx:xx:xx:xx" into 6 bytes.
+fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 fn log_request(peer: SocketAddr, request: &RtspRequest) {
@@ -1164,6 +1547,15 @@ struct RtspSession {
     dacp_id: Option<String>,
     active_remote: Option<String>,
     session_key: Option<Vec<u8>>,
+    /// AP1 remote control port parsed from classic SETUP Transport header.
+    ap1_remote_control_port: Option<u16>,
+    /// AP1 remote timing port parsed from classic SETUP Transport header.
+    ap1_remote_timing_port: Option<u16>,
+    /// true when this connection established (or currently controls) the
+    /// principal playback session — i.e. it sent a successful classic
+    /// ANNOUNCE with valid crypto, or a successful AP2 audio SETUP/RECORD.
+    /// Only owner connections may clear global playback state on close.
+    is_playback_owner: bool,
 }
 
 impl RtspSession {
@@ -1230,7 +1622,7 @@ impl RtspSession {
     fn ensure_buffered_audio_listener(
         &mut self,
         state: &AppState,
-        audio_engine: &AudioEngine,
+        playout: &PlayoutHandle,
     ) -> anyhow::Result<u16> {
         if let Some(port) = self.buffered_audio_port {
             return Ok(port);
@@ -1256,7 +1648,7 @@ impl RtspSession {
         let handle = crate::airplay::buffered_audio::spawn_buffered_accept_loop(
             listener,
             state.clone(),
-            audio_engine.clone(),
+            playout.clone(),
         );
         self.buffered_audio_port = Some(port);
         self.buffered_audio_listener = Some(handle);
@@ -1298,7 +1690,7 @@ fn handle_ap2_setup(
     state: &AppState,
     session: &mut RtspSession,
     request: &RtspRequest,
-    audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     dacp: &DacpController,
 ) -> RtspResponse {
     let plist_body = &request.body;
@@ -1365,7 +1757,7 @@ fn handle_ap2_setup(
                     stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
                     stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
                     state.set_active(true);
-                    enable_audio_when_track_ready(state, audio_engine);
+                    enable_audio_when_track_ready(state, playout);
                     state.set_player_state(PlayerState::Playing);
                     state.set_diagnostic("ap2_stream_type", "realtime");
                     state.set_diagnostic("ap2_realtime_audio_port", data_port.to_string());
@@ -1376,14 +1768,13 @@ fn handle_ap2_setup(
                 }
                 103 => {
                     session.ap2_streams.push(Ap2StreamType::BufferedAudio);
-                    let data_port =
-                        match session.ensure_buffered_audio_listener(state, audio_engine) {
-                            Ok(port) => port,
-                            Err(e) => {
-                                warn!(%e, "failed to open AP2 buffered audio TCP socket");
-                                return response(503, "Service Unavailable");
-                            }
-                        };
+                    let data_port = match session.ensure_buffered_audio_listener(state, playout) {
+                        Ok(port) => port,
+                        Err(e) => {
+                            warn!(%e, "failed to open AP2 buffered audio TCP socket");
+                            return response(503, "Service Unavailable");
+                        }
+                    };
                     if let Some(plist::Value::Data(shk)) = stream.get("shk") {
                         state.set_diagnostic("ap2_shk_len", shk.len().to_string());
                         if shk.len() >= 32 {
@@ -1391,6 +1782,7 @@ fn handle_ap2_setup(
                             let mut key = [0u8; 32];
                             key.copy_from_slice(&shk[..32]);
                             *state.ap2_media_key.write() = Some(key);
+                            session.is_playback_owner = true;
                         } else {
                             warn!(shk_len = shk.len(), "AP2 buffered SETUP shk is too short");
                         }
@@ -1442,7 +1834,7 @@ fn handle_ap2_setup(
                         plist_uint_value(8 * 1024 * 1024u64),
                     );
                     state.set_active(true);
-                    enable_audio_when_track_ready(state, audio_engine);
+                    enable_audio_when_track_ready(state, playout);
                     state.set_player_state(PlayerState::Playing);
                     state.set_diagnostic("ap2_stream_type", "buffered");
                     state.set_diagnostic("ap2_buffered_audio_port", data_port.to_string());
@@ -1623,6 +2015,7 @@ fn handle_ap2_setup(
 fn apply_set_parameter(
     state: &AppState,
     audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     dacp: &DacpController,
     peer_addr: Option<SocketAddr>,
     request: &RtspRequest,
@@ -1639,6 +2032,7 @@ fn apply_set_parameter(
             apply_media_update(
                 state,
                 audio_engine,
+                playout,
                 None,
                 &extract_media_update(&plist::Value::Dictionary(dict.clone())),
             );
@@ -1687,13 +2081,25 @@ fn apply_set_parameter(
                 }
             }
         }
-        state.set_track_metadata(title, artist, album);
+        apply_media_update(
+            state,
+            audio_engine,
+            playout,
+            None,
+            &MediaUpdate {
+                title,
+                artist,
+                album,
+                ..MediaUpdate::default()
+            },
+        );
     }
 }
 
 fn apply_ap2_command(
     state: &AppState,
     audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     dacp: &DacpController,
     request: &RtspRequest,
@@ -1708,10 +2114,11 @@ fn apply_ap2_command(
             .or_else(|| dict.get("type").and_then(plist::Value::as_string));
         if let Some(command) = command {
             state.set_diagnostic("ap2_last_command", command.to_string());
-            apply_playback_command(state, audio_engine, player, command);
+            apply_playback_command(state, playout, player, command);
             if is_navigation_alias(command) {
                 player.flush();
-                audio_engine.set_playback_enabled(false);
+                playout.pause();
+                playout.flush();
                 state.clear_track_for_transition();
             }
             if let Some(dacp_command) = dacp_command_for_alias(command) {
@@ -1721,6 +2128,7 @@ fn apply_ap2_command(
         apply_media_update(
             state,
             audio_engine,
+            playout,
             Some(player),
             &extract_media_update(&plist::Value::Dictionary(dict.clone())),
         );
@@ -1800,7 +2208,8 @@ struct MediaUpdate {
 
 fn apply_media_update(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: Option<&SharedPlayer>,
     update: &MediaUpdate,
 ) {
@@ -1811,7 +2220,8 @@ fn apply_media_update(
     if title_changed {
         let was_waiting_for_title = state.is_waiting_for_track_title();
         if !was_waiting_for_title {
-            audio_engine.clear_output_samples();
+            playout.pause();
+            playout.flush();
             if let Some(player) = player {
                 player.flush();
             }
@@ -1829,7 +2239,7 @@ fn apply_media_update(
         );
     }
     if title_changed && update.title.is_some() {
-        enable_audio_when_track_ready(state, audio_engine);
+        enable_audio_when_track_ready(state, playout);
     }
     if let Some(duration_ms) = update.duration_ms {
         state.set_duration_ms(duration_ms);
@@ -2039,7 +2449,8 @@ fn apply_audio_mode(state: &AppState, request: &RtspRequest) {
 
 fn apply_setrateanchortime(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    _audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     request: &RtspRequest,
 ) {
@@ -2068,12 +2479,13 @@ fn apply_setrateanchortime(
         let sample_rate = state.alac_sample_rate.read().unwrap_or(44_100);
         player.set_sample_rate(sample_rate);
         player.start(0);
-        enable_audio_when_track_ready(state, audio_engine);
+        enable_audio_when_track_ready(state, playout);
         state.set_player_state(PlayerState::Playing);
         state.set_diagnostic("ap2_play_enabled", "true");
     } else {
         player.flush();
-        audio_engine.set_playback_enabled(false);
+        playout.pause();
+        playout.flush();
         state.set_player_state(PlayerState::Paused);
         state.set_diagnostic("ap2_play_enabled", "false");
     }
@@ -2081,59 +2493,60 @@ fn apply_setrateanchortime(
 
 fn apply_playback_command(
     state: &AppState,
-    audio_engine: &AudioEngine,
+    playout: &PlayoutHandle,
     player: &SharedPlayer,
     command: &str,
 ) -> bool {
     let normalized = command.to_ascii_lowercase();
     if normalized.contains("toggle") {
         return match state.snapshot().player_state {
-            PlayerState::Playing => pause_playback(state, audio_engine, player),
-            _ => play_playback(state, audio_engine, player),
+            PlayerState::Playing => pause_playback(state, playout, player),
+            _ => play_playback(state, playout, player),
         };
     }
     if normalized.contains("pause") {
-        return pause_playback(state, audio_engine, player);
+        return pause_playback(state, playout, player);
     }
     if normalized.contains("stop") {
-        return stop_playback(state, audio_engine, player);
+        return stop_playback(state, playout, player);
     }
     if normalized.contains("play") || normalized.contains("resume") {
-        return play_playback(state, audio_engine, player);
+        return play_playback(state, playout, player);
     }
     false
 }
 
-fn play_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn play_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     let sample_rate = state.alac_sample_rate.read().unwrap_or(44_100);
     player.set_sample_rate(sample_rate);
     player.start(0);
-    enable_audio_when_track_ready(state, audio_engine);
+    enable_audio_when_track_ready(state, playout);
     state.set_player_state(PlayerState::Playing);
     true
 }
 
-fn enable_audio_when_track_ready(state: &AppState, audio_engine: &AudioEngine) -> bool {
+fn enable_audio_when_track_ready(state: &AppState, playout: &PlayoutHandle) -> bool {
     if state.is_waiting_for_track_title() {
         state.set_diagnostic("audio_waiting_for_track_title", "true");
-        audio_engine.clear_output_samples();
+        playout.flush();
         return false;
     }
     state.set_diagnostic("audio_waiting_for_track_title", "false");
-    audio_engine.set_playback_enabled(true);
+    playout.start();
     true
 }
 
-fn pause_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn pause_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     player.flush();
-    audio_engine.set_playback_enabled(false);
+    playout.pause();
+    playout.flush();
     state.set_player_state(PlayerState::Paused);
     true
 }
 
-fn stop_playback(state: &AppState, audio_engine: &AudioEngine, player: &SharedPlayer) -> bool {
+fn stop_playback(state: &AppState, playout: &PlayoutHandle, player: &SharedPlayer) -> bool {
     player.stop();
-    audio_engine.set_playback_enabled(false);
+    playout.stop();
     state.set_player_state(PlayerState::Stopped);
     true
 }
@@ -2534,6 +2947,30 @@ impl RtspResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playout::scheduler::{PlayoutCommand, PlayoutHandle};
+    use rsa::pkcs1v15::Pkcs1v15Sign;
+    use std::sync::Arc;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// Create a test-only [`PlayoutHandle`] and its associated command and
+    /// ingress receivers.  Tests that need to assert exact command sequences
+    /// keep `cmd_rx`; others drop it.
+    fn test_playout() -> (
+        PlayoutHandle,
+        UnboundedReceiver<PlayoutCommand>,
+        crate::playout::ingress::IngressReceiver,
+    ) {
+        PlayoutHandle::command_channel_for_tests(64)
+    }
+
+    /// Drain all pending commands from the receiver and return them as a Vec.
+    fn drain_cmds(rx: &mut UnboundedReceiver<PlayoutCommand>) -> Vec<PlayoutCommand> {
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            cmds.push(cmd);
+        }
+        cmds
+    }
 
     #[test]
     fn parses_rtsp_request_with_body() {
@@ -2549,7 +2986,8 @@ mod tests {
     fn set_parameter_volume_updates_state_and_audio_gain() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, mut consumer) = AudioEngine::new(8);
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
         let request = RtspRequest {
@@ -2561,12 +2999,12 @@ mod tests {
         };
 
         let dacp = DacpController::disabled(state.clone());
-        apply_set_parameter(&state, &audio_engine, &dacp, None, &request);
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
 
         assert_eq!(state.snapshot().volume.airplay_db, -6.0);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 1);
-        let mut out = [0.0];
-        audio_engine.fill_output(&mut out);
+        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        let mut out = [0.0; 2];
+        consumer.fill_output(&mut out);
         assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
     }
 
@@ -2574,7 +3012,8 @@ mod tests {
     fn text_progress_uses_airplay_rtp_timestamps() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let dacp = DacpController::disabled(state.clone());
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".to_string(), "text/parameters".to_string());
@@ -2586,34 +3025,77 @@ mod tests {
             body: b"Progress: 44100/88200/176400\r\n".to_vec(),
         };
 
-        apply_set_parameter(&state, &audio_engine, &dacp, None, &request);
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
 
         assert_eq!(state.snapshot().track.progress_ms, Some(1_000));
         assert_eq!(state.snapshot().track.duration_ms, Some(3_000));
     }
 
     #[test]
-    fn ap2_command_pause_and_play_gate_audio_engine() {
+    fn text_title_release_starts_playout() {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
-        let audio_engine = AudioEngine::new(8);
+        state.set_track_metadata(Some("Old song".to_string()), None, None);
+        state.clear_track_for_transition();
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+        let dacp = DacpController::disabled(state.clone());
+        let mut headers = BTreeMap::new();
+        headers.insert("Content-Type".to_string(), "text/parameters".to_string());
+        let request = RtspRequest {
+            method: "SET_PARAMETER".to_string(),
+            uri: "rtsp://x".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: b"title: New song\r\nartist: Singer\r\n".to_vec(),
+        };
+
+        apply_set_parameter(&state, &audio_engine, &playout, &dacp, None, &request);
+
+        assert!(!state.is_waiting_for_track_title());
+        assert_eq!(state.snapshot().track.title.as_deref(), Some("New song"));
+        assert_eq!(
+            drain_cmds(&mut cmd_rx).as_slice(),
+            &[PlayoutCommand::Start],
+            "text metadata title release must start playout"
+        );
+    }
+
+    #[test]
+    fn ap2_command_pause_and_play_gate_playout() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let pause = ap2_command_request("pause");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &pause);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &pause);
 
         assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 0);
+        // Pause emits exact [Pause, Flush]
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "pause must emit exactly [Pause, Flush]"
+        );
 
         let play = ap2_command_request("play");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &play);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &play);
 
         assert!(matches!(
             state.snapshot().player_state,
             PlayerState::Playing
         ));
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0]), 1);
+        // Play emits Start (no waiting for title)
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Start],
+            "play must emit exactly [Start] when title is ready"
+        );
     }
 
     #[test]
@@ -2628,20 +3110,26 @@ mod tests {
         *state.alac_channels.write() = Some(2);
         *state.frames_per_packet.write() = Some(352);
         let epoch = state.track_transition_epoch();
-        let audio_engine = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let next = ap2_command_request("next");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &next);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &next);
+
+        // Navigation should send exact [Pause, Flush]
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "navigation must emit exactly [Pause, Flush]"
+        );
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.track.title, None);
         assert_eq!(snapshot.track.progress_ms, Some(0));
         assert!(snapshot.track.awaiting_title);
-        assert_eq!(audio_engine.status().queued_samples, 0);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 0);
         assert!(state.ap2_audio_format.read().is_none());
         assert!(state.alac_sample_rate.read().is_none());
         assert!(state.alac_sample_size.read().is_none());
@@ -2655,32 +3143,229 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
-        let audio_engine = AudioEngine::new(8);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         apply_ap2_command(
             &state,
             &audio_engine,
+            &playout,
             &player,
             &dacp,
             &ap2_command_request("next"),
         );
+        // Navigation sends Pause + Flush; drain them
+        drain_cmds(&mut cmd_rx);
+
         apply_setrateanchortime(
             &state,
             &audio_engine,
+            &playout,
             &player,
             &setrateanchortime_request(1),
         );
 
         assert!(state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 0);
+        // Title not ready → no Start command emitted; Flush sent instead
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(!cmds.contains(&PlayoutCommand::Start));
+        assert!(cmds.contains(&PlayoutCommand::Flush));
 
         let metadata = ap2_now_playing_request("New song", "Singer", "Record");
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &metadata);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &metadata);
 
         assert!(!state.snapshot().track.awaiting_title);
-        assert_eq!(audio_engine.enqueue_interleaved(&[0.5]), 1);
+        // Title arrived → Start command emitted
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(cmds.contains(&PlayoutCommand::Start));
+    }
+
+    #[test]
+    fn ap1_record_emits_start_when_title_ready() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        state.set_track_metadata(Some("Song Title".to_string()), None, None);
+        *state.alac_sample_rate.write() = Some(44_100);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        // Title is set → enable_audio_when_track_ready emits Start
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            cmds.contains(&PlayoutCommand::Start),
+            "AP1 RECORD must emit Start when title is ready, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn ap1_record_does_not_start_when_awaiting_title() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        state.clear_track_for_transition(); // sets awaiting_title = true
+        *state.alac_sample_rate.write() = Some(44_100);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        // Awaiting title → only Flush emitted, no Start
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            !cmds.contains(&PlayoutCommand::Start),
+            "AP1 RECORD must NOT emit Start when awaiting title, got {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&PlayoutCommand::Flush),
+            "AP1 RECORD must emit Flush when awaiting title, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn flush_emits_exact_pause_then_flush() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "FLUSH".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "FLUSH must emit exactly [Pause, Flush]"
+        );
+        assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
+    }
+
+    #[test]
+    fn pause_emits_exact_pause_then_flush() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "PAUSE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Pause, PlayoutCommand::Flush],
+            "PAUSE must emit exactly [Pause, Flush]"
+        );
+        assert!(matches!(state.snapshot().player_state, PlayerState::Paused));
     }
 
     #[test]
@@ -2688,14 +3373,21 @@ mod tests {
         let config = crate::config::Config::default();
         let state = AppState::new(config);
         state.set_track_metadata(Some("Old song".to_string()), None, None);
-        let audio_engine = AudioEngine::new(8);
-        assert_eq!(audio_engine.enqueue_interleaved(&[1.0, 1.0, 1.0]), 3);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
         let player = SharedPlayer::new();
         let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
         let request = ap2_now_playing_request("New song", "Singer", "Record");
 
-        apply_ap2_command(&state, &audio_engine, &player, &dacp, &request);
+        apply_ap2_command(&state, &audio_engine, &playout, &player, &dacp, &request);
+
+        // Title changed (Old → New) while not waiting for title:
+        // Pause + Flush sent, then enable_audio_when_track_ready → Start.
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(cmds.contains(&PlayoutCommand::Pause));
+        assert!(cmds.contains(&PlayoutCommand::Flush));
+        assert!(cmds.contains(&PlayoutCommand::Start));
 
         let track = state.snapshot().track;
         assert_eq!(track.title.as_deref(), Some("New song"));
@@ -2703,7 +3395,6 @@ mod tests {
         assert_eq!(track.album.as_deref(), Some("Record"));
         assert_eq!(track.progress_ms, Some(12_500));
         assert_eq!(track.duration_ms, Some(240_000));
-        assert_eq!(audio_engine.status().queued_samples, 0);
     }
 
     #[test]
@@ -2840,14 +3531,14 @@ mod tests {
             body,
         };
 
-        let audio_engine = AudioEngine::new(1024);
         let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
         let response = handle_ap2_setup(
             &config.airplay,
             &state,
             &mut session,
             &request,
-            &audio_engine,
+            &playout,
             &dacp,
         );
         let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
@@ -2863,7 +3554,7 @@ mod tests {
         assert!(data_port > 0);
         assert!(control_port > 0);
         assert_ne!(data_port, control_port);
-        assert_eq!(*state.session_key.read(), None);
+        assert_eq!(*state.session_crypto.read(), None);
         assert_eq!(*state.ap2_media_key.read(), Some([7u8; 32]));
         assert_eq!(
             *state.ap2_audio_format.read(),
@@ -2922,5 +3613,886 @@ mod tests {
         assert_ne!(formats.buffer_stream & 0x0080_0000, 0);
         assert_eq!(formats.buffer_stream & 0x2700_0000, 0);
         assert_eq!(formats.buffer_stream & 0x2800_0000, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Apple-Challenge → Apple-Response
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn apple_challenge_builds_response() {
+        // Known input: challenge = [0x01; 16], local IPv4 = 127.0.0.1,
+        // device_id = "00:11:22:33:44:55"
+        let challenge_bytes = [0x01u8; 16];
+        let challenge_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let device_id = "00:11:22:33:44:55";
+
+        let response = build_apple_response(&challenge_b64, Some(local), device_id);
+        assert!(response.is_some(), "must produce Apple-Response");
+        let resp = response.unwrap();
+
+        // Response should be valid base64 (no padding in the output)
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD_NO_PAD, &resp);
+        assert!(
+            decoded.is_ok(),
+            "Apple-Response must be valid base64, got: {resp}"
+        );
+        let sig = decoded.unwrap();
+
+        // Signature must be 256 bytes (2048-bit RSA)
+        assert_eq!(sig.len(), 256, "unexpected signature length");
+
+        // Verify the signature round-trips with the public key
+        let key = decoder::classic_rsa_private_key();
+        let pub_key: rsa::RsaPublicKey = key.clone().into();
+
+        // Reconstruct the exact input buffer that was signed
+        let mut expected_buf = Vec::new();
+        expected_buf.extend_from_slice(&challenge_bytes);
+        expected_buf.extend_from_slice(&[127, 0, 0, 1]); // IPv4
+        expected_buf.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // ap1_prefix
+        while expected_buf.len() < 32 {
+            expected_buf.push(0u8);
+        }
+
+        pub_key
+            .verify(Pkcs1v15Sign::new_unprefixed(), &expected_buf, &sig)
+            .expect("Apple-Response signature must verify");
+    }
+
+    #[test]
+    fn apple_challenge_rejects_oversized_challenge() {
+        // 17 bytes challenge (larger than the 16-byte max)
+        let challenge_bytes = [0x42u8; 17];
+        let challenge_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let response = build_apple_response(&challenge_b64, Some(local), "00:11:22:33:44:55");
+        assert!(response.is_none(), "oversized challenge must be rejected");
+    }
+
+    #[test]
+    fn parse_mac_bytes_valid() {
+        let mac = parse_mac_bytes("aa:bb:cc:dd:ee:ff");
+        assert_eq!(mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    }
+
+    #[test]
+    fn parse_mac_bytes_invalid() {
+        assert_eq!(parse_mac_bytes("not-a-mac"), None);
+        assert_eq!(parse_mac_bytes("aa:bb:cc"), None); // too short
+        assert_eq!(parse_mac_bytes("aa:bb:cc:dd:ee:ff:00"), None); // too long
+    }
+
+    // -------------------------------------------------------------------
+    // Unpadded Apple-Challenge
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn apple_challenge_accepts_unpadded_base64() {
+        // Apple strips trailing '=' from base64 challenge strings.
+        // The tolerant decoder must handle this.
+        let challenge_bytes = [0x42u8; 16];
+        let challenge_b64_padded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge_bytes);
+        let challenge_b64_unpadded = challenge_b64_padded.trim_end_matches('=');
+
+        let local = SocketAddr::from(([127, 0, 0, 1], 7000));
+        let device_id = "00:11:22:33:44:55";
+
+        let response_padded = build_apple_response(&challenge_b64_padded, Some(local), device_id);
+        let response_unpadded =
+            build_apple_response(challenge_b64_unpadded, Some(local), device_id);
+
+        // Both padded and unpadded challenge must produce the same response,
+        // because they represent the same decoded bytes.
+        assert!(response_padded.is_some());
+        assert_eq!(response_padded, response_unpadded);
+    }
+
+    // -------------------------------------------------------------------
+    // Stale crypto replacement at ANNOUNCE + 456 for invalid crypto
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn announce_clears_stale_session_crypto() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Pre-populate with some stale crypto
+        *state.session_crypto.write() = SessionCrypto::new(&[1u8; 16], &[2u8; 16]);
+        assert!(state.session_crypto.read().is_some());
+
+        // Build a minimal ANNOUNCE request that does NOT contain crypto
+        // fields.  Unencrypted sessions are rejected with 456, but the
+        // stale crypto must still be cleared at the top of the handler.
+        let sdp_body =
+            b"v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\n";
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "1".to_string());
+        let request = RtspRequest {
+            method: "ANNOUNCE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: sdp_body.to_vec(),
+        };
+
+        let mut session = RtspSession::default();
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let services = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let response = route_request(&services, &mut session, &request);
+
+        // Unencrypted ANNOUNCE is rejected
+        assert_eq!(
+            response.code, 456,
+            "unencrypted ANNOUNCE must return 456 Parameter Not Understood"
+        );
+        // Stale crypto must still be cleared
+        assert_eq!(
+            *state.session_crypto.read(),
+            None,
+            "ANNOUNCE must clear stale session crypto even when rejected"
+        );
+        // Non-owner flag must NOT be set
+        assert!(!session.is_playback_owner);
+    }
+
+    #[test]
+    fn announce_with_partial_crypto_returns_456() {
+        // When rsaaeskey is provided but aesiv is missing, return 456.
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // SDP with rsaaeskey (encrypted with the classic key) but NO aesiv
+        let data = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x10\x11\x12\x13\x14\x15\x16";
+        let pub_key: rsa::RsaPublicKey = decoder::classic_rsa_private_key().clone().into();
+        let mut rng = rand_core::OsRng;
+        let encrypted = pub_key
+            .encrypt(&mut rng, rsa::Oaep::new::<sha1::Sha1>(), data)
+            .expect("encrypt");
+        let rsaaeskey_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted);
+
+        let sdp_body = format!(
+            "v=0\r\no=iTunes 1 0 IN IP4 10.0.0.2\r\ns=AirTunes\r\nm=audio 0 RTP/AVP 96\r\na=rsaaeskey:{rsaaeskey_b64}\r\n"
+        );
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "1".to_string());
+        let request = RtspRequest {
+            method: "ANNOUNCE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body: sdp_body.into_bytes(),
+        };
+
+        let mut session = RtspSession::default();
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let services = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let response = route_request(&services, &mut session, &request);
+
+        assert_eq!(
+            response.code, 456,
+            "partial crypto (key without IV) must return 456"
+        );
+        assert!(!session.is_playback_owner);
+    }
+
+    // -------------------------------------------------------------------
+    // perform_connection_cleanup idempotency + ownership
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn connection_cleanup_owner_clears_global_state() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        // Set up state that an owner cleanup should clear
+        *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
+        *state.ap2_media_key.write() = Some([5u8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+        state.set_active(true);
+        state.set_player_state(PlayerState::Playing);
+
+        let mut session = RtspSession::default();
+        session.is_playback_owner = true;
+
+        // Owner cleanup must clear global state and emit Stop
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+        assert_eq!(*state.session_crypto.read(), None);
+        assert_eq!(*state.ap2_media_key.read(), None);
+        assert_eq!(*state.ap2_audio_format.read(), None);
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert_eq!(
+            cmds.as_slice(),
+            &[PlayoutCommand::Stop],
+            "owner cleanup must emit exactly one Stop"
+        );
+
+        // Second cleanup must not repeat global cleanup or emit another command.
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+        assert_eq!(*state.session_crypto.read(), None);
+        assert_eq!(*state.ap2_media_key.read(), None);
+        assert_eq!(*state.ap2_audio_format.read(), None);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+    }
+
+    #[test]
+    fn connection_cleanup_non_owner_preserves_global_state() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+
+        // Set up state representing an active session owned by someone else
+        *state.session_crypto.write() = SessionCrypto::new(&[3u8; 16], &[4u8; 16]);
+        *state.ap2_media_key.write() = Some([5u8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+        state.set_active(true);
+        state.set_player_state(PlayerState::Playing);
+
+        let mut session = RtspSession::default();
+        // is_playback_owner defaults to false — this is a non-owner probe
+
+        // Non-owner cleanup must NOT clear global state
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+        assert!(
+            state.session_crypto.read().is_some(),
+            "non-owner cleanup must not clear session_crypto"
+        );
+        assert!(
+            state.ap2_media_key.read().is_some(),
+            "non-owner cleanup must not clear ap2_media_key"
+        );
+        assert!(
+            state.ap2_audio_format.read().is_some(),
+            "non-owner cleanup must not clear ap2_audio_format"
+        );
+        // Non-owner must emit no commands
+        let cmds = drain_cmds(&mut cmd_rx);
+        assert!(
+            cmds.is_empty(),
+            "non-owner cleanup must not emit any playout command, got {cmds:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Stream TEARDOWN ownership gating
+    // -------------------------------------------------------------------
+
+    /// Non-owner stream TEARDOWN must abort only its own listener and leave
+    /// another active session's ap2_media_key + ap2_audio_format intact.
+    #[test]
+    fn stream_teardown_non_owner_preserves_ap2_key_and_format() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Seed global AP2 state representing an active owner session
+        *state.ap2_media_key.write() = Some([0xABu8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+
+        // Build a buffered-audio stream TEARDOWN body (type 103)
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamID".to_string(), plist_uint_value(1u64));
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "10".to_string());
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+
+        // Non-owner session (is_playback_owner defaults to false)
+        let mut session = RtspSession::default();
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        route_request(&svc, &mut session, &request);
+
+        // Global AP2 state must remain intact
+        assert!(
+            state.ap2_media_key.read().is_some(),
+            "non-owner stream TEARDOWN must not clear ap2_media_key"
+        );
+        assert!(
+            state.ap2_audio_format.read().is_some(),
+            "non-owner stream TEARDOWN must not clear ap2_audio_format"
+        );
+    }
+
+    /// Owner stream TEARDOWN clears ap2_media_key, ap2_audio_format, and
+    /// session_key so the next SETUP can populate fresh values.
+    #[test]
+    fn stream_teardown_owner_clears_ap2_key_and_format() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+
+        // Seed global AP2 state
+        *state.ap2_media_key.write() = Some([0xCDu8; 32]);
+        *state.ap2_audio_format.write() = Some(AudioFormat::Alac44100S16Stereo);
+
+        // Build a buffered-audio stream TEARDOWN body (type 103)
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamID".to_string(), plist_uint_value(1u64));
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("CSeq".to_string(), "10".to_string());
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+
+        let mut session = RtspSession::default();
+        session.is_playback_owner = true;
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        route_request(&svc, &mut session, &request);
+
+        // Owner stream TEARDOWN must clear global AP2 state
+        assert_eq!(
+            *state.ap2_media_key.read(),
+            None,
+            "owner stream TEARDOWN must clear ap2_media_key"
+        );
+        assert_eq!(
+            *state.ap2_audio_format.read(),
+            None,
+            "owner stream TEARDOWN must clear ap2_audio_format"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Sub-16-byte payload preservation (aes_cbc_decrypt_in_place)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn aes_cbc_short_payload_preserved() {
+        // Verify that aes_cbc_decrypt_in_place leaves sub-block payloads
+        // unchanged rather than dropping them.
+        let key = [0xabu8; 16];
+        let iv = [0x06u8; 16];
+
+        // 5 bytes: no complete block
+        let mut short = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let original = short;
+        crate::decoder::aes_cbc_decrypt_in_place(&key, &iv, &mut short).unwrap();
+        assert_eq!(
+            short, original,
+            "payload < 16 bytes must be preserved unchanged"
+        );
+
+        // 17 bytes: 1 full block + 1 trailing byte
+        let mut mixed = [0x42u8; 17];
+        crate::decoder::aes_cbc_decrypt_in_place(&key, &iv, &mut mixed).unwrap();
+        // The last byte must be unchanged; first 16 are decrypted
+        assert_eq!(mixed[16], 0x42, "trailing byte must be unchanged");
+    }
+
+    // -------------------------------------------------------------------
+    // AP1 Transport header parser
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_ap1_transport_ipv4_lowercase() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 6001);
+        assert_eq!(params.timing_port, 6002);
+    }
+
+    #[test]
+    fn parse_ap1_transport_mixed_case_keys() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;Control_Port=7000;TimingPort=7001",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 7000);
+        assert_eq!(params.timing_port, 7001);
+    }
+
+    #[test]
+    fn parse_ap1_transport_extra_tokens_tolerated() {
+        let params = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=5000;timing_port=5001;foo=bar;baz",
+        )
+        .unwrap();
+        assert_eq!(params.control_port, 5000);
+        assert_eq!(params.timing_port, 5001);
+    }
+
+    #[test]
+    fn parse_ap1_transport_missing_control_port() {
+        let err = parse_ap1_transport_header("RTP/AVP/UDP;unicast;mode=record;timing_port=6002")
+            .unwrap_err();
+        assert!(err.contains("missing control_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_missing_timing_port() {
+        let err = parse_ap1_transport_header("RTP/AVP/UDP;unicast;mode=record;control_port=6001")
+            .unwrap_err();
+        assert!(err.contains("missing timing_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_zero_control_port() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=0;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("must not be zero"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_non_numeric_port() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=abc;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid control_port"));
+    }
+
+    #[test]
+    fn parse_ap1_transport_port_out_of_range() {
+        let err = parse_ap1_transport_header(
+            "RTP/AVP/UDP;unicast;mode=record;control_port=99999;timing_port=6002",
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid control_port"));
+    }
+
+    // -------------------------------------------------------------------
+    // AP1 SETUP stores remote endpoints, advertises local ports
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ap1_setup_stores_endpoints_and_returns_local_ports() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "192.168.1.50:51234".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.local_addr = Some("0.0.0.0:5000".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "tRaNsPoRt".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+
+        assert_eq!(resp.code, 200);
+
+        // Response must advertise local ports
+        let transport = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Transport"))
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert!(transport.contains(&format!("server_port={}", config.airplay.audio_port)));
+        assert!(transport.contains(&format!("control_port={}", config.airplay.control_port)));
+        assert!(transport.contains(&format!("timing_port={}", config.airplay.timing_port)));
+        assert!(state.snapshot().active);
+        assert_eq!(session.session_id.as_deref(), Some("1"));
+
+        // AppState must have the remote endpoints
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(peer.ip(), 6001));
+        assert_eq!(eps.timing, SocketAddr::new(peer.ip(), 6002));
+
+        // Session must have the remote ports
+        assert_eq!(session.ap1_remote_control_port, Some(6001));
+        assert_eq!(session.ap1_remote_timing_port, Some(6002));
+    }
+
+    #[test]
+    fn ap1_setup_ipv6_stores_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "[fd00::1]:51234".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.local_addr = Some("[::]:5000".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=7000;timing_port=7001".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 200);
+
+        let eps = state.ap1_remote_endpoints().unwrap();
+        assert_eq!(eps.control, SocketAddr::new(peer.ip(), 7000));
+        assert_eq!(eps.timing, SocketAddr::new(peer.ip(), 7001));
+    }
+
+    #[test]
+    fn ap1_setup_missing_transport_returns_400() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        session.peer_addr = Some("10.0.0.1:12345".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn ap1_setup_invalid_transport_returns_400() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        session.peer_addr = Some("10.0.0.1:12345".parse().unwrap());
+
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=0;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn ap1_setup_missing_peer_returns_400_without_activation() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Transport".to_string(),
+                "RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002".to_string(),
+            )]
+            .into(),
+            body: vec![],
+        };
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+        };
+
+        let resp = route_request(&svc, &mut session, &request);
+        assert_eq!(resp.code, 400);
+        assert!(!state.snapshot().active);
+        assert!(state.ap1_remote_endpoints().is_none());
+        assert!(session.session_id.is_none());
+    }
+
+    #[test]
+    fn owner_cleanup_clears_ap1_remote_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        session.peer_addr = Some(peer);
+        session.is_playback_owner = true;
+
+        // Set up remote endpoints first
+        state.set_ap1_remote_endpoints(peer.ip(), 6001, 6002);
+        assert!(state.ap1_remote_endpoints().is_some());
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+
+        assert!(state.ap1_remote_endpoints().is_none());
+        let snap = state.snapshot();
+        assert!(!snap.diagnostics.contains_key("ap1_remote_control"));
+        assert!(!snap.diagnostics.contains_key("ap1_remote_timing"));
+    }
+
+    #[test]
+    fn non_owner_cleanup_preserves_ap1_remote_endpoints() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let mut session = RtspSession::default();
+        let peer: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        session.peer_addr = Some(peer);
+        // is_playback_owner defaults to false — non-owner probe
+
+        // Set up remote endpoints
+        state.set_ap1_remote_endpoints(peer.ip(), 6001, 6002);
+        assert!(state.ap1_remote_endpoints().is_some());
+
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        perform_connection_cleanup(
+            &state,
+            &audio_engine,
+            &player,
+            &dacp,
+            &playout,
+            &mut session,
+        );
+
+        // Non-owner cleanup must NOT clear AP1 remote endpoints
+        assert!(state.ap1_remote_endpoints().is_some());
+        let snap = state.snapshot();
+        assert!(snap.diagnostics.contains_key("ap1_remote_control"));
+        assert!(snap.diagnostics.contains_key("ap1_remote_timing"));
     }
 }

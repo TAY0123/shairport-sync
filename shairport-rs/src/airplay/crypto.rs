@@ -55,16 +55,16 @@ impl IdentityKey {
     /// Load identity key from a file, or generate and save if not present.
     pub fn load_or_generate(path: Option<&std::path::Path>, device_id: &str) -> Self {
         if let Some(path) = path {
-            if let Ok(data) = std::fs::read(path) {
-                if data.len() == 32 {
-                    let mut seed = [0u8; 32];
-                    seed.copy_from_slice(&data);
-                    return Self::from_seed(seed);
-                }
+            if let Ok(data) = std::fs::read(path)
+                && data.len() == 32
+            {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&data);
+                return Self::from_seed(seed);
             }
             // Generate and persist
             let key = Self::generate();
-            if let Err(e) = std::fs::write(path, &key.signing.to_bytes()) {
+            if let Err(e) = std::fs::write(path, key.signing.to_bytes()) {
                 tracing::warn!(%e, "failed to persist identity key");
             }
             return key;

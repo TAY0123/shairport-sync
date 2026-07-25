@@ -711,9 +711,9 @@ pub fn parse_ptp_message(packet: &[u8]) -> Option<PtpMessage> {
     let sequence_id = u16::from_be_bytes([packet[30], packet[31]]);
     let clock_identity = u64::from_be_bytes(packet[20..28].try_into().ok()?);
     let origin_timestamp_ns = parse_timestamp_ns(packet.get(34..44)?);
-    let estimated_offset_ns = origin_timestamp_ns.and_then(|origin| {
+    let estimated_offset_ns = origin_timestamp_ns.map(|origin| {
         let local = timestamp_now_ns() as i128;
-        Some((origin as i128 - local).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        (origin as i128 - local).clamp(i64::MIN as i128, i64::MAX as i128) as i64
     });
     Some(PtpMessage {
         message_type,
