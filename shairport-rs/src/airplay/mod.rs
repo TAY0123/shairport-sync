@@ -1,3 +1,4 @@
+pub mod ap2;
 pub mod buffered_audio;
 pub mod crypto;
 pub mod dacp;
