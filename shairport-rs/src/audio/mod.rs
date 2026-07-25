@@ -1020,7 +1020,6 @@ impl AudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::Player;
 
     // ---------------------------------------------------------------------------
     // Existing tests (preserved, adapted to new API)
@@ -1604,51 +1603,54 @@ mod tests {
         );
     }
 
-    /// The `Player` struct has a fully implemented `pull_samples()` method,
-    /// but the audio output callback (`fill_output`) reads directly from the
-    /// `AudioEngine` ring buffer — it never calls `Player::pull_samples`.
-    /// The `Player` accumulates timing-aware frames from the RTP path but has
-    /// no consumer in the production audio pipeline.
+    /// Regression: `Player` is now control-only — it has no audio-frame queue
+    /// and cannot accumulate duplicate PCM via `push_frame`.
     ///
-    /// Sentinel: this test encodes a desired invariant that cannot be satisfied
-    /// until `Player::pull_samples` is wired into the audio output callback.
-    /// It asserts that after audio output consumption, the Player's
-    /// `total_frames_played` counter should advance.  Today, because
-    /// `fill_output` bypasses the Player entirely, the counter stays at 0.
+    /// In a prior architecture the RTP path fed decoded audio into *both*
+    /// `Player::push_frame` (timing-aware frame buffer) and
+    /// `AudioEngine::enqueue_interleaved_for_output` (the ring buffer that
+    /// `fill_output` actually reads from), creating a duplicate queue that was
+    /// never drained.
+    ///
+    /// Phase 3 removed the frame queue from Player entirely.  This test proves:
+    ///  * `Player` no longer exposes a `push_frame` method (`SharedPlayer`
+    ///    also lacks it).
+    ///  * All queue-related `PlayerStatus` fields report zero/`None` even after
+    ///    a start.
+    ///  * The `AudioEngine` pipeline is completely independent of the Player.
     #[test]
-    #[ignore = "bug: Player::pull_samples has no call site in the audio output callback; the Player fills independently and is never drained"]
-    fn player_not_integrated_with_audio_output() {
-        // Set up a Player with a buffered audio frame (simulating the RTP path).
-        let mut player = Player::new();
-        player.start(100);
-        player.push_frame(200, vec![0.8; 960], 48_000, 2);
-        assert_eq!(
-            player.status().buffered_frames,
-            1,
-            "precondition: Player has data"
-        );
+    fn player_is_control_only_and_cannot_accumulate_audio_queue() {
+        let player = crate::player::SharedPlayer::new();
+        player.start(11025);
+        let s = player.status();
 
-        // Create an AudioEngine — in the desired architecture the output
-        // callback would pull from the Player and feed the engine.
+        // --- Queue fields are always zero / None ---
+        assert_eq!(s.buffered_frames, 0, "no frame buffer exists");
+        assert_eq!(s.total_frames_played, 0);
+        assert_eq!(s.underruns, 0);
+        assert_eq!(s.late_frames_dropped, 0);
+        assert!(s.timestamp_offset.is_none());
+
+        // --- Transport-only state is observable ---
+        assert!(s.playing);
+        assert_eq!(s.latency_frames, 11025);
+        assert_eq!(s.sample_rate, 44100);
+
+        // --- AudioEngine is independent — fill_output reads its own ring buffer ---
         let (engine, mut consumer) = AudioEngine::new(2048);
         engine.set_output_format(48_000, 2);
+        engine.enqueue_interleaved_for_output(&[0.5; 960], 48_000, 2);
 
-        // The real output callback runs fill_output, which today pulls
-        // directly from the engine's ring buffer, bypassing the Player.
         let mut out = [0.0f32; 480];
-        consumer.fill_output(&mut out);
+        let filled = consumer.fill_output(&mut out);
+        assert!(filled > 0, "AudioEngine pipeline works independently");
 
-        // Sentinel assertion: in a correctly integrated system,
-        // total_frames_played would have advanced because the output
-        // callback consumed audio from the Player.  Because fill_output
-        // ignores the Player, total_frames_played remains 0.
-        assert!(
-            player.status().total_frames_played > 0,
-            "SENTINEL: total_frames_played = {} — Player::pull_samples must be \
-             called from the audio output path.  Today fill_output reads the \
-             AudioEngine ring buffer directly, so the Player is never drained.",
-            player.status().total_frames_played
-        );
+        // Player queue counters are untouched by audio-engine activity.
+        let s2 = player.status();
+        assert_eq!(s2.buffered_frames, 0);
+        assert_eq!(s2.total_frames_played, 0);
+        assert_eq!(s2.underruns, 0);
+        assert_eq!(s2.late_frames_dropped, 0);
     }
 
     /// In the AP2 buffered-audio path, `handle_buffered_stream` enables audio

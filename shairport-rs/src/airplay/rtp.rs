@@ -5,10 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::UdpSocket, task::JoinHandle};
 use tracing::{debug, info, warn};
 
-use crate::{
-    audio::AudioEngine, codec, config::AirplayConfig, decoder, player::SharedPlayer,
-    state::AppState,
-};
+use crate::{audio::AudioEngine, codec, config::AirplayConfig, decoder, state::AppState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RtpChannel {
@@ -32,15 +29,8 @@ pub async fn spawn_rtp_receivers(
     config: AirplayConfig,
     state: AppState,
     audio_engine: AudioEngine,
-    player: SharedPlayer,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
-    let audio = bind_audio_channel(
-        config.audio_port,
-        state.clone(),
-        audio_engine.clone(),
-        player,
-    )
-    .await?;
+    let audio = bind_audio_channel(config.audio_port, state.clone(), audio_engine.clone()).await?;
     let control = bind_channel(RtpChannel::Control, config.control_port, state.clone()).await?;
     let timing = bind_channel(RtpChannel::Timing, config.timing_port, state).await?;
     Ok(vec![audio, control, timing])
@@ -50,7 +40,6 @@ async fn bind_audio_channel(
     port: u16,
     state: AppState,
     audio_engine: AudioEngine,
-    player: SharedPlayer,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind = SocketAddr::from(([0, 0, 0, 0], port));
     let socket = UdpSocket::bind(bind)
@@ -146,15 +135,6 @@ async fn bind_audio_channel(
                         match dec.decode(&decrypted) {
                             Ok(decoded) => {
                                 if !decoded.samples.is_empty() {
-                                    let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-
-                                    player.push_frame(
-                                        ts,
-                                        decoded.samples.clone(),
-                                        decoded.sample_rate,
-                                        decoded.channels,
-                                    );
-
                                     let (enqueued, total_samples) = audio_engine
                                         .enqueue_interleaved_for_output(
                                             &decoded.samples,

@@ -147,7 +147,6 @@ async fn main() -> anyhow::Result<()> {
             config.airplay.clone(),
             app_state.clone(),
             audio_engine.clone(),
-            player.clone(),
         )
         .await?
     } else {
