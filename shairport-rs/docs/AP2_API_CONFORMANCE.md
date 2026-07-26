@@ -319,7 +319,41 @@ and artwork bodies; exceeding either limit drops the connection.
    MediaRemote commands are not handled.
 
 7. **`/feedback`.**  The body is acknowledged but not inspected.
-   Event-driven status push via the event channel is implemented.
+   Event-driven status push via the event channel now sends
+   `updateInfo` on each accepted connection and validates the
+   encrypted 2xx acknowledgement.  No speculative live state
+   pushes are generated yet — only the `updateInfo` command is
+   sent on connect.
+
+   The event channel transport lives in `src/airplay/ap2/event.rs`
+   and provides:
+   - `EventListener::bind()` — TCP listener with deterministic abort
+     (aborting the listener also terminates the current worker).
+   - `build_update_info_command()` — produces the exact `POST /command
+     RTSP/1.0` wire format with `Content-Length` and `Content-Type:
+     application/x-apple-binary-plist` (no `CSeq`).
+   - `parse_rtsp_response()` — validates status line, case-insensitive
+     headers, `Content-Length`, and complete-message boundary.
+   - Only 2xx responses are accepted as successful acknowledgement;
+     non-2xx, malformed, EOF, timeout, auth failure, oversize, or
+     extra invalid data closes the worker but keeps the listener
+     alive for reconnect.
+   - At most one active connection: a new accepted connection aborts
+     and replaces the previous worker.
+   - The zeroizing pairing secret is used once to derive one
+     session-lifetime event `PairCipher`. Workers share only the cipher;
+     counters remain monotonic across reconnects and raw secret bytes are
+     not retained by workers or logged.
+   - Bounds: encrypted pending ≤ 4 096 bytes, decrypted response
+     ≤ 8 192 bytes, `PairCipher::MAX_BLOCK` (1 024) enforced by the
+     cipher.  All buffers use checked arithmetic.
+   - Full test coverage (40 tests): wire format, binary-plist shape,
+     RTSP response parser fragmented at every byte boundary,
+     content-length body, malformed status/header/content-length,
+     non-2xx, encrypted fragmented response, auth failure, encrypted/
+     plaintext limit boundary and overflow, replacement of active
+     connection, reconnect after failure, parent abort terminates
+     worker, no payload log patterns.
 
 8. **SETPEERS / SETPEERSX.**  Body lengths are recorded as
    diagnostics but the peer information is not stored or acted on.
@@ -385,7 +419,7 @@ The `crypto.rs` module adds **~12 tests** covering:
 - Client/server control cipher cross-direction round-trip
 - Fragmented header at every byte boundary (accumulator pattern)
 
-Full test count: **602** tests passing (`cargo test --all-targets`).
+Full test count: **642** tests passing (`cargo test --all-targets`).
 
 These tests run as part of `cargo test --all-targets` and are
 independent of the RTSP server — no TCP sockets are opened for the

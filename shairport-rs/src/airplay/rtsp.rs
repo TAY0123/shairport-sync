@@ -23,6 +23,7 @@ use crate::{
     airplay::{
         ap2::capability::Ap2CapabilityPolicy,
         ap2::contract::{Ap2StreamType, Ap2TimingProtocol},
+        ap2::event::EventListener,
         ap2::session::{
             Ap2SessionPhase, Ap2SessionState, Ap2Stream, Ap2StreamState, Ap2TeardownTarget,
             TransitionError, validate_add_stream_phase, validate_transition,
@@ -192,119 +193,6 @@ fn spawn_tcp_drain_listener(
     Ok((port, handle))
 }
 
-fn spawn_ap2_event_listener(
-    bind_addr: SocketAddr,
-    config: AirplayConfig,
-    peer_addr: Option<SocketAddr>,
-    shared_secret: Vec<u8>,
-    group_uuid: Option<String>,
-    group_contains_group_leader: Option<bool>,
-    ap2_policy: Ap2CapabilityPolicy,
-) -> anyhow::Result<(u16, JoinHandle<()>)> {
-    let shared_secret = Arc::new(Zeroizing::new(shared_secret));
-    let socket = match bind_addr {
-        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
-        SocketAddr::V6(_) => {
-            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-            socket.set_only_v6(false)?;
-            socket
-        }
-    };
-    socket.set_reuse_address(true)?;
-    socket.bind(&bind_addr.into())?;
-    socket.listen(5)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    let port = std_listener.local_addr()?.port();
-    let listener = TcpListener::from_std(std_listener)?;
-
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    info!(%peer, "AP2 event connection opened");
-                    let config = config.clone();
-                    let shared_secret = Arc::clone(&shared_secret);
-                    let group_uuid = group_uuid.clone();
-                    let ap2_policy = ap2_policy;
-                    tokio::spawn(async move {
-                        let mut cipher = PairCipher::events_for_server(shared_secret.as_slice());
-                        match build_ap2_update_info_event(
-                            &config,
-                            peer_addr,
-                            group_uuid.as_deref(),
-                            group_contains_group_leader,
-                            &ap2_policy,
-                        ) {
-                            Ok(wire) => match cipher.encrypt_blocks(&wire) {
-                                Ok(encrypted) => {
-                                    if let Err(e) = stream.write_all(&encrypted).await {
-                                        warn!(%peer, %e, "failed to send AP2 event updateInfo");
-                                        return;
-                                    }
-                                    debug!(
-                                        %peer,
-                                        plaintext_len = wire.len(),
-                                        encrypted_len = encrypted.len(),
-                                        "AP2 event updateInfo sent"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(%peer, %e, "failed to encrypt AP2 event updateInfo");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                warn!(%peer, %e, "failed to build AP2 event updateInfo");
-                                return;
-                            }
-                        }
-
-                        let mut encrypted_buf = Vec::new();
-                        let mut read_buf = [0u8; 2048];
-                        loop {
-                            match stream.read(&mut read_buf).await {
-                                Ok(0) => {
-                                    debug!(%peer, "AP2 event connection closed");
-                                    break;
-                                }
-                                Ok(read) => {
-                                    encrypted_buf.extend_from_slice(&read_buf[..read]);
-                                    match cipher.decrypt_blocks(&encrypted_buf) {
-                                        Ok((plain, consumed)) => {
-                                            if consumed > 0 {
-                                                encrypted_buf.drain(..consumed);
-                                            }
-                                            if !plain.is_empty() {
-                                                debug!(
-                                                    %peer,
-                                                    plaintext_len = plain.len(),
-                                                    "AP2 event payload received"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(%peer, %e, bytes_read = read, "failed to decrypt AP2 event payload");
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(%peer, %e, "AP2 event connection failed");
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => warn!(%e, "AP2 event accept failed"),
-            }
-        }
-    });
-
-    Ok((port, handle))
-}
-
 fn build_ap2_update_info_event(
     config: &AirplayConfig,
     peer_addr: Option<SocketAddr>,
@@ -330,13 +218,7 @@ fn build_ap2_update_info_event(
     plist::to_writer_binary(&mut body, &Value::Dictionary(update_info))
         .context("failed to serialize AP2 updateInfo plist")?;
 
-    let mut wire = format!(
-        "POST /command RTSP/1.0\r\nContent-Length: {}\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    wire.extend_from_slice(&body);
-    Ok(wire)
+    Ok(body)
 }
 
 fn spawn_ap2_control_receiver(bind_addr: SocketAddr) -> anyhow::Result<(u16, JoinHandle<()>)> {
@@ -878,11 +760,9 @@ fn activate_pairing_completion(
         PairingCompletion::TransientSetup { key, .. }
         | PairingCompletion::FullSetup { key, .. } => {
             session.control_cipher = Some(PairCipher::control_for_server(key));
-            session.event_cipher = Some(PairCipher::events_for_server(key));
         }
         PairingCompletion::Verify { shared_secret } => {
             session.control_cipher = Some(PairCipher::control_for_server(shared_secret));
-            session.event_cipher = Some(PairCipher::events_for_server(shared_secret));
         }
     }
     Ok(())
@@ -1765,9 +1645,8 @@ struct RtspSession {
     session_id: Option<String>,
     pairing: PairingSession,
     control_cipher: Option<PairCipher>,
-    event_cipher: Option<PairCipher>,
     data_cipher: Option<PairCipher>,
-    event_listener: Option<JoinHandle<()>>,
+    event_listener: Option<EventListener>,
     ap2_control_listener: Option<JoinHandle<()>>,
     buffered_audio_listener: Option<JoinHandle<()>>,
     realtime_audio_listener: Option<JoinHandle<()>>,
@@ -1806,8 +1685,10 @@ impl RtspSession {
     }
 
     fn abort_ap2_listeners(&mut self) {
+        if let Some(listener) = self.event_listener.take() {
+            listener.abort();
+        }
         for handle in [
-            self.event_listener.take(),
             self.ap2_control_listener.take(),
             self.buffered_audio_listener.take(),
             self.realtime_audio_listener.take(),
@@ -2351,7 +2232,7 @@ fn handle_ap2_setup(
 
             // Hold any newly-created listener locally until every fallible
             // operation has succeeded. Existing session listeners are reused.
-            let mut new_event_listener: Option<(u16, JoinHandle<()>)> = None;
+            let mut new_event_listener: Option<(u16, EventListener)> = None;
             let event_port = if let Some(port) = session.event_port {
                 port
             } else {
@@ -2360,17 +2241,32 @@ fn handle_ap2_setup(
                     return response(503, "Service Unavailable");
                 };
                 let event_bind = event_bind_addr(session.local_addr, local_ip);
-                match spawn_ap2_event_listener(
-                    event_bind,
-                    config.clone(),
+
+                // Build the updateInfo binary-plist body.
+                let update_info_body = match build_ap2_update_info_event(
+                    config,
                     session.peer_addr,
-                    shared_secret.to_vec(),
-                    group_uuid.clone(),
+                    group_uuid.as_deref(),
                     group_leader,
-                    *ap2_policy,
+                    ap2_policy,
                 ) {
-                    Ok((port, handle)) => {
-                        new_event_listener = Some((port, handle));
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!(%e, "failed to build AP2 updateInfo event");
+                        return response(500, "Internal Server Error");
+                    }
+                };
+
+                let secret = Arc::new(Zeroizing::new(shared_secret.to_vec()));
+                match EventListener::bind(
+                    event_bind,
+                    secret,
+                    update_info_body,
+                    crate::airplay::ap2::event::DEFAULT_WRITE_TIMEOUT,
+                    crate::airplay::ap2::event::DEFAULT_READ_TIMEOUT,
+                ) {
+                    Ok((port, listener)) => {
+                        new_event_listener = Some((port, listener));
                         port
                     }
                     Err(e) => {
@@ -2396,8 +2292,8 @@ fn handle_ap2_setup(
             let mut body = Vec::new();
             if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_err()
             {
-                if let Some((_, handle)) = new_event_listener {
-                    handle.abort();
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
                 }
                 return response(500, "Internal Server Error");
             }
@@ -2408,17 +2304,17 @@ fn handle_ap2_setup(
                     .ap2
                     .configure_timing(timing_protocol, group_uuid.clone(), group_leader)
             {
-                if let Some((_, handle)) = new_event_listener {
-                    handle.abort();
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
                 }
                 return response(455, "Method Not Valid in This State")
                     .header("X-Reason", format!("invalid phase for timing SETUP: {e}"))
                     .with_cseq(request);
             }
             session.receiver_ip_override = Some(local_ip);
-            if let Some((port, handle)) = new_event_listener {
+            if let Some((port, listener)) = new_event_listener {
                 session.event_port = Some(port);
-                session.event_listener = Some(handle);
+                session.event_listener = Some(listener);
             }
             state.set_diagnostic("ap2_phase", "initial-ptp-setup");
             if let Some(gid) = group_uuid {
@@ -6526,7 +6422,6 @@ mod tests {
                 .is_some()
         );
         assert!(session.control_cipher.is_none());
-        assert!(session.event_cipher.is_none());
         assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
     }
 
@@ -6540,6 +6435,5 @@ mod tests {
         };
         assert!(activate_pairing_completion(&mut session, &completion).is_err());
         assert!(session.control_cipher.is_none());
-        assert!(session.event_cipher.is_none());
     }
 }
