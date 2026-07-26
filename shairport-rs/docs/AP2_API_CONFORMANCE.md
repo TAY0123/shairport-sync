@@ -218,18 +218,37 @@ The `PairingReply` carries a typed `PairingCompletion` enum
 **only** when the terminal pairing step succeeds and the response TLV
 contains no error.  Apple sends TLV errors with HTTP 200 — the old
 pattern of checking `status_code >= 200` for success was therefore
-unsafe and has been replaced.  The RTSP handler installs the control
-`PairCipher` and marks the `Ap2SessionState` as `Paired` exclusively
-from the completion signal.
+unsafe and has been replaced.  The RTSP handler marks the
+`Ap2SessionState` as `Paired` exclusively from the completion signal.
+Control encryption (`PairCipher`) is installed per the table below.
+
+#### Control encryption activation
+
+| Completion       | Marks Paired | Installs `control_cipher`              |
+|------------------|:------------:|----------------------------------------|
+| `TransientSetup` | ✓            | ✓ — SRP session key K                 |
+| `FullSetup`      | ✓            | **no** — stays plaintext              |
+| `Verify`         | ✓            | ✓ — X25519 shared secret              |
+
+**Transient pair-setup** has no subsequent pair-verify; the SRP session
+key K is therefore used directly to derive the control cipher.
+
+**Non-transient (full) pair-setup** persists the client identity to the
+`PairingDatabase` and marks the session `Paired`, but deliberately does
+*not* activate RTSP control encryption.  The next pair-verify exchange
+runs in plaintext; only a successful `Verify` completion installs the
+control `PairCipher` (using the fresh X25519 shared secret, not the
+stale SRP session key).  This matches Apple's protocol behaviour.
 
 - **Transient pair-setup:** `TransientSetup { key, client_id: None }` after M3/M4 SRP
   proof verification.  `key` is the 64-byte SRP session key K.
 - **Non-transient pair-setup:** `FullSetup { key, client_id }` after
   M5 identity verification and M6 generation.  The client is persisted
   to the `PairingDatabase` before the completion is signalled.
+  The `key` is *not* used for control encryption (see above).
 - **Pair-verify:** `Verify { shared_secret }` after M3 Ed25519
   signature verification.  `shared_secret` is the verified X25519
-  ECDH shared secret.
+  ECDH shared secret used to derive the control cipher.
 
 ### Pair management gate
 
@@ -448,7 +467,7 @@ Route-level RTSP integration tests additionally cover:
 - Strict/transactional seed, dedicated-socket, and control-type rejection
 - Duplicate SETUP rollback, data-only TEARDOWN, and full session cleanup
 
-Full test count: **673** tests passing (`cargo test --all-targets`).
+Full test count: **679** tests passing (`cargo test --all-targets`).
 
 Contract and pure validation tests do not open sockets. The event/data
 transport and RTSP lifecycle integration tests intentionally use loopback TCP

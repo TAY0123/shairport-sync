@@ -705,6 +705,23 @@ fn perform_connection_cleanup(
     let _ = session.ap2.close();
 }
 
+/// Activate a [`PairingCompletion`] on the session.
+///
+/// # Control encryption behaviour
+///
+/// | Completion         | Marks Paired | Installs `control_cipher` |
+/// |--------------------|:------------:|:-------------------------:|
+/// | `TransientSetup`   | ✓            | ✓ (SRP session key K)    |
+/// | `FullSetup`        | ✓            | **no** — stays plaintext |
+/// | `Verify`           | ✓            | ✓ (X25519 shared secret) |
+///
+/// **Transient** pair-setup has no subsequent pair-verify; the SRP session
+/// key is therefore used directly for control encryption.
+///
+/// **Non-transient (Full)** pair-setup persists the client identity to the
+/// database but deliberately does *not* activate control encryption.  The
+/// next pair-verify exchange must happen in plaintext; only a successful
+/// `Verify` completion installs the control `PairCipher`.
 fn activate_pairing_completion(
     session: &mut RtspSession,
     completion: &PairingCompletion,
@@ -712,9 +729,16 @@ fn activate_pairing_completion(
     // Validate lifecycle state before installing any new ciphers.
     session.ap2.mark_paired()?;
     match completion {
-        PairingCompletion::TransientSetup { key, .. }
-        | PairingCompletion::FullSetup { key, .. } => {
+        PairingCompletion::TransientSetup { key, .. } => {
             session.control_cipher = Some(PairCipher::control_for_server(key));
+        }
+        PairingCompletion::FullSetup { .. } => {
+            // Non-transient (full) pair-setup persists the client to the
+            // pairing database and marks the session Paired, but does NOT
+            // activate RTSP control encryption.  The next pair-verify
+            // exchange is plaintext; only successful Verify installs the
+            // control PairCipher (using the fresh X25519 shared secret,
+            // not the SRP session key).
         }
         PairingCompletion::Verify { shared_secret } => {
             session.control_cipher = Some(PairCipher::control_for_server(shared_secret));
@@ -7113,5 +7137,140 @@ mod tests {
         };
         assert!(activate_pairing_completion(&mut session, &completion).is_err());
         assert!(session.control_cipher.is_none());
+    }
+
+    // ── activate_pairing_completion compliance ─────────────────────────
+
+    #[test]
+    fn full_setup_marks_paired_and_leaves_control_cipher_none() {
+        let mut session = RtspSession::default();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
+        assert!(session.control_cipher.is_none());
+
+        let completion = PairingCompletion::FullSetup {
+            key: [0xAA; 64],
+            client_id: "test-client".into(),
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        // FullSetup must advance the phase to Paired.
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // FullSetup must NOT install control encryption.
+        assert!(session.control_cipher.is_none());
+    }
+
+    #[test]
+    fn verify_installs_cipher() {
+        let mut session = RtspSession::default();
+        let secret: [u8; 32] = [0x77; 32];
+        let completion = PairingCompletion::Verify {
+            shared_secret: secret,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // Verify must install a control cipher using the X25519 shared secret.
+        assert!(session.control_cipher.is_some());
+    }
+
+    #[test]
+    fn transient_setup_installs_cipher() {
+        let mut session = RtspSession::default();
+        let completion = PairingCompletion::TransientSetup {
+            key: [0xBB; 64],
+            client_id: None,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // TransientSetup must install control encryption (no subsequent verify).
+        assert!(session.control_cipher.is_some());
+    }
+
+    /// After a non-transient FullSetup (control_cipher left None), a
+    /// plaintext pair-verify-like RTSP request must remain parseable as
+    /// plaintext.  It must not be routed into encrypted-parsing.
+    #[test]
+    fn full_setup_leaves_control_plaintext_for_next_request() {
+        let mut session = RtspSession::default();
+
+        // 1. Complete a non-transient pair-setup.
+        let completion = PairingCompletion::FullSetup {
+            key: [0xCC; 64],
+            client_id: "test-client-2".into(),
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+        assert!(session.control_cipher.is_none());
+
+        // 2. Simulate residual plaintext pair-verify bytes after the
+        //    FullSetup response. The production handoff helper must leave
+        //    them in the plaintext buffer because no cipher was activated.
+        let raw = b"POST /pair-verify RTSP/1.0\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Content-Length: 6\r\n\
+                     \r\n\
+                     \x00\x01\x02\x03\x04\x05";
+        let mut plaintext = raw.to_vec();
+        let mut encrypted = Vec::new();
+        handoff_coalesced_encrypted_control(
+            false,
+            session.control_cipher.as_mut(),
+            &mut plaintext,
+            &mut encrypted,
+        )
+        .unwrap();
+        assert_eq!(plaintext, raw);
+        assert!(encrypted.is_empty());
+
+        let (parsed, consumed) = parse_request(&plaintext).unwrap();
+        assert_eq!(consumed, plaintext.len());
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.uri, "/pair-verify");
+        assert_eq!(
+            parsed.headers.get("Content-Type").map(|s| s.as_str()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(parsed.body, b"\x00\x01\x02\x03\x04\x05");
+    }
+
+    /// After a TransientSetup installs the cipher, the next request on
+    /// the wire is encrypted — the coalesced handoff path must still
+    /// work (regression guard for the existing behaviour).
+    #[test]
+    fn transient_setup_cipher_activated_coalesced_handoff_guard() {
+        let mut session = RtspSession::default();
+        let completion = PairingCompletion::TransientSetup {
+            key: [0xDD; 64],
+            client_id: None,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+        // After TransientSetup the cipher must be active — the next
+        // request must be encrypted.
+        assert!(session.control_cipher.is_some());
+    }
+
+    /// Verify-after-FullSetup must install the cipher: simulate a
+    /// non-transient pair-setup followed by a pair-verify completion.
+    #[test]
+    fn verify_after_full_setup_installs_cipher() {
+        let mut session = RtspSession::default();
+
+        // Step 1: FullSetup — no cipher.
+        let setup_completion = PairingCompletion::FullSetup {
+            key: [0xEE; 64],
+            client_id: "client-3".into(),
+        };
+        activate_pairing_completion(&mut session, &setup_completion).unwrap();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        assert!(session.control_cipher.is_none());
+
+        // Step 2: Verify — cipher must be installed.
+        let secret: [u8; 32] = [0xFF; 32];
+        let verify_completion = PairingCompletion::Verify {
+            shared_secret: secret,
+        };
+        activate_pairing_completion(&mut session, &verify_completion).unwrap();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        assert!(session.control_cipher.is_some());
     }
 }
