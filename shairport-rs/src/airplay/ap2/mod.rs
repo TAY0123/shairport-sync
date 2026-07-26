@@ -22,6 +22,7 @@
 //! assert_eq!(contract.operation, "GET /info");
 //! ```
 
+pub mod capability;
 pub mod contract;
 pub mod request;
 pub mod response;

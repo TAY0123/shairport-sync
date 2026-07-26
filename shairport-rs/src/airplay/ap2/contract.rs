@@ -239,6 +239,10 @@ pub enum Ap2StateEffect {
     StreamListenerClosed,
     /// Media key derived / refreshed.
     MediaKeyDerived,
+    /// Timing protocol and peer identity configured.
+    TimingConfigured,
+    /// AP2 event listener opened.
+    EventPortOpen,
     /// Timing anchor applied.
     TimingAnchorSet,
     /// Volume / audio mode changed.
@@ -264,6 +268,8 @@ impl fmt::Display for Ap2StateEffect {
             Self::PlaybackStopped => "playback-stopped",
             Self::StreamListenerClosed => "stream-listener-closed",
             Self::MediaKeyDerived => "media-key-derived",
+            Self::TimingConfigured => "timing-configured",
+            Self::EventPortOpen => "event-port-open",
             Self::TimingAnchorSet => "timing-anchor-set",
             Self::AudioModeChanged => "audio-mode-changed",
             Self::PeersUpdated => "peers-updated",
@@ -325,8 +331,15 @@ pub enum Ap2RequestDiscriminator {
     /// No extra check — contract matches on method/URI/CT alone.
     None,
     /// The plist dictionary must contain the given key for the contract to
-    /// match.  When `plist_dict` is `None` the discriminator fails.
+    /// match. When `plist_dict` is `None` the discriminator fails.
     HasPlistKey(&'static str),
+    /// The plist dictionary must contain `required` and must not contain
+    /// `excluded`. This disambiguates initial SETUP from stream SETUP when
+    /// both use the same method, URI, and content type.
+    HasPlistKeyWithout {
+        required: &'static str,
+        excluded: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -458,9 +471,9 @@ impl fmt::Display for ContractError {
 /// `/pair-verify` have complete SRP + Ed25519 logic in `pairing.rs` →
 /// Implemented.  `/fp-setup` and `/configure` are acknowledged but the
 /// FairPlay implementation is a stub → Stub.  `SETUP` with buffered audio
-/// (type 103) + PTP timing is Partial because some negotiated parameters are
-/// recorded but not acted upon.  Realtime audio (type 96) and NTP timing are
-/// accepted but not fully operational → Partial.
+/// (type 103) + PTP timing is Partial because timeline anchors are not yet
+/// applied to scheduler deadlines. Realtime audio (type 96), data streams
+/// (type 130), NTP timing, and no-timing mode are rejected truthfully.
 ///
 /// See `docs/AP2_API_CONFORMANCE.md` for rationale.
 pub static AP2_CONTRACTS: &[Ap2Contract] = &[
@@ -681,17 +694,19 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         ],
         expected_status: 200,
         response_content_type: Ap2ContentType::BinaryPlist,
-        required_response_keys: &["streams"],
+        required_response_keys: &["timingPeerInfo", "eventPort", "timingPort"],
         idempotency: Ap2Idempotency::NotIdempotent,
         state_effects: &[
             Ap2StateEffect::SessionCreated,
-            Ap2StateEffect::AudioPortsOpen,
-            Ap2StateEffect::ActiveSet,
-            Ap2StateEffect::MediaKeyDerived,
+            Ap2StateEffect::EventPortOpen,
+            Ap2StateEffect::TimingConfigured,
         ],
         error_policy: Ap2ErrorPolicy::Standard,
         implementation: Ap2ImplementationStatus::Partial,
-        discriminator: Ap2RequestDiscriminator::HasPlistKey("timingProtocol"),
+        discriminator: Ap2RequestDiscriminator::HasPlistKeyWithout {
+            required: "timingProtocol",
+            excluded: "streams",
+        },
     },
     Ap2Contract {
         method: Ap2Method::Setup,
@@ -904,6 +919,9 @@ pub fn classify(view: &super::request::Ap2RequestView<'_>) -> Option<&'static Ap
             Ap2RequestDiscriminator::HasPlistKey(key) => {
                 view.plist_dict.is_some_and(|d| d.contains_key(key))
             }
+            Ap2RequestDiscriminator::HasPlistKeyWithout { required, excluded } => view
+                .plist_dict
+                .is_some_and(|d| d.contains_key(required) && !d.contains_key(excluded)),
         }
     })
 }
@@ -1338,10 +1356,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_setup_both_keys_is_initial() {
-        // When both timingProtocol and streams are present, the first
-        // matching contract (initial SETUP) wins — protocol permits
-        // an initial SETUP that also adds streams.
+    fn classify_setup_both_keys_is_stream() {
+        // Runtime SETUP handling gives the streams shape precedence when
+        // both keys are present, so the contract classifier must agree.
         let mut dict = plist::Dictionary::new();
         dict.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
         dict.insert("streams".into(), plist::Value::Array(vec![]));
@@ -1353,8 +1370,8 @@ mod tests {
         );
         let c = classify(&v).expect("should classify when both keys present");
         assert!(
-            c.operation.contains("initial"),
-            "expected initial SETUP when both keys present, got '{}'",
+            c.operation.contains("stream"),
+            "expected stream SETUP when both keys present, got '{}'",
             c.operation
         );
     }
@@ -1609,6 +1626,12 @@ mod tests {
                 Ap2RequestDiscriminator::HasPlistKey(key) => {
                     let mut d = plist::Dictionary::new();
                     d.insert(key.into(), plist::Value::String("test".into()));
+                    owned_dict = Some(d);
+                    owned_dict.as_ref()
+                }
+                Ap2RequestDiscriminator::HasPlistKeyWithout { required, .. } => {
+                    let mut d = plist::Dictionary::new();
+                    d.insert(required.into(), plist::Value::String("test".into()));
                     owned_dict = Some(d);
                     owned_dict.as_ref()
                 }
