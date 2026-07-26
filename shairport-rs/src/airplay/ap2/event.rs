@@ -370,18 +370,18 @@ async fn handle_event_connection(
 ) -> Result<(), EventError> {
     info!(%peer, "AP2 event connection opened");
     let wire = build_update_info_command(&update_info_body);
-    let encrypted = {
-        let mut cipher = cipher.lock().await;
-        cipher.encrypt_blocks(&wire)?
-    };
-
-    timeout(write_timeout, stream.write_all(&encrypted))
+    let mut cipher_guard = cipher.lock().await;
+    let prepared = cipher_guard.prepare_encryption(&wire)?;
+    let encrypted_len = prepared.ciphertext().len();
+    timeout(write_timeout, stream.write_all(prepared.ciphertext()))
         .await
         .map_err(|_| EventError::WriteTimeout)??;
+    prepared.commit();
+    drop(cipher_guard);
     debug!(
         %peer,
         plaintext_len = wire.len(),
-        encrypted_len = encrypted.len(),
+        encrypted_len,
         "AP2 event updateInfo sent"
     );
 

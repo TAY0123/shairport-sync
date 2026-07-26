@@ -154,6 +154,14 @@ impl PairingSession {
             .or_else(|| self.setup_session_key.as_ref().map(|key| key.as_slice()))
     }
 
+    /// Install a verified control secret for protocol integration tests.
+    #[cfg(test)]
+    pub(crate) fn install_test_control_secret(&mut self, secret: [u8; 32]) {
+        self.reset_verify();
+        self.verify_shared_secret = Some(secret);
+        self.verified = true;
+    }
+
     fn finish_setup_exchange(&mut self) {
         if let Some(ref mut state) = self.setup {
             state.zeroize();

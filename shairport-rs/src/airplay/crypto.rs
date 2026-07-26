@@ -55,6 +55,8 @@ pub enum CipherError {
     CounterExhausted,
     #[error("encryption failed")]
     EncryptionFailed,
+    #[error("outbound encryption state is poisoned after an uncommitted write")]
+    EncryptionStatePoisoned,
 }
 
 /// ChaCha20-Poly1305 cipher with per-direction counters.
@@ -65,10 +67,13 @@ pub enum CipherError {
 ///
 /// # Counter behaviour
 ///
-/// Counters use checked arithmetic.  An encryption that would exceed
+/// Counters use checked arithmetic. An encryption that would exceed
 /// [`u64::MAX`] returns [`CipherError::CounterExhausted`] **before** any
-/// nonce is reused.  Decryption does not advance the counter on
-/// authentication failure.
+/// nonce is reused. Decryption does not advance the counter on
+/// authentication failure. Network writers can use [`prepare_encryption`]
+/// to defer the outbound counter commit until the ciphertext is fully written.
+/// Dropping an uncommitted prepared record poisons outbound encryption so a
+/// later connection cannot accidentally reuse or skip an uncertain nonce.
 ///
 /// # Framing
 ///
@@ -81,6 +86,40 @@ pub struct PairCipher {
     decryption_key: DerivedKey,
     encryption_counter: u64,
     decryption_counter: u64,
+    encryption_poisoned: bool,
+}
+
+/// Ciphertext prepared for an external write but not yet committed.
+///
+/// The caller must call [`PreparedEncryption::commit`] only after the entire
+/// ciphertext has been written. Dropping this guard without committing marks
+/// the cipher's outbound direction unusable, including task cancellation.
+pub struct PreparedEncryption<'a> {
+    cipher: &'a mut PairCipher,
+    ciphertext: Vec<u8>,
+    final_counter: u64,
+    committed: bool,
+}
+
+impl PreparedEncryption<'_> {
+    /// Ciphertext bytes to write atomically from the protocol's perspective.
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+
+    /// Commit the staged counter after a successful complete write.
+    pub fn commit(mut self) {
+        self.cipher.encryption_counter = self.final_counter;
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedEncryption<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cipher.encryption_poisoned = true;
+        }
+    }
 }
 
 impl Drop for PairCipher {
@@ -89,6 +128,7 @@ impl Drop for PairCipher {
         self.decryption_key.zeroize();
         self.encryption_counter.zeroize();
         self.decryption_counter.zeroize();
+        self.encryption_poisoned = false;
     }
 }
 
@@ -128,16 +168,28 @@ impl PairCipher {
         )
     }
 
-    #[allow(dead_code)]
-    pub fn data_for_server(shared_secret: &[u8], seed: &str) -> Self {
-        let write_salt = format!("DataStream-Salt{seed}");
-        let read_salt = format!("DataStream-Salt{seed}");
+    /// Data-stream cipher from the receiver/server perspective.
+    pub fn data_for_server(shared_secret: &[u8], seed: u64) -> Self {
+        let salt = format!("DataStream-Salt{seed}");
         Self::new(
             shared_secret,
-            write_salt.as_bytes(),
+            salt.as_bytes(),
             b"DataStream-Input-Encryption-Key",
-            read_salt.as_bytes(),
+            salt.as_bytes(),
             b"DataStream-Output-Encryption-Key",
+        )
+    }
+
+    /// Data-stream cipher from the sender/client perspective.
+    #[cfg(test)]
+    pub fn data_for_client(shared_secret: &[u8], seed: u64) -> Self {
+        let salt = format!("DataStream-Salt{seed}");
+        Self::new(
+            shared_secret,
+            salt.as_bytes(),
+            b"DataStream-Output-Encryption-Key",
+            salt.as_bytes(),
+            b"DataStream-Input-Encryption-Key",
         )
     }
 
@@ -155,24 +207,46 @@ impl PairCipher {
             decryption_key: hkdf_sha512(shared_secret, read_salt, read_info),
             encryption_counter: 0,
             decryption_counter: 0,
+            encryption_poisoned: false,
         }
     }
 
     // ── Encryption ───────────────────────────────────────────────────
 
-    /// Encrypt `plaintext` as one or more ChaCha20-Poly1305 framed blocks.
+    /// Encrypt `plaintext` and immediately commit the outbound counter.
     ///
-    /// Each block is output as `[2-byte length LE][ciphertext][16-byte tag]`.
-    /// The function **pre-flights** every block before writing any output:
-    /// if any block would fail the entire operation is rejected without
-    /// emitting partial ciphertext.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CipherError::BlockTooLarge`] if any block exceeds
-    /// [`MAX_BLOCK`], or [`CipherError::CounterExhausted`] if advancing a
-    /// counter would overflow `u64`.
+    /// This convenience API is appropriate for in-memory use. Network writers
+    /// must prefer [`PairCipher::prepare_encryption`] and commit only after a
+    /// successful complete write.
     pub fn encrypt_blocks(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CipherError> {
+        let (ciphertext, final_counter) = self.build_encrypted_blocks(plaintext)?;
+        self.encryption_counter = final_counter;
+        Ok(ciphertext)
+    }
+
+    /// Prepare encrypted blocks without advancing the outbound counter.
+    ///
+    /// The returned guard borrows this cipher until the caller either commits
+    /// after a complete write or drops the guard. An uncommitted drop poisons
+    /// outbound encryption because the peer may have received an unknown
+    /// prefix of the record.
+    pub fn prepare_encryption(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<PreparedEncryption<'_>, CipherError> {
+        let (ciphertext, final_counter) = self.build_encrypted_blocks(plaintext)?;
+        Ok(PreparedEncryption {
+            cipher: self,
+            ciphertext,
+            final_counter,
+            committed: false,
+        })
+    }
+
+    fn build_encrypted_blocks(&self, plaintext: &[u8]) -> Result<(Vec<u8>, u64), CipherError> {
+        if self.encryption_poisoned {
+            return Err(CipherError::EncryptionStatePoisoned);
+        }
         let num_blocks = if plaintext.is_empty() {
             1
         } else {
@@ -184,8 +258,6 @@ impl PairCipher {
             .checked_add(blocks)
             .ok_or(CipherError::CounterExhausted)?;
 
-        // Build all ciphertext with a local counter. The object counter is
-        // committed only after every block has encrypted successfully.
         let mut counter = self.encryption_counter;
         let mut out =
             Vec::with_capacity(plaintext.len() + num_blocks * (LENGTH_PREFIX_LEN + TAG_LEN));
@@ -226,8 +298,7 @@ impl PairCipher {
             }
         }
 
-        self.encryption_counter = final_counter;
-        Ok(out)
+        Ok((out, final_counter))
     }
 
     // ── Decryption ───────────────────────────────────────────────────
@@ -682,6 +753,39 @@ mod tests {
         assert!(matches!(result, Err(CipherError::CounterExhausted)));
         // Counter not advanced — transactional
         assert_eq!(writer.encryption_counter, u64::MAX - 1);
+    }
+
+    #[test]
+    fn prepared_encryption_commits_only_after_explicit_commit() {
+        let (mut writer, mut reader) = test_cipher_pair();
+        let prepared = writer.prepare_encryption(b"staged").unwrap();
+        let ciphertext = prepared.ciphertext().to_vec();
+        prepared.commit();
+        assert_eq!(writer.encryption_counter, 1);
+        assert!(!writer.encryption_poisoned);
+
+        let (plaintext, consumed) = reader.decrypt_blocks(&ciphertext).unwrap();
+        assert_eq!(consumed, ciphertext.len());
+        assert_eq!(plaintext, b"staged");
+    }
+
+    #[test]
+    fn dropping_prepared_encryption_poisons_outbound_state() {
+        let (mut writer, _reader) = test_cipher_pair();
+        {
+            let prepared = writer.prepare_encryption(b"uncertain write").unwrap();
+            assert!(!prepared.ciphertext().is_empty());
+        }
+        assert_eq!(writer.encryption_counter, 0);
+        assert!(writer.encryption_poisoned);
+        assert!(matches!(
+            writer.encrypt_blocks(b"retry"),
+            Err(CipherError::EncryptionStatePoisoned)
+        ));
+        assert!(matches!(
+            writer.prepare_encryption(b"retry"),
+            Err(CipherError::EncryptionStatePoisoned)
+        ));
     }
 
     #[test]

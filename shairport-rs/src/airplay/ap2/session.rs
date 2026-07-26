@@ -287,15 +287,99 @@ pub enum Ap2StreamState {
     Active,
 }
 
+/// Typed stream configuration payload.
+///
+/// Each variant carries the minimum data needed for that stream type.
+/// Secret key material is zeroed on drop — the enum's [`Drop`] impl
+/// zeroizes only the audio variants' `media_key`.
+///
+/// This type is intentionally **not** [`Clone`], [`Debug`], or
+/// [`Serialize`](serde::Serialize) to avoid copying, logging, or
+/// serializing secret key material.
+pub enum Ap2StreamConfig {
+    /// Buffered audio stream (type 103).
+    BufferedAudio {
+        /// Negotiated audio format.
+        audio_format: AudioFormat,
+        /// Sample rate in Hz.
+        sample_rate: u32,
+        /// Frames per packet.
+        frames_per_packet: u32,
+        /// Per-stream media key (shared secret for this stream).
+        media_key: [u8; 32],
+    },
+    /// Data stream (type 130, remote-control-only).
+    Data {
+        /// Decimal seed used for data cipher derivation.
+        seed: u64,
+    },
+    /// Realtime audio stream (type 96) — not yet implemented.
+    #[allow(dead_code)]
+    RealtimeAudio {
+        /// Negotiated audio format.
+        audio_format: AudioFormat,
+        /// Sample rate in Hz.
+        sample_rate: u32,
+        /// Frames per packet.
+        frames_per_packet: u32,
+        /// Per-stream media key (shared secret for this stream).
+        media_key: [u8; 32],
+    },
+}
+
+impl Drop for Ap2StreamConfig {
+    fn drop(&mut self) {
+        match self {
+            Self::BufferedAudio { media_key, .. } | Self::RealtimeAudio { media_key, .. } => {
+                media_key.fill(0);
+            }
+            Self::Data { .. } => {
+                // No secret key material in the Data variant.
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Ap2StreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BufferedAudio {
+                audio_format,
+                sample_rate,
+                frames_per_packet,
+                ..
+            } => f
+                .debug_struct("BufferedAudio")
+                .field("audio_format", audio_format)
+                .field("sample_rate", sample_rate)
+                .field("frames_per_packet", frames_per_packet)
+                .field("media_key", &"[REDACTED]")
+                .finish(),
+            Self::Data { .. } => f.debug_struct("Data").finish_non_exhaustive(),
+            Self::RealtimeAudio {
+                audio_format,
+                sample_rate,
+                frames_per_packet,
+                ..
+            } => f
+                .debug_struct("RealtimeAudio")
+                .field("audio_format", audio_format)
+                .field("sample_rate", sample_rate)
+                .field("frames_per_packet", frames_per_packet)
+                .field("media_key", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
 /// An AP2 stream record owned by the session.
 ///
-/// Each configured stream tracks its type, audio format, sample rate,
-/// media key, and data port so the session can tear down individual
-/// streams without disturbing others.
+/// Each configured stream tracks its type, configuration, and data port
+/// so the session can tear down individual streams without disturbing
+/// others.
 ///
 /// This type is intentionally **not** [`Clone`] to avoid copying secret
-/// key material.  On [`Drop`] the media key is zeroed.
-#[derive(Debug)]
+/// key material.  On [`Drop`] the media key (if any) is zeroed.
 pub struct Ap2Stream {
     /// Unique stream identifier assigned at SETUP time.
     pub stream_id: u32,
@@ -303,23 +387,66 @@ pub struct Ap2Stream {
     pub stream_connection_id: Option<u64>,
     /// Stream type (buffered audio, realtime audio, or data).
     pub stream_type: Ap2StreamType,
-    /// Negotiated audio format.
-    pub audio_format: AudioFormat,
-    /// Sample rate in Hz.
-    pub sample_rate: u32,
-    /// Frames per packet.
-    pub frames_per_packet: u32,
-    /// Per-stream media key (shared secret for this stream).
-    pub media_key: [u8; 32],
+    /// Typed stream configuration (audio format/key or data seed).
+    pub config: Ap2StreamConfig,
     /// UDP or TCP data port bound for this stream.
     pub data_port: u16,
     /// Current stream state.
     pub state: Ap2StreamState,
 }
 
-impl Drop for Ap2Stream {
-    fn drop(&mut self) {
-        self.media_key.fill(0);
+impl std::fmt::Debug for Ap2Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ap2Stream")
+            .field("stream_id", &self.stream_id)
+            .field("stream_connection_id", &self.stream_connection_id)
+            .field("stream_type", &self.stream_type)
+            .field("config", &self.config)
+            .field("data_port", &self.data_port)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl Ap2Stream {
+    /// Convenience: return the audio format if this is a buffered audio stream.
+    pub fn audio_format(&self) -> Option<AudioFormat> {
+        match &self.config {
+            Ap2StreamConfig::BufferedAudio { audio_format, .. }
+            | Ap2StreamConfig::RealtimeAudio { audio_format, .. } => Some(*audio_format),
+            Ap2StreamConfig::Data { .. } => None,
+        }
+    }
+
+    /// Convenience: return the sample rate if this is an audio stream.
+    pub fn sample_rate(&self) -> Option<u32> {
+        match &self.config {
+            Ap2StreamConfig::BufferedAudio { sample_rate, .. }
+            | Ap2StreamConfig::RealtimeAudio { sample_rate, .. } => Some(*sample_rate),
+            Ap2StreamConfig::Data { .. } => None,
+        }
+    }
+
+    /// Convenience: return the frames per packet if this is an audio stream.
+    pub fn frames_per_packet(&self) -> Option<u32> {
+        match &self.config {
+            Ap2StreamConfig::BufferedAudio {
+                frames_per_packet, ..
+            }
+            | Ap2StreamConfig::RealtimeAudio {
+                frames_per_packet, ..
+            } => Some(*frames_per_packet),
+            Ap2StreamConfig::Data { .. } => None,
+        }
+    }
+
+    /// Access the media key (audio streams only). Returns `None` for data streams.
+    pub fn media_key(&self) -> Option<&[u8; 32]> {
+        match &self.config {
+            Ap2StreamConfig::BufferedAudio { media_key, .. }
+            | Ap2StreamConfig::RealtimeAudio { media_key, .. } => Some(media_key),
+            Ap2StreamConfig::Data { .. } => None,
+        }
     }
 }
 
@@ -350,6 +477,10 @@ pub struct Ap2SessionState {
     /// Used to determine the correct phase to return to when the last
     /// stream is removed.
     peers_configured: bool,
+    /// Whether this is a remote-control-only session established via
+    /// timingProtocol=None with isRemoteControlOnly=true. Such sessions
+    /// do not require PTP and may only carry data streams (type 130).
+    remote_control_only: bool,
     session_key: Option<[u8; 32]>,
     streams: Vec<Ap2Stream>,
 }
@@ -364,6 +495,7 @@ impl Default for Ap2SessionState {
             active_remote: None,
             dacp_id: None,
             peers_configured: false,
+            remote_control_only: false,
             session_key: None,
             streams: Vec::with_capacity(MAX_AP2_STREAMS),
         }
@@ -428,6 +560,20 @@ impl Ap2SessionState {
         self.phase != Ap2SessionPhase::Connected && self.phase != Ap2SessionPhase::Closed
     }
 
+    /// Whether this is a remote-control-only session (no PTP, no audio).
+    pub fn is_remote_control_only(&self) -> bool {
+        self.remote_control_only
+    }
+
+    /// Mark this session as remote-control-only.
+    ///
+    /// Must be called transactionally after the initial SETUP response
+    /// and event listener creation succeed. Once set, this flag enables
+    /// type-130 data stream setup and relaxed RECORD handling.
+    pub fn set_remote_control_only(&mut self, value: bool) {
+        self.remote_control_only = value;
+    }
+
     // ── Transition helpers ─────────────────────────────────────────────
 
     /// Validate and apply a phase transition.
@@ -442,9 +588,14 @@ impl Ap2SessionState {
         self.apply_transition(Ap2SessionPhase::Paired)
     }
 
-    /// Configure timing after a successful initial PTP SETUP.
+    /// Configure timing after a successful initial PTP or
+    /// remote-control-only SETUP.
     ///
-    /// Requires the session to be [`Paired`](Ap2SessionPhase::Paired).
+    /// For PTP: requires the session to be [`Paired`](Ap2SessionPhase::Paired).
+    /// For remote-control-only ([`Ap2TimingProtocol::None`]): also requires
+    /// [`Paired`](Ap2SessionPhase::Paired) and stores the protocol, but
+    /// does not require PTP availability.
+    ///
     /// Stores the timing protocol, group UUID, and group-leader flag.
     pub fn configure_timing(
         &mut self,
@@ -484,6 +635,36 @@ impl Ap2SessionState {
     /// caller must unwind any side-effects.
     pub fn add_stream(&mut self, stream: Ap2Stream) -> Result<(), TransitionError> {
         validate_add_stream_phase(self.phase)?;
+
+        let config_matches_type = matches!(
+            (&stream.stream_type, &stream.config),
+            (
+                Ap2StreamType::BufferedAudio,
+                Ap2StreamConfig::BufferedAudio { .. }
+            ) | (
+                Ap2StreamType::RealtimeAudio,
+                Ap2StreamConfig::RealtimeAudio { .. }
+            ) | (Ap2StreamType::DataStream, Ap2StreamConfig::Data { .. })
+        );
+        if !config_matches_type {
+            return Err(TransitionError {
+                from: self.phase,
+                to: self.phase,
+                reason: "stream type/config mismatch",
+            });
+        }
+        let is_data = stream.stream_type == Ap2StreamType::DataStream;
+        if self.remote_control_only != is_data {
+            return Err(TransitionError {
+                from: self.phase,
+                to: self.phase,
+                reason: if self.remote_control_only {
+                    "remote-control-only session accepts data streams only"
+                } else {
+                    "data stream requires remote-control-only session"
+                },
+            });
+        }
 
         if self.streams.len() >= MAX_AP2_STREAMS {
             return Err(TransitionError {
@@ -631,19 +812,26 @@ impl Ap2SessionState {
     }
 
     /// Clear all sensitive data (session key, stream media keys) and
-    /// logical connection data (group, remote, DACP, timing).
+    /// logical connection data (group, remote, DACP, timing, flags).
     ///
-    /// Uses explicit zeroing without `unsafe`.  After this call the
-    /// session key and all stream keys are zeroed, streams are dropped,
-    /// and logical fields are cleared to defaults.
+    /// Zeroizes audio stream media keys individually, drops all streams,
+    /// and resets logical fields to defaults including the
+    /// `remote_control_only` flag.
     pub fn clear_sensitive(&mut self) {
         if let Some(ref mut key) = self.session_key {
             key.fill(0);
         }
         self.session_key = None;
 
+        // Zeroize only audio stream media keys; data streams carry no secrets.
         for stream in &mut self.streams {
-            stream.media_key.fill(0);
+            match &mut stream.config {
+                Ap2StreamConfig::BufferedAudio { media_key, .. }
+                | Ap2StreamConfig::RealtimeAudio { media_key, .. } => {
+                    media_key.fill(0);
+                }
+                Ap2StreamConfig::Data { .. } => {}
+            }
         }
         self.streams.clear();
 
@@ -654,6 +842,7 @@ impl Ap2SessionState {
         self.dacp_id = None;
         self.timing_protocol = Ap2TimingProtocol::None;
         self.peers_configured = false;
+        self.remote_control_only = false;
     }
 
     // ── Mutators for fields set during protocol handling ───────────────
@@ -1158,7 +1347,9 @@ mod tests {
             .unwrap();
 
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        stream.media_key = [0x42u8; 32];
+        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
+            *media_key = [0x42u8; 32];
+        }
         state.add_stream(stream).unwrap();
         assert_eq!(state.stream_count(), 1);
 
@@ -1176,7 +1367,9 @@ mod tests {
         }
         state.session_key = None;
         for stream in &mut state.streams {
-            stream.media_key.fill(0);
+            if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
+                media_key.fill(0);
+            }
         }
     }
 
@@ -1189,12 +1382,14 @@ mod tests {
             .unwrap();
 
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        stream.media_key = [0x42u8; 32];
+        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
+            *media_key = [0x42u8; 32];
+        }
         state.add_stream(stream).unwrap();
 
         clear_key_for_test(&mut state);
         let s = state.find_stream(1).unwrap();
-        assert_eq!(s.media_key, [0u8; 32]);
+        assert_eq!(s.media_key(), Some(&[0u8; 32]));
         assert!(state.session_key().is_none());
     }
 
@@ -1209,7 +1404,9 @@ mod tests {
             .configure_timing(Ap2TimingProtocol::Ptp, None, None)
             .unwrap();
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        stream.media_key = [0xCCu8; 32];
+        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
+            *media_key = [0xCCu8; 32];
+        }
         state.add_stream(stream).unwrap();
 
         // Verify session key is set before drop
@@ -1241,27 +1438,30 @@ mod tests {
 
     #[test]
     fn two_sessions_independent_streams() {
-        let mut s1 = Ap2SessionState::default();
-        let mut s2 = Ap2SessionState::default();
-
-        // Set up both sessions to stream-capable phase
-        for s in [&mut s1, &mut s2] {
-            s.mark_paired().unwrap();
-            s.configure_timing(Ap2TimingProtocol::Ptp, None, None)
-                .unwrap();
-        }
-
-        s1.add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
-            .unwrap();
-        s2.add_stream(test_stream(100, Ap2StreamType::BufferedAudio))
-            .unwrap();
-        s2.add_stream(test_stream(101, Ap2StreamType::DataStream))
+        let mut audio = Ap2SessionState::default();
+        audio.mark_paired().unwrap();
+        audio
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
             .unwrap();
 
-        assert_eq!(s1.stream_count(), 1);
-        assert_eq!(s2.stream_count(), 2);
-        assert!(s1.find_stream(100).is_none());
-        assert!(s2.find_stream(100).is_some());
+        let mut remote = Ap2SessionState::default();
+        remote.mark_paired().unwrap();
+        remote
+            .configure_timing(Ap2TimingProtocol::None, None, None)
+            .unwrap();
+        remote.set_remote_control_only(true);
+
+        audio
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        remote
+            .add_stream(test_stream(100, Ap2StreamType::DataStream))
+            .unwrap();
+
+        assert_eq!(audio.stream_count(), 1);
+        assert_eq!(remote.stream_count(), 1);
+        assert!(audio.find_stream(100).is_none());
+        assert!(remote.find_stream(100).is_some());
     }
 
     #[test]
@@ -1392,27 +1592,38 @@ mod tests {
 
     #[test]
     fn find_stream_by_type() {
-        let mut state = Ap2SessionState::default();
-        state.mark_paired().unwrap();
-        state
+        let mut audio = Ap2SessionState::default();
+        audio.mark_paired().unwrap();
+        audio
             .configure_timing(Ap2TimingProtocol::Ptp, None, None)
             .unwrap();
-        state
+        audio
             .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
             .unwrap();
-        state
-            .add_stream(test_stream(2, Ap2StreamType::DataStream))
-            .unwrap();
-
         assert!(
-            state
+            audio
                 .find_stream_by_type(Ap2StreamType::BufferedAudio)
                 .is_some()
         );
         assert!(
-            state
-                .find_stream_by_type(Ap2StreamType::RealtimeAudio)
+            audio
+                .find_stream_by_type(Ap2StreamType::DataStream)
                 .is_none()
+        );
+
+        let mut remote = Ap2SessionState::default();
+        remote.mark_paired().unwrap();
+        remote
+            .configure_timing(Ap2TimingProtocol::None, None, None)
+            .unwrap();
+        remote.set_remote_control_only(true);
+        remote
+            .add_stream(test_stream(2, Ap2StreamType::DataStream))
+            .unwrap();
+        assert!(
+            remote
+                .find_stream_by_type(Ap2StreamType::DataStream)
+                .is_some()
         );
     }
 
@@ -1647,18 +1858,91 @@ mod tests {
         );
     }
 
+    fn paired_state() -> Ap2SessionState {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+    }
+
+    #[test]
+    fn remote_control_session_accepts_only_typed_data_streams() {
+        let mut state = paired_state();
+        state
+            .configure_timing(Ap2TimingProtocol::None, None, None)
+            .unwrap();
+        state.set_remote_control_only(true);
+        assert!(
+            state
+                .add_stream(test_stream(1, Ap2StreamType::DataStream))
+                .is_ok()
+        );
+
+        let mut state = paired_state();
+        state
+            .configure_timing(Ap2TimingProtocol::None, None, None)
+            .unwrap();
+        state.set_remote_control_only(true);
+        let error = state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            "remote-control-only session accepts data streams only"
+        );
+    }
+
+    #[test]
+    fn audio_session_rejects_data_and_mismatched_config() {
+        let mut state = paired_state();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        let error = state
+            .add_stream(test_stream(1, Ap2StreamType::DataStream))
+            .unwrap_err();
+        assert_eq!(
+            error.reason,
+            "data stream requires remote-control-only session"
+        );
+
+        let mut mismatched = test_stream(2, Ap2StreamType::BufferedAudio);
+        mismatched.config = Ap2StreamConfig::Data { seed: 7 };
+        let error = state.add_stream(mismatched).unwrap_err();
+        assert_eq!(error.reason, "stream type/config mismatch");
+    }
+
+    #[test]
+    fn data_stream_debug_redacts_seed() {
+        let stream = test_stream(1, Ap2StreamType::DataStream);
+        let rendered = format!("{stream:?}");
+        assert!(rendered.contains("Data"));
+        assert!(!rendered.contains("seed"));
+    }
+
     // ── Helper ─────────────────────────────────────────────────────────
 
     fn test_stream(id: u32, st: Ap2StreamType) -> Ap2Stream {
         use crate::codec::AudioFormat;
+        let config = match st {
+            Ap2StreamType::BufferedAudio => Ap2StreamConfig::BufferedAudio {
+                audio_format: AudioFormat::Alac44100S16Stereo,
+                sample_rate: 44100,
+                frames_per_packet: 352,
+                media_key: [0u8; 32],
+            },
+            Ap2StreamType::RealtimeAudio => Ap2StreamConfig::RealtimeAudio {
+                audio_format: AudioFormat::Alac44100S16Stereo,
+                sample_rate: 44100,
+                frames_per_packet: 352,
+                media_key: [0u8; 32],
+            },
+            Ap2StreamType::DataStream => Ap2StreamConfig::Data { seed: 0 },
+        };
         Ap2Stream {
             stream_id: id,
             stream_connection_id: None,
             stream_type: st,
-            audio_format: AudioFormat::Alac44100S16Stereo,
-            sample_rate: 44100,
-            frames_per_packet: 352,
-            media_key: [0u8; 32],
+            config,
             data_port: 6000 + id as u16,
             state: Ap2StreamState::Configured,
         }

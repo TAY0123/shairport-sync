@@ -117,6 +117,8 @@ pub struct Ap2CapabilityPolicy {
     /// Real-time audio-stream format mask (`supportedFormats.audioStream`).
     /// Always 0 in this profile (realtime type 96 is not implemented).
     pub audio_stream_formats: u64,
+    /// Whether AirPlay 2 is enabled in configuration.
+    pub ap2_enabled: bool,
     /// Whether PTP is truly available: AP2 enabled, PTP configured, and
     /// PTP daemon confirmed running.  Drives `supports_timing_protocol` and
     /// `supports_stream_type` gating.
@@ -184,6 +186,7 @@ impl Ap2CapabilityPolicy {
             publish_airplay,
             buffer_stream_formats: buffer_stream,
             audio_stream_formats: 0, // realtime type 96 not implemented
+            ap2_enabled: airplay2,
             ptp_available,
         }
     }
@@ -207,7 +210,10 @@ impl Ap2CapabilityPolicy {
     ///
     /// Returns `true` only when AP2 is enabled, PTP is confirmed available,
     /// and the stream type is implemented.  Currently only buffered audio
-    /// (type 103) is supported.
+    /// (type 103) is supported via this path.
+    ///
+    /// Type 130 (data stream) support is context-dependent and checked via
+    /// [`supports_remote_control_data_stream`](Self::supports_remote_control_data_stream).
     pub fn supports_stream_type(&self, ty: u32) -> bool {
         if !self.ptp_available {
             return false;
@@ -215,9 +221,19 @@ impl Ap2CapabilityPolicy {
         match ty {
             103 => true,  // buffered audio
             96 => false,  // realtime audio — not implemented
-            130 => false, // data stream — not genuinely implemented
+            130 => false, // data stream — requires remote-control-only context
             _ => false,
         }
+    }
+
+    /// Whether the remote-control data stream (type 130) is supported.
+    ///
+    /// Returns `true` when AP2 is enabled regardless of PTP status,
+    /// because remote-control-only sessions do not require PTP.
+    /// This is the context-aware check used during type-130 stream SETUP.
+    pub fn supports_remote_control_data_stream(&self) -> bool {
+        // AP2 must be enabled; PTP not required for remote-control-only.
+        self.ap2_enabled
     }
 
     /// Whether the given timing protocol string is acceptable.
@@ -427,6 +443,40 @@ mod tests {
         config.airplay.airplay2_enabled = false;
         let policy = Ap2CapabilityPolicy::from_config(&config, true);
         assert!(!policy.supports_stream_type(103));
+    }
+
+    // ── Remote-control data stream support ───────────────────────────────
+
+    #[test]
+    fn supports_remote_control_data_stream_when_ap2_enabled() {
+        // PTP running is NOT required for data stream support.
+        let policy = Ap2CapabilityPolicy::from_config(&base_config(), true);
+        assert!(policy.supports_remote_control_data_stream());
+    }
+
+    #[test]
+    fn supports_remote_control_data_stream_without_ptp() {
+        // Even when PTP is not running, data stream should be supported
+        // for remote-control-only sessions.
+        let policy = Ap2CapabilityPolicy::from_config(&base_config(), false);
+        assert!(policy.supports_remote_control_data_stream());
+    }
+
+    #[test]
+    fn supports_remote_control_data_stream_false_when_ap2_disabled() {
+        let mut config = base_config();
+        config.airplay.airplay2_enabled = false;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+        assert!(!policy.supports_remote_control_data_stream());
+    }
+
+    #[test]
+    fn stream_type_130_still_false_in_generic_check() {
+        // Generic supports_stream_type(130) returns false; use the
+        // context-aware supports_remote_control_data_stream instead.
+        let policy = Ap2CapabilityPolicy::from_config(&base_config(), true);
+        assert!(!policy.supports_stream_type(130));
+        assert!(policy.supports_remote_control_data_stream());
     }
 
     // ── Timing protocol support ──────────────────────────────────────────

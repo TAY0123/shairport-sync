@@ -231,10 +231,14 @@ pub enum Ap2StateEffect {
     AudioPortsOpen,
     /// Playback transitions to Playing.
     PlaybackStarted,
+    /// Playback starts only for audio sessions; control-only RECORD is an acknowledgement.
+    PlaybackConditionallyStarted,
     /// Playback transitions to Paused.
     PlaybackPaused,
     /// Playback stops, listeners aborted, keys cleared.
     PlaybackStopped,
+    /// Encrypted AP2 data-stream TCP port opened.
+    DataPortOpen,
     /// Single stream listener aborted.
     StreamListenerClosed,
     /// Media key derived / refreshed.
@@ -270,8 +274,10 @@ impl fmt::Display for Ap2StateEffect {
             Self::SessionCreated => "session-created",
             Self::AudioPortsOpen => "audio-ports-open",
             Self::PlaybackStarted => "playback-started",
+            Self::PlaybackConditionallyStarted => "playback-conditionally-started",
             Self::PlaybackPaused => "playback-paused",
             Self::PlaybackStopped => "playback-stopped",
+            Self::DataPortOpen => "data-port-open",
             Self::StreamListenerClosed => "stream-listener-closed",
             Self::MediaKeyDerived => "media-key-derived",
             Self::TimingConfigured => "timing-configured",
@@ -349,6 +355,13 @@ pub enum Ap2RequestDiscriminator {
         required: &'static str,
         excluded: &'static str,
     },
+    /// Initial PTP SETUP: `timingProtocol=PTP` and no `streams` key.
+    InitialPtpSetup,
+    /// Initial control-only SETUP: `timingProtocol=None`,
+    /// `isRemoteControlOnly=true`, and no `streams` key.
+    InitialRemoteControlSetup,
+    /// Stream SETUP whose first stream dictionary has the given numeric type.
+    StreamType(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -479,10 +492,12 @@ impl fmt::Display for ContractError {
 /// implements the sub-protocol.  Entries like `/pair-setup` and
 /// `/pair-verify` have complete SRP + Ed25519 logic in `pairing.rs` →
 /// Implemented.  `/fp-setup` and `/configure` are acknowledged but the
-/// FairPlay implementation is a stub → Stub.  `SETUP` with buffered audio
+/// FairPlay implementation is a stub → Stub. `SETUP` with buffered audio
 /// (type 103) + PTP timing is Partial because timeline anchors are not yet
-/// applied to scheduler deadlines. Realtime audio (type 96), data streams
-/// (type 130), NTP timing, and no-timing mode are rejected truthfully.
+/// applied to scheduler deadlines. Remote-control-only initial SETUP is
+/// implemented. Data-stream SETUP and encrypted transport (type 130) are
+/// Partial because MediaRemote protobuf decoding/dispatch is not implemented.
+/// Realtime audio (type 96), NTP timing, and bare no-timing mode are rejected.
 ///
 /// See `docs/AP2_API_CONFORMANCE.md` for rationale.
 pub static AP2_CONTRACTS: &[Ap2Contract] = &[
@@ -694,7 +709,6 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         request_content_type: Ap2ContentType::BinaryPlist,
         required_request_keys: &["timingProtocol"],
         optional_request_keys: &[
-            "streams",
             "activeRemote",
             "dacpID",
             "groupUUID",
@@ -712,15 +726,32 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         ],
         error_policy: Ap2ErrorPolicy::Standard,
         implementation: Ap2ImplementationStatus::Partial,
-        discriminator: Ap2RequestDiscriminator::HasPlistKeyWithout {
-            required: "timingProtocol",
-            excluded: "streams",
-        },
+        discriminator: Ap2RequestDiscriminator::InitialPtpSetup,
     },
     Ap2Contract {
         method: Ap2Method::Setup,
         endpoint: Ap2Endpoint::Any,
-        operation: "SETUP (stream — additional stream add)",
+        operation: "SETUP (initial — remote-control-only)",
+        request_content_type: Ap2ContentType::BinaryPlist,
+        required_request_keys: &["timingProtocol", "isRemoteControlOnly"],
+        optional_request_keys: &["activeRemote", "dacpID"],
+        expected_status: 200,
+        response_content_type: Ap2ContentType::BinaryPlist,
+        required_response_keys: &["eventPort"],
+        idempotency: Ap2Idempotency::NotIdempotent,
+        state_effects: &[
+            Ap2StateEffect::SessionCreated,
+            Ap2StateEffect::EventPortOpen,
+            Ap2StateEffect::TimingConfigured,
+        ],
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Implemented,
+        discriminator: Ap2RequestDiscriminator::InitialRemoteControlSetup,
+    },
+    Ap2Contract {
+        method: Ap2Method::Setup,
+        endpoint: Ap2Endpoint::Any,
+        operation: "SETUP (stream — buffered audio type 103)",
         request_content_type: Ap2ContentType::BinaryPlist,
         required_request_keys: &["streams"],
         optional_request_keys: &[
@@ -734,10 +765,26 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         response_content_type: Ap2ContentType::BinaryPlist,
         required_response_keys: &["streams"],
         idempotency: Ap2Idempotency::NotIdempotent,
-        state_effects: &[Ap2StateEffect::AudioPortsOpen],
+        state_effects: &[Ap2StateEffect::AudioPortsOpen, Ap2StateEffect::StreamAdded],
         error_policy: Ap2ErrorPolicy::Standard,
         implementation: Ap2ImplementationStatus::Partial,
-        discriminator: Ap2RequestDiscriminator::HasPlistKey("streams"),
+        discriminator: Ap2RequestDiscriminator::StreamType(103),
+    },
+    Ap2Contract {
+        method: Ap2Method::Setup,
+        endpoint: Ap2Endpoint::Any,
+        operation: "SETUP (stream — remote-control data type 130)",
+        request_content_type: Ap2ContentType::BinaryPlist,
+        required_request_keys: &["streams"],
+        optional_request_keys: &["activeRemote", "dacpID", "timingProtocol"],
+        expected_status: 200,
+        response_content_type: Ap2ContentType::BinaryPlist,
+        required_response_keys: &["streams"],
+        idempotency: Ap2Idempotency::NotIdempotent,
+        state_effects: &[Ap2StateEffect::DataPortOpen, Ap2StateEffect::StreamAdded],
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Partial,
+        discriminator: Ap2RequestDiscriminator::StreamType(130),
     },
     // ── Peers ──────────────────────────────────────────────────────────────
     Ap2Contract {
@@ -791,7 +838,7 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         required_response_keys: &[],
         idempotency: Ap2Idempotency::Idempotent,
         state_effects: &[
-            Ap2StateEffect::PlaybackStarted,
+            Ap2StateEffect::PlaybackConditionallyStarted,
             Ap2StateEffect::DiagnosticUpdate,
         ],
         error_policy: Ap2ErrorPolicy::Standard,
@@ -901,6 +948,15 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
 // Classification & validation
 // ---------------------------------------------------------------------------
 
+fn first_stream_type(dict: &plist::Dictionary) -> Option<u64> {
+    dict.get("streams")
+        .and_then(plist::Value::as_array)
+        .and_then(|streams| streams.first())
+        .and_then(plist::Value::as_dictionary)
+        .and_then(|stream| stream.get("type"))
+        .and_then(plist::Value::as_unsigned_integer)
+}
+
 /// Classify a request view against the contract registry.
 ///
 /// Returns the first matching [`Ap2Contract`], or `None` if no entry matches.
@@ -931,6 +987,23 @@ pub fn classify(view: &super::request::Ap2RequestView<'_>) -> Option<&'static Ap
             Ap2RequestDiscriminator::HasPlistKeyWithout { required, excluded } => view
                 .plist_dict
                 .is_some_and(|d| d.contains_key(required) && !d.contains_key(excluded)),
+            Ap2RequestDiscriminator::InitialPtpSetup => view.plist_dict.is_some_and(|d| {
+                !d.contains_key("streams")
+                    && d.get("timingProtocol").and_then(plist::Value::as_string) == Some("PTP")
+            }),
+            Ap2RequestDiscriminator::InitialRemoteControlSetup => {
+                view.plist_dict.is_some_and(|d| {
+                    !d.contains_key("streams")
+                        && d.get("timingProtocol").and_then(plist::Value::as_string) == Some("None")
+                        && d.get("isRemoteControlOnly")
+                            .and_then(plist::Value::as_boolean)
+                            == Some(true)
+                })
+            }
+            Ap2RequestDiscriminator::StreamType(stream_type) => view
+                .plist_dict
+                .and_then(first_stream_type)
+                .is_some_and(|actual| actual == stream_type),
         }
     })
 }
@@ -1346,10 +1419,58 @@ mod tests {
     }
 
     #[test]
+    fn classify_setup_initial_remote_control_only() {
+        let mut dict = plist::Dictionary::new();
+        dict.insert("timingProtocol".into(), plist::Value::String("None".into()));
+        dict.insert("isRemoteControlOnly".into(), plist::Value::Boolean(true));
+        let v = mk_view(
+            "SETUP",
+            "*",
+            Some("application/x-apple-binary-plist"),
+            Some(&dict),
+        );
+        let contract = classify(&v).expect("remote-control SETUP should classify");
+        assert_eq!(contract.operation, "SETUP (initial — remote-control-only)");
+        assert_eq!(contract.required_response_keys, &["eventPort"]);
+    }
+
+    #[test]
+    fn classify_setup_data_stream_type130() {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(130.into()));
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let v = mk_view(
+            "SETUP",
+            "*",
+            Some("application/x-apple-binary-plist"),
+            Some(&dict),
+        );
+        let contract = classify(&v).expect("type-130 SETUP should classify");
+        assert_eq!(
+            contract.operation,
+            "SETUP (stream — remote-control data type 130)"
+        );
+        assert!(
+            contract
+                .state_effects
+                .contains(&Ap2StateEffect::DataPortOpen)
+        );
+    }
+
+    #[test]
     fn classify_setup_stream_with_streams() {
         // Stream SETUP with streams but no timingProtocol.
         let mut dict = plist::Dictionary::new();
-        dict.insert("streams".into(), plist::Value::Array(vec![]));
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
         let v = mk_view(
             "SETUP",
             "*",
@@ -1370,7 +1491,12 @@ mod tests {
         // both keys are present, so the contract classifier must agree.
         let mut dict = plist::Dictionary::new();
         dict.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
-        dict.insert("streams".into(), plist::Value::Array(vec![]));
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
         let v = mk_view(
             "SETUP",
             "*",
@@ -1406,7 +1532,12 @@ mod tests {
     #[test]
     fn validate_setup_required_keys_present() {
         let mut dict = plist::Dictionary::new();
-        dict.insert("streams".into(), plist::Value::Array(vec![]));
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
         dict.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
         let v = mk_view(
             "SETUP",
@@ -1496,7 +1627,12 @@ mod tests {
     #[test]
     fn validate_optional_keys_are_not_enforced() {
         let mut dict = plist::Dictionary::new();
-        dict.insert("streams".into(), plist::Value::Array(vec![]));
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
         dict.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
         // Optional keys like "activeRemote", "dacpID" are absent — that's fine.
         let v = mk_view(
@@ -1602,7 +1738,7 @@ mod tests {
     #[test]
     fn registry_has_exactly_expected_count() {
         // 21 contract entries (see the table in the module doc comment)
-        assert_eq!(AP2_CONTRACTS.len(), 21);
+        assert_eq!(AP2_CONTRACTS.len(), 23);
     }
 
     #[test]
@@ -1641,6 +1777,30 @@ mod tests {
                 Ap2RequestDiscriminator::HasPlistKeyWithout { required, .. } => {
                     let mut d = plist::Dictionary::new();
                     d.insert(required.into(), plist::Value::String("test".into()));
+                    owned_dict = Some(d);
+                    owned_dict.as_ref()
+                }
+                Ap2RequestDiscriminator::InitialPtpSetup => {
+                    let mut d = plist::Dictionary::new();
+                    d.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
+                    owned_dict = Some(d);
+                    owned_dict.as_ref()
+                }
+                Ap2RequestDiscriminator::InitialRemoteControlSetup => {
+                    let mut d = plist::Dictionary::new();
+                    d.insert("timingProtocol".into(), plist::Value::String("None".into()));
+                    d.insert("isRemoteControlOnly".into(), plist::Value::Boolean(true));
+                    owned_dict = Some(d);
+                    owned_dict.as_ref()
+                }
+                Ap2RequestDiscriminator::StreamType(stream_type) => {
+                    let mut stream = plist::Dictionary::new();
+                    stream.insert("type".into(), plist::Value::Integer(stream_type.into()));
+                    let mut d = plist::Dictionary::new();
+                    d.insert(
+                        "streams".into(),
+                        plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+                    );
                     owned_dict = Some(d);
                     owned_dict.as_ref()
                 }
@@ -1713,6 +1873,22 @@ mod tests {
             Some(Ap2TimingProtocol::None)
         );
         assert_eq!(Ap2TimingProtocol::from_str("BOGUS"), None);
+    }
+
+    #[test]
+    fn record_contract_marks_playback_as_conditional() {
+        let view = mk_view("RECORD", "*", None, None);
+        let contract = classify(&view).expect("RECORD should classify");
+        assert!(
+            contract
+                .state_effects
+                .contains(&Ap2StateEffect::PlaybackConditionallyStarted)
+        );
+        assert!(
+            !contract
+                .state_effects
+                .contains(&Ap2StateEffect::PlaybackStarted)
+        );
     }
 
     // ── Ap2ImplementationStatus display ─────────────────────────────────

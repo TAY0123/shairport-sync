@@ -81,8 +81,13 @@ mod tests {
 
     #[test]
     fn view_classify_and_validate_empty_errors_for_good_request() {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
         let mut dict = plist::Dictionary::new();
-        dict.insert("streams".into(), plist::Value::Array(vec![]));
+        dict.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
         dict.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
 
         let v = Ap2RequestView {

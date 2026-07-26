@@ -1,11 +1,14 @@
 # AirPlay 2 API Conformance Matrix
 
-**Target profile:** PTP + buffered audio (type 103).
-Realtime audio (type 96), NTP timing, and No-timing modes are
-**truthfully rejected** — the SETUP handler returns `status=1` for
-unsupported stream types and `400 Bad Request` for unsupported
-timing protocols (`NTP`, `None`).  No listener or state activation
-fires for unsupported streams.
+**Target profile:** PTP + buffered audio (type 103), and
+**remote-control-only** with encrypted data stream (type 130).
+
+Realtime audio (type 96), NTP timing, and bare `None` timing (without
+`isRemoteControlOnly`) are **truthfully rejected** — the SETUP handler
+returns `status=1` for unsupported stream types and `400 Bad Request`
+for unsupported timing protocols. Remote-control-only sessions
+(`timingProtocol=None` with `isRemoteControlOnly=true`) are accepted
+when paired and AP2 is enabled; PTP is not required for this path.
 
 ## Capability policy
 
@@ -204,7 +207,7 @@ clears its own AP2 secrets.
 |------|-----|-----------|-------------------------------------|
 | Real-time audio | 96  | —         | Rejected (status=1). No listener.   |
 | Buffered audio  | 103 | TCP       | Framing, decrypt, decode, and bounded enqueue work; timed playout remains partial. |
-| Data / event    | 130 | —         | Rejected (status=1). No listener.   |
+| Data stream     | 130 | TCP       | Encrypted channel for remote-control-only sessions. Sync reply protocol implemented. MediaRemote protobuf decoding/dispatch remains unsupported. |
 
 ## Pairing & control framing guarantees
 
@@ -301,8 +304,12 @@ and artwork bodies; exceeding either limit drops the connection.
    Only `"PTP"` is accepted and wired through to the embedded
    PTP service. Timeline anchors are not yet applied to scheduler deadlines.
 
-3. **Data stream (type 130).**  The SETUP handler returns `status=1`
-   without opening any listener.  No runtime resources are consumed.
+3. **Data stream MediaRemote decoding.**  The encrypted data stream
+   (type 130) transport and sync reply protocol are implemented.
+   Binary-plist payload shape is inspected for diagnostics, but
+   protobuf messages (`DEVICE_INFO_MESSAGE`, etc.) are not decoded
+   or dispatched.  The channel is fully operational as a transport;
+   only the MRP-level message handling is missing.
 
 4. **FairPlay (`/fp-setup`).**  The handler echoes the request body
    back.  No license acquisition, content-key derivation, or SCP
@@ -360,7 +367,7 @@ and artwork bodies; exceeding either limit drops the connection.
 
 ## Test coverage
 
-The `src/airplay/ap2/` module ships **~60 inline tests** covering:
+The `src/airplay/ap2/` modules ship focused inline tests covering:
 
 - Method parsing (known + unknown + display round-trip)
 - Content-type matching
@@ -380,17 +387,19 @@ The `capability.rs` module adds **~20 additional tests** verifying:
 - Password status flag
 - `AlacOnly` vs `AacIfAvailable` format masks
 - `feature_words()` round-trip and `features_ex()` base64
-- Stream type acceptance (103 only)
-- Timing protocol acceptance (PTP only)
+- Buffered stream type 103 acceptance under PTP
+- Context-aware type 130 acceptance for control-only sessions without PTP
+- PTP timing acceptance and control-only `None` handling
 - Format playability checks
 
 The `rtsp.rs` AP2 SETUP tests cover:
 - Buffered type 103 happy-path (ports + session key + audio format)
 - Realtime type 96 rejection (status=1, no listener, no activation)
-- Data type 130 rejection (status=1, no listener, no activation)
+- Data type 130 rejection without remote-control-only session (455)
+- Remote-control-only None timing + isRemoteControlOnly SETUP
 - Unknown stream type rejection (status=1)
 - Unplayable format rejection (AAC under AlacOnly policy)
-- NTP / None / empty timing protocol → 400
+- NTP / None / empty timing protocol → appropriate error
 - GET /info binary plist field verification
 - txtAirPlay / mDNS / info features cross-consistency
 
@@ -408,7 +417,7 @@ The `pairing.rs` module adds **~25 tests** covering:
 - `pair_list` rejection of unverified sessions
 - M6 inner TLV encryption/signature round-trip
 
-The `crypto.rs` module adds **~12 tests** covering:
+The `crypto.rs` module contains **23 focused tests** covering:
 - Single-block, multi-block, and empty-plaintext encrypt/decrypt round-trips
 - Exactly `MAX_BLOCK` boundary encryption
 - Oversize length-prefix rejection (`BlockTooLarge`)
@@ -416,12 +425,32 @@ The `crypto.rs` module adds **~12 tests** covering:
 - Auth failure does not advance decryption counter (retry works)
 - Counter exhaustion detected before nonce reuse
 - Multi-block encryption is transactional (preflight failure = no partial output)
+- Staged outbound encryption commits counters only after complete network writes
+- Cancelled/failed uncertain writes poison outbound state instead of reusing a nonce
 - Client/server control cipher cross-direction round-trip
 - Fragmented header at every byte boundary (accumulator pattern)
 
-Full test count: **642** tests passing (`cargo test --all-targets`).
+The `ap2/data.rs` module contains **17 focused tests** covering:
+- Exact 32-byte big-endian header parsing and canonical field prefixes
+- Header fragmentation at every boundary, size limits, and zero padding
+- Exact `sync` → `rply` bytes and sequence-number preservation
+- Nested/direct binary-plist shape inspection and malformed-plist rejection
+- Checked encrypted/plaintext accumulation bounds
+- Real encrypted TCP sync round-trip with bytewise fragmentation
+- Reconnect counter continuity and authentication-failure retry
+- Sequential worker replacement and active-worker abort/drop cleanup
+- Fixed partial-frame deadlines, non-sync no-reply behavior, and safe errors
 
-These tests run as part of `cargo test --all-targets` and are
-independent of the RTSP server — no TCP sockets are opened for the
-contract/validation tests, but the SETUP integration tests use a
-Tokio runtime (via `#[tokio::test]`).
+Route-level RTSP integration tests additionally cover:
+- Actual control-only initial SETUP with an encrypted event listener
+- RECORD before a data stream without audio or playout side effects
+- Type-130 response shape and real encrypted sync traffic on `dataPort`
+- Strict/transactional seed, dedicated-socket, and control-type rejection
+- Duplicate SETUP rollback, data-only TEARDOWN, and full session cleanup
+
+Full test count: **673** tests passing (`cargo test --all-targets`).
+
+Contract and pure validation tests do not open sockets. The event/data
+transport and RTSP lifecycle integration tests intentionally use loopback TCP
+listeners under Tokio to verify real ownership, framing, reconnect, and
+teardown behavior.
