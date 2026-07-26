@@ -206,6 +206,92 @@ clears its own AP2 secrets.
 | Buffered audio  | 103 | TCP       | Framing, decrypt, decode, and bounded enqueue work; timed playout remains partial. |
 | Data / event    | 130 | —         | Rejected (status=1). No listener.   |
 
+## Pairing & control framing guarantees
+
+### Pairing completion signal
+
+The `PairingReply` carries a typed `PairingCompletion` enum
+(`TransientSetup`, `FullSetup`, `Verify`).  A completion is signalled
+**only** when the terminal pairing step succeeds and the response TLV
+contains no error.  Apple sends TLV errors with HTTP 200 — the old
+pattern of checking `status_code >= 200` for success was therefore
+unsafe and has been replaced.  The RTSP handler installs the control
+`PairCipher` and marks the `Ap2SessionState` as `Paired` exclusively
+from the completion signal.
+
+- **Transient pair-setup:** `TransientSetup { key, client_id: None }` after M3/M4 SRP
+  proof verification.  `key` is the 64-byte SRP session key K.
+- **Non-transient pair-setup:** `FullSetup { key, client_id }` after
+  M5 identity verification and M6 generation.  The client is persisted
+  to the `PairingDatabase` before the completion is signalled.
+- **Pair-verify:** `Verify { shared_secret }` after M3 Ed25519
+  signature verification.  `shared_secret` is the verified X25519
+  ECDH shared secret.
+
+### Pair management gate
+
+`/pair-add`, `/pair-remove`, and `/pair-list` now reject unverified
+sessions with a TLV authentication error (state M2 / error 2).
+Previously `pair-remove` and `pair-list` accepted unverified callers,
+which could leak pairing database contents or mutate state without
+proof of identity.
+
+### Stale state reset
+
+`PairingSession` clears both setup and verify state on every new M1
+request and resets the active exchange on any terminal authentication failure (bad SRP proof,
+decryption failure, signature mismatch).  This prevents state from
+a previous incomplete attempt from contaminating a retry.
+`reset_setup()` and `reset_verify()` zero all associated secret
+bytes via `Zeroize` before clearing the `Option`.
+
+### Secret material hardening
+
+- `DerivedKey`, `PairCipher`, `PairingCompletion`, `PairSetupState`, and `PairingSession`
+  no longer implement `Clone`, `Debug`, `PartialEq`, `Eq`,
+  `Serialize`, or `Deserialize`.  This prevents accidental copying
+  or logging of key bytes.
+- All types carrying secret bytes implement `Drop` or explicit
+  zeroing via the `zeroize` crate.  `PairingSession::clear()`,
+  `PairingSession::drop()`, and `PairCipher::drop()` zero their
+  internal key material and counters.
+- All logging of SRP private keys, SRP verifiers, X25519 shared
+  secrets, derived encryption keys, decrypted pairing plaintext,
+  and control ciphertext has been removed.  Only lengths,
+  public keys/IDs, and success/failure indicators are logged.
+
+### Control framing (`PairCipher`)
+
+- **MAX_BLOCK = 1024.**  Any encrypted block with a length prefix
+  larger than 1024 is rejected immediately without advancing the
+  decryption counter.
+- **Incomplete frames** return whatever complete blocks were consumed
+  so far; the remainder is buffered by the caller.
+- **Authentication failure** does not advance the decryption counter,
+  so a legitimate sender can retry.
+- **Counter exhaustion** is detected via checked arithmetic (`u64`
+  overflow → `CounterExhausted` error) **before** nonce reuse.
+- **Preflight encryption:** `encrypt_blocks` validates all blocks
+  (size, counter range) before writing any output.  If any block
+  would fail, no partial ciphertext is emitted.
+- **Client-direction constructor**: `PairCipher::control_for_client`
+  produces a cipher with swapped read/write keys for test round-trips.
+
+### Coalesced plaintext → encrypted transition
+
+When a terminal pairing request (e.g. pair-setup M3 or pair-verify
+M3) activates the control cipher, its own response is sent as
+plaintext (cipher state is captured *before* routing).  Any residual
+bytes already in the plaintext buffer from the same TCP segment
+are moved to the encrypted buffer, decrypted immediately, and
+parsed as the next request.
+
+### Buffer limits
+
+RTSP control buffers are bounded at 16 MiB plaintext and 64 KiB
+pending encrypted data. The larger plaintext limit accommodates metadata
+and artwork bodies; exceeding either limit drops the connection.
+
 ## Known gaps (target profile: PTP + buffered 103)
 
 1. **Realtime audio (type 96).**  The SETUP handler returns `status=1`
@@ -273,6 +359,33 @@ The `rtsp.rs` AP2 SETUP tests cover:
 - NTP / None / empty timing protocol → 400
 - GET /info binary plist field verification
 - txtAirPlay / mDNS / info features cross-consistency
+
+The `pairing.rs` module adds **~25 tests** covering:
+- Transient pair-setup M1→M4 completion (typed `TransientSetup` signal)
+- Non-transient pair-setup M1→M3→M5→M6 completion (typed `FullSetup`
+  signal, client persisted to DB)
+- TLV-error HTTP-200 never signals completion or activates cipher
+- Pair-verify M3 success/failure completion
+- Stale setup state reset on new M1 and on auth failure
+- Stale verify state reset on auth failure
+- `reset_setup` / `clear` zeroization of session key
+- `pair_add` rejection of unverified sessions
+- `pair_remove` rejection of unverified sessions
+- `pair_list` rejection of unverified sessions
+- M6 inner TLV encryption/signature round-trip
+
+The `crypto.rs` module adds **~12 tests** covering:
+- Single-block, multi-block, and empty-plaintext encrypt/decrypt round-trips
+- Exactly `MAX_BLOCK` boundary encryption
+- Oversize length-prefix rejection (`BlockTooLarge`)
+- Incomplete frame returns partial (0 consumed) then completes when rest arrives
+- Auth failure does not advance decryption counter (retry works)
+- Counter exhaustion detected before nonce reuse
+- Multi-block encryption is transactional (preflight failure = no partial output)
+- Client/server control cipher cross-direction round-trip
+- Fragmented header at every byte boundary (accumulator pattern)
+
+Full test count: **602** tests passing (`cargo test --all-targets`).
 
 These tests run as part of `cargo test --all-targets` and are
 independent of the RTSP server — no TCP sockets are opened for the

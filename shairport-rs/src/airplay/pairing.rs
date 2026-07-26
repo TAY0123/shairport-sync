@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2_011::Sha512 as SrpSha512;
 use srp::{ClientG3072, ServerG3072};
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::airplay::{
     crypto::{AgreementKey, DerivedKey, IdentityKey, hkdf_sha512, nonce_from_label, open, seal},
@@ -29,6 +30,57 @@ pub const TLV_ERROR_AUTHENTICATION: u8 = 2;
 const PAIRING_FLAGS_TRANSIENT: u8 = 0x10;
 const PAIR_SETUP_USERNAME: &[u8] = b"Pair-Setup";
 
+// ---------------------------------------------------------------------------
+// Pairing-completion signal
+// ---------------------------------------------------------------------------
+
+/// Signals that a pairing protocol step completed successfully and provides the
+/// secret material needed to install a [`crate::airplay::crypto::PairCipher`].
+///
+/// Intentionally **not** [`Clone`], [`Debug`], [`PartialEq`], or [`Eq`] to
+/// avoid copying or logging of secret bytes.
+/// On [`Drop`] all inner secret material is zeroed.
+pub enum PairingCompletion {
+    /// Transient pair-setup completed (after M3/M4).  `key` is the raw 64-byte
+    /// SRP session key K used to derive the control cipher.
+    TransientSetup {
+        key: [u8; 64],
+        /// Client identifier from M5 inner TLV (for non-transient; None for transient).
+        client_id: Option<String>,
+    },
+    /// Non-transient pair-setup completed (after M5/M6).  `key` is the raw
+    /// 64-byte SRP session key K.  The client has been persisted to the pairing
+    /// database.
+    FullSetup { key: [u8; 64], client_id: String },
+    /// Pair-verify completed (after M3/M4).  `shared_secret` is the verified
+    /// 32-byte X25519 shared secret used to derive the control cipher.
+    Verify { shared_secret: [u8; 32] },
+}
+
+impl Drop for PairingCompletion {
+    fn drop(&mut self) {
+        match self {
+            PairingCompletion::TransientSetup { key, client_id } => {
+                key.zeroize();
+                if let Some(id) = client_id {
+                    id.zeroize();
+                }
+            }
+            PairingCompletion::FullSetup { key, client_id } => {
+                key.zeroize();
+                client_id.zeroize();
+            }
+            PairingCompletion::Verify { shared_secret } => {
+                shared_secret.zeroize();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing endpoint & reply
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PairingEndpoint {
     Setup,
@@ -38,29 +90,118 @@ pub enum PairingEndpoint {
     List,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PairingReply {
     pub status_code: u16,
     pub body: Vec<u8>,
+    /// Present only after a successful terminal pairing step with no TLV error.
+    pub completion: Option<PairingCompletion>,
 }
 
+// ---------------------------------------------------------------------------
+// Pairing session
+// ---------------------------------------------------------------------------
+
+/// Per-connection session state for pair-setup and pair-verify.
+///
+/// Intentionally **not** [`Clone`], [`Debug`], [`PartialEq`], or [`Eq`] —
+/// these traits would risk accidental copying or logging of secret key
+/// material.  On [`Drop`] all secret fields are zeroed.
 #[derive(Default)]
 pub struct PairingSession {
     setup: Option<PairSetupState>,
-    // Raw SRP session key K (64 bytes), available after M3
-    setup_session_key: Option<Vec<u8>>,
+    // Raw SRP session key K (64 bytes), available after M3.
+    setup_session_key: Option<[u8; 64]>,
     verify_agreement: Option<AgreementKey>,
     verify_shared_secret: Option<[u8; 32]>,
     verify_session_key: Option<DerivedKey>,
     client_ephemeral_public_key: Option<[u8; 32]>,
     pub verified: bool,
-    // Client's Ed25519 public key (from M5 inner TLV), stored for pair-verify M3
+    // Client's Ed25519 public key (from M5 inner TLV), stored for pair-verify M3.
     pub client_public_key: Option<[u8; 32]>,
-    // Client's device identifier
+    // Client's device identifier.
     pub client_device_id: Option<String>,
 }
 
-type SrpServer = ServerG3072<sha2_011::Sha512>;
+impl Drop for PairingSession {
+    fn drop(&mut self) {
+        self.reset_setup();
+        self.reset_verify();
+    }
+}
+
+impl PairingSession {
+    /// The verified X25519 shared secret from pair-verify, available only
+    /// after `verified` is true.
+    pub fn shared_secret(&self) -> Option<&[u8; 32]> {
+        self.verify_shared_secret.as_ref().filter(|_| self.verified)
+    }
+
+    /// Raw SRP session key K (64 bytes), for HKDF key derivation.
+    pub fn session_key(&self) -> Option<&[u8; 64]> {
+        self.setup_session_key.as_ref()
+    }
+
+    /// Secret used to derive encrypted control/event channels after a
+    /// successful terminal pairing step. Pair-verify takes precedence when
+    /// present; transient/full pair-setup uses the SRP session key.
+    pub fn control_secret(&self) -> Option<&[u8]> {
+        if !self.verified {
+            return None;
+        }
+        self.verify_shared_secret
+            .as_ref()
+            .map(|secret| secret.as_slice())
+            .or_else(|| self.setup_session_key.as_ref().map(|key| key.as_slice()))
+    }
+
+    fn finish_setup_exchange(&mut self) {
+        if let Some(ref mut state) = self.setup {
+            state.zeroize();
+        }
+        self.setup = None;
+    }
+
+    fn finish_verify_exchange(&mut self) {
+        self.verify_agreement = None;
+        self.client_ephemeral_public_key = None;
+    }
+
+    /// Reset pair-setup state and zero all associated secret material.
+    pub fn reset_setup(&mut self) {
+        if let Some(ref mut state) = self.setup {
+            state.zeroize();
+        }
+        self.setup = None;
+        if let Some(ref mut key) = self.setup_session_key {
+            key.zeroize();
+        }
+        self.setup_session_key = None;
+    }
+
+    /// Reset pair-verify state and zero all associated secret material.
+    pub fn reset_verify(&mut self) {
+        self.verify_agreement = None;
+        if let Some(ref mut sec) = self.verify_shared_secret {
+            sec.zeroize();
+        }
+        self.verify_shared_secret = None;
+        self.verify_session_key = None; // Drop impl zeros DerivedKey
+        self.client_ephemeral_public_key = None;
+        self.verified = false;
+    }
+
+    /// Clear both setup and verify state (used on connection close / drop).
+    pub fn clear(&mut self) {
+        self.reset_setup();
+        self.reset_verify();
+        self.client_public_key = None;
+        self.client_device_id = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PairSetupState
+// ---------------------------------------------------------------------------
 
 struct PairSetupState {
     salt: [u8; 16],
@@ -70,49 +211,26 @@ struct PairSetupState {
     is_transient: bool,
 }
 
-impl std::fmt::Debug for PairSetupState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PairSetupState")
-            .field("is_transient", &self.is_transient)
-            .field("server_public_len", &self.server_public.len())
-            .finish_non_exhaustive()
+impl Zeroize for PairSetupState {
+    fn zeroize(&mut self) {
+        self.salt.zeroize();
+        self.verifier_bytes.zeroize();
+        self.server_private.zeroize();
+        self.server_public.zeroize();
     }
 }
 
-impl Clone for PairSetupState {
-    fn clone(&self) -> Self {
-        Self {
-            salt: self.salt,
-            verifier_bytes: self.verifier_bytes.clone(),
-            server_private: self.server_private.clone(),
-            server_public: self.server_public.clone(),
-            is_transient: self.is_transient,
-        }
+impl Drop for PairSetupState {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
-impl PartialEq for PairSetupState {
-    fn eq(&self, other: &Self) -> bool {
-        self.salt == other.salt
-            && self.verifier_bytes == other.verifier_bytes
-            && self.server_private == other.server_private
-            && self.server_public == other.server_public
-            && self.is_transient == other.is_transient
-    }
-}
+// ---------------------------------------------------------------------------
+// Pairing service
+// ---------------------------------------------------------------------------
 
-impl Eq for PairSetupState {}
-
-impl PairingSession {
-    pub fn shared_secret(&self) -> Option<&[u8; 32]> {
-        self.verify_shared_secret.as_ref().filter(|_| self.verified)
-    }
-
-    /// Raw SRP session key K, for HKDF key derivation in M5/M6
-    pub fn session_key(&self) -> Option<&[u8]> {
-        self.setup_session_key.as_deref()
-    }
-}
+type SrpServer = ServerG3072<sha2_011::Sha512>;
 
 /// A stored client pairing entry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,6 +339,8 @@ impl PairingService {
         }
     }
 
+    // ── Top-level dispatch ───────────────────────────────────────────
+
     pub fn handle(
         &self,
         session: &mut PairingSession,
@@ -243,46 +363,69 @@ impl PairingService {
             "pairing request"
         );
 
-        let out = match endpoint {
+        let (tlv, completion) = match endpoint {
             PairingEndpoint::Setup => match requested_state {
                 1 => self.setup_m1(session, &incoming),
                 3 => self.setup_m3(session, &incoming),
                 5 => self.setup_m5(session, &incoming),
-                _ => auth_error(requested_state.saturating_add(1).min(6)),
+                _ => {
+                    session.reset_setup();
+                    (auth_error(requested_state.saturating_add(1).min(6)), None)
+                }
             },
             PairingEndpoint::Verify => match requested_state {
                 1 => self.verify_m1(session, &incoming),
                 3 => self.verify_m3(session, &incoming),
-                _ => auth_error(requested_state.saturating_add(1).min(4)),
+                _ => {
+                    session.reset_verify();
+                    (auth_error(requested_state.saturating_add(1).min(4)), None)
+                }
             },
             PairingEndpoint::Add => self.pair_add(session, &incoming),
-            PairingEndpoint::Remove => self.pair_remove(&incoming),
-            PairingEndpoint::List => self.pair_list(),
+            PairingEndpoint::Remove => self.pair_remove(session, &incoming),
+            PairingEndpoint::List => self.pair_list(session),
         };
+
+        let has_error = tlv.first(TLV_ERROR).is_some();
         debug!(
             ?endpoint,
             requested_state,
-            response_tlv = %out.debug_summary(),
-            has_error = out.first(TLV_ERROR).is_some(),
+            response_tlv = %tlv.debug_summary(),
+            has_error,
+            completion = if completion.is_some() { "Some" } else { "None" },
             "pairing response"
         );
 
-        let code = 200u16; // Appple uses 200 whether or not error TLV is present
+        // Only signal completion when the TLV has no error — this is the key
+        // fix: Apple sends TLV errors with HTTP 200, so we must NOT infer
+        // success from the status code.
+        let completion = if has_error { None } else { completion };
 
         PairingReply {
-            status_code: code,
-            body: out.encode(),
+            status_code: 200, // Apple uses 200 whether or not error TLV is present
+            body: tlv.encode(),
+            completion,
         }
     }
 
-    fn setup_m1(&self, session: &mut PairingSession, incoming: &Tlv) -> Tlv {
+    // ── Pair-setup handlers ──────────────────────────────────────────
+
+    fn setup_m1(
+        &self,
+        session: &mut PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
+        // A new M1 starts a fresh pairing exchange and clears stale setup,
+        // verify, client identity, and verification state.
+        session.clear();
+
         let method = incoming
             .first(TLV_METHOD)
             .and_then(|value| value.first().copied())
             .unwrap_or(0);
         if method != 0 {
             warn!(method, "unsupported pair-setup method");
-            return auth_error(2);
+            return (auth_error(2), None);
         }
 
         let is_transient = incoming
@@ -302,6 +445,7 @@ impl PairingService {
         let verifier = client.compute_verifier(PAIR_SETUP_USERNAME, pin_bytes, &salt);
         let server_public = server.compute_public_ephemeral(&server_secret, &verifier);
 
+        // Public-only logging: no secret bytes.
         debug!(
             method,
             flags = format_args!("0x{flags:02x}"),
@@ -309,13 +453,10 @@ impl PairingService {
             srp_username_in_x = true,
             srp_pad_g_in_m1 = false,
             pin_len = pin_bytes.len(),
-            salt = %hex_prefix(&salt, 16),
+            salt_len = 16,
             verifier_len = verifier.len(),
-            verifier = %hex_prefix(&verifier, 16),
-            server_private_len = server_secret.len(),
-            server_private = %hex_prefix(&server_secret, 16),
             server_public_len = server_public.len(),
-            server_public = %hex_prefix(&server_public, 16),
+            server_private_len = server_secret.len(),
             "pair-setup M1 accepted"
         );
 
@@ -331,41 +472,38 @@ impl PairingService {
         out.insert(TLV_STATE, [2]);
         out.insert(TLV_SALT, salt);
         out.insert(TLV_PUBLIC_KEY, server_public);
-        out
+        (out, None)
     }
 
-    fn setup_m3(&self, session: &mut PairingSession, incoming: &Tlv) -> Tlv {
+    fn setup_m3(
+        &self,
+        session: &mut PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
         let Some(setup) = session.setup.as_mut() else {
             warn!("pair-setup M3 received before M1 setup state");
-            return auth_error(4);
+            return (auth_error(4), None);
         };
         let Some(client_public) = incoming.joined(TLV_PUBLIC_KEY) else {
             warn!(
                 tlv = %incoming.debug_summary(),
                 "pair-setup M3 missing client public key"
             );
-            return auth_error(4);
+            session.reset_setup();
+            return (auth_error(4), None);
         };
         let Some(client_proof) = incoming.joined(TLV_PROOF) else {
             warn!(
                 tlv = %incoming.debug_summary(),
                 "pair-setup M3 missing client proof"
             );
-            return auth_error(4);
+            session.reset_setup();
+            return (auth_error(4), None);
         };
         debug!(
             is_transient = setup.is_transient,
-            salt = %hex_prefix(&setup.salt, 16),
-            verifier_len = setup.verifier_bytes.len(),
-            verifier = %hex_prefix(&setup.verifier_bytes, 16),
-            server_private_len = setup.server_private.len(),
-            server_private = %hex_prefix(&setup.server_private, 16),
-            server_public_len = setup.server_public.len(),
-            server_public = %hex_prefix(&setup.server_public, 16),
             client_public_len = client_public.len(),
-            client_public = %hex_prefix(&client_public, 16),
             client_proof_len = client_proof.len(),
-            client_proof = %hex_prefix(&client_proof, 16),
             "pair-setup M3 SRP input"
         );
 
@@ -380,9 +518,7 @@ impl PairingService {
             Ok(v) => {
                 debug!(
                     premaster_len = v.key().len(),
-                    premaster = %hex_prefix(v.key(), 16),
                     server_proof_len = v.proof().len(),
-                    server_proof = %hex_prefix(v.proof(), 16),
                     "pair-setup M3 SRP verifier built"
                 );
                 v
@@ -391,64 +527,73 @@ impl PairingService {
                 warn!(
                     %err,
                     client_public_len = client_public.len(),
-                    client_public = %hex_prefix(&client_public, 16),
                     server_public_len = setup.server_public.len(),
-                    server_public = %hex_prefix(&setup.server_public, 16),
                     "pair-setup SRP reply rejected"
                 );
-                return auth_error(4);
+                session.reset_setup();
+                return (auth_error(4), None);
             }
         };
 
-        let session_key = match verifier.verify_client(&client_proof) {
+        let mut session_key = match verifier.verify_client(&client_proof) {
             Ok(session_key) => {
                 debug!(
                     session_key_len = session_key.len(),
-                    session_key = %hex_prefix(session_key, 16),
                     server_proof_len = verifier.proof().len(),
-                    server_proof = %hex_prefix(verifier.proof(), 16),
-                    "pair-setup M3 client proof verified"
+                    "pair-setup M3 SRP proof verified"
                 );
-                session_key.to_vec()
+                let mut key = [0u8; 64];
+                key.copy_from_slice(session_key);
+                key
             }
             Err(err) => {
                 warn!(
                     %err,
                     client_proof_len = client_proof.len(),
-                    client_proof = %hex_prefix(&client_proof, 32),
                     server_public_len = setup.server_public.len(),
-                    server_public = %hex_prefix(&setup.server_public, 16),
-                    premaster_len = verifier.key().len(),
-                    premaster = %hex_prefix(verifier.key(), 16),
-                    server_proof_len = verifier.proof().len(),
-                    server_proof = %hex_prefix(verifier.proof(), 16),
                     "pair-setup client proof rejected"
                 );
-                return auth_error(4);
+                session.reset_setup();
+                return (auth_error(4), None);
             }
         };
 
         info!("pair-setup SRP proof verified, session key established");
 
-        if setup.is_transient {
-            session.setup_session_key = Some(session_key);
-            session.verified = true;
-        }
+        session.setup_session_key = Some(session_key);
 
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [4]);
         out.insert(TLV_PROOF, verifier.proof());
-        out
+
+        let completion = if setup.is_transient {
+            session.verified = true;
+            session.finish_setup_exchange();
+            info!("transient pair-setup completed; control cipher available");
+            Some(PairingCompletion::TransientSetup {
+                key: session_key,
+                client_id: None,
+            })
+        } else {
+            None
+        };
+        session_key.zeroize();
+        (out, completion)
     }
 
     /// M5: Client sends encrypted TLV (State=5, EncryptedData).
     /// Inner TLV: Identifier, PublicKey, Signature.
-    fn setup_m5(&self, session: &mut PairingSession, incoming: &Tlv) -> Tlv {
+    fn setup_m5(
+        &self,
+        session: &mut PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
         let session_key = match session.session_key() {
-            Some(k) => k.to_vec(),
+            Some(k) => zeroize::Zeroizing::new(*k),
             None => {
                 warn!("pair-setup M5 received without SRP session key");
-                return auth_error(6);
+                session.reset_setup();
+                return (auth_error(6), None);
             }
         };
         let Some(encrypted_data) = incoming.joined(TLV_ENCRYPTED_DATA) else {
@@ -456,19 +601,18 @@ impl PairingService {
                 tlv = %incoming.debug_summary(),
                 "pair-setup M5 missing encrypted data"
             );
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         };
         debug!(
             session_key_len = session_key.len(),
-            session_key = %hex_prefix(&session_key, 16),
             encrypted_len = encrypted_data.len(),
-            encrypted = %hex_prefix(&encrypted_data, 24),
             "pair-setup M5 decrypt input"
         );
 
-        // Derive encryption key: HKDF(session_key, "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info")
+        // Derive encryption key
         let enc_key = hkdf_sha512(
-            &session_key,
+            &session_key[..],
             b"Pair-Setup-Encrypt-Salt",
             b"Pair-Setup-Encrypt-Info",
         );
@@ -477,23 +621,13 @@ impl PairingService {
         // Decrypt
         let plaintext = match chacha_open(&enc_key, &nonce, &[], &encrypted_data) {
             Ok(p) => {
-                debug!(
-                    plaintext_len = p.len(),
-                    plaintext = %hex_prefix(&p, 24),
-                    "pair-setup M5 decrypted"
-                );
+                debug!(plaintext_len = p.len(), "pair-setup M5 decrypted");
                 p
             }
             Err(e) => {
-                warn!(
-                    %e,
-                    enc_key = %hex_prefix(&enc_key.0, 16),
-                    nonce = %hex_prefix(&nonce, 12),
-                    encrypted_len = encrypted_data.len(),
-                    encrypted = %hex_prefix(&encrypted_data, 24),
-                    "pair-setup M5 decryption failed"
-                );
-                return auth_error(6);
+                warn!(%e, encrypted_len = encrypted_data.len(), "pair-setup M5 decryption failed");
+                session.reset_setup();
+                return (auth_error(6), None);
             }
         };
 
@@ -504,20 +638,23 @@ impl PairingService {
             .map(|v| String::from_utf8_lossy(v).to_string())
         else {
             warn!(inner_tlv = %inner.debug_summary(), "pair-setup M5 missing client id");
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         };
         let Some(client_pk) = inner.first(TLV_PUBLIC_KEY).and_then(as_32_bytes) else {
             warn!(inner_tlv = %inner.debug_summary(), "pair-setup M5 missing client public key");
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         };
         let Some(client_sig) = inner.first(TLV_SIGNATURE).and_then(as_64_bytes) else {
             warn!(inner_tlv = %inner.debug_summary(), "pair-setup M5 missing client signature");
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         };
 
-        // Derive device_x: HKDF(session_key, "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info")
+        // Derive device_x
         let device_x = hkdf_sha512(
-            &session_key,
+            &session_key[..],
             b"Pair-Setup-Controller-Sign-Salt",
             b"Pair-Setup-Controller-Sign-Info",
         );
@@ -535,41 +672,63 @@ impl PairingService {
         let Some(vk) = vk else {
             warn!(
                 client_id,
-                client_pk = %hex_prefix(&client_pk, 16),
                 "pair-setup M5: invalid client Ed25519 public key"
             );
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         };
         let sig = ed25519_dalek::Signature::from_bytes(&client_sig);
         if vk.verify_strict(&signed_info, &sig).is_err() {
             warn!(
                 client_id,
-                client_pk = %hex_prefix(&client_pk, 16),
-                client_sig = %hex_prefix(&client_sig, 16),
                 signed_info_len = signed_info.len(),
-                signed_info = %hex_prefix(&signed_info, 24),
                 "pair-setup M5: Ed25519 signature verification failed"
             );
-            return auth_error(6);
+            session.reset_setup();
+            return (auth_error(6), None);
         }
 
-        debug!(
-            client_id,
-            client_pk = %hex_prefix(&client_pk, 16),
-            client_sig = %hex_prefix(&client_sig, 16),
-            "pair-setup M5 client signature verified"
-        );
-        // Store client info
-        session.client_device_id = Some(client_id);
-        session.client_public_key = Some(client_pk);
+        debug!(client_id, "pair-setup M5 client signature verified");
 
-        // Build M6: encrypt server identity + signature
-        self.setup_m6(session, &session_key)
+        // Generate M6 before persisting or marking the session verified.
+        let m6_tlv = match self.setup_m6(&session_key) {
+            Ok(tlv) => tlv,
+            Err(e) => {
+                warn!(%e, "pair-setup M6 generation failed");
+                session.reset_setup();
+                return (auth_error(6), None);
+            }
+        };
+
+        // Commit identity and pairing database state only after M6 exists.
+        session.client_device_id = Some(client_id.clone());
+        session.client_public_key = Some(client_pk);
+        {
+            let mut db = self.db.write();
+            db.add_client(client_id.clone(), client_pk);
+            db.save(self.db_path.as_deref());
+        }
+        session.verified = true;
+        info!(
+            client_id,
+            "non-transient pair-setup completed and client persisted"
+        );
+
+        drop(enc_key);
+        drop(device_x);
+
+        (
+            m6_tlv,
+            Some(PairingCompletion::FullSetup {
+                key: *session_key,
+                client_id,
+            }),
+        )
     }
 
     /// M6: Server sends encrypted TLV with server identity + Ed25519 signature.
-    fn setup_m6(&self, _session: &PairingSession, session_key: &[u8]) -> Tlv {
-        // Derive device_x for accessory: HKDF(session_key, "Pair-Setup-Accessory-Sign-Salt", "Pair-Setup-Accessory-Sign-Info")
+    fn setup_m6(&self, session_key: &[u8; 64]) -> anyhow::Result<Tlv> {
+        // Derive device_x for accessory
         let device_x = hkdf_sha512(
             session_key,
             b"Pair-Setup-Accessory-Sign-Salt",
@@ -593,12 +752,9 @@ impl PairingService {
         let inner_encoded = inner.encode();
         debug!(
             device_id = %self.device_id,
-            accessory_pk = %hex_prefix(&pk, 16),
-            accessory_sig = %hex_prefix(&sig, 16),
-            signed_info_len = signed_info.len(),
-            signed_info = %hex_prefix(&signed_info, 24),
             inner_tlv = %inner.debug_summary(),
             inner_len = inner_encoded.len(),
+            signed_info_len = signed_info.len(),
             "pair-setup M6 inner TLV"
         );
 
@@ -610,40 +766,39 @@ impl PairingService {
         );
         let nonce = nonce_from_label(b"PS-Msg06");
 
-        let encrypted = match chacha_seal(&enc_key, &nonce, &[], &inner_encoded) {
-            Ok(e) => {
-                debug!(
-                    enc_key = %hex_prefix(&enc_key.0, 16),
-                    nonce = %hex_prefix(&nonce, 12),
-                    encrypted_len = e.len(),
-                    encrypted = %hex_prefix(&e, 24),
-                    "pair-setup M6 encrypted"
-                );
-                e
-            }
-            Err(e) => {
-                warn!(%e, "pair-setup M6 encryption failed");
-                return auth_error(6);
-            }
-        };
+        let encrypted = chacha_seal(&enc_key, &nonce, &[], &inner_encoded)?;
+        debug!(encrypted_len = encrypted.len(), "pair-setup M6 encrypted");
+
+        drop(enc_key);
+        drop(device_x);
 
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [6]);
         out.insert(TLV_ENCRYPTED_DATA, encrypted);
-        out
+        Ok(out)
     }
 
-    fn verify_m1(&self, session: &mut PairingSession, incoming: &Tlv) -> Tlv {
+    // ── Pair-verify handlers ─────────────────────────────────────────
+
+    fn verify_m1(
+        &self,
+        session: &mut PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
+        // A new M1 starts a fresh pairing exchange and clears stale setup,
+        // verify, client identity, and verification state.
+        session.clear();
+
         let Some(client_public) = incoming.first(TLV_PUBLIC_KEY).and_then(as_32_bytes) else {
             warn!(
                 tlv = %incoming.debug_summary(),
                 "pair-verify M1 missing client public key"
             );
-            return auth_error(2);
+            return (auth_error(2), None);
         };
         let agreement = AgreementKey::generate();
         let public = agreement.public_key();
-        let shared_secret = agreement.shared_secret(&client_public);
+        let mut shared_secret = agreement.shared_secret(&client_public);
         let session_key = hkdf_sha512(
             &shared_secret,
             b"Pair-Verify-Encrypt-Salt",
@@ -668,16 +823,13 @@ impl PairingService {
             Ok(encrypted) => encrypted,
             Err(e) => {
                 warn!(%e, "pair-verify M2 encryption failed");
-                return auth_error(2);
+                return (auth_error(2), None);
             }
         };
         debug!(
-            client_public = %hex_prefix(&client_public, 16),
-            server_public = %hex_prefix(&public, 16),
-            shared_secret = %hex_prefix(&shared_secret, 16),
-            session_key = %hex_prefix(&session_key.0, 16),
+            client_public_len = 32,
+            server_public_len = 32,
             encrypted_len = encrypted.len(),
-            encrypted = %hex_prefix(&encrypted, 24),
             "pair-verify M1 accepted"
         );
 
@@ -685,69 +837,74 @@ impl PairingService {
         session.verify_shared_secret = Some(shared_secret);
         session.verify_session_key = Some(session_key);
         session.client_ephemeral_public_key = Some(client_public);
+        shared_secret.zeroize();
 
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [2]);
         out.insert(TLV_PUBLIC_KEY, public);
         out.insert(TLV_ENCRYPTED_DATA, encrypted);
-        out
+        (out, None)
     }
 
-    fn verify_m3(&self, session: &mut PairingSession, incoming: &Tlv) -> Tlv {
-        let Some(session_key) = session.verify_session_key.as_ref() else {
+    fn verify_m3(
+        &self,
+        session: &mut PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
+        let Some(ref session_key) = session.verify_session_key else {
             warn!("pair-verify M3 received without session key");
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
         let Some(encrypted) = incoming.joined(TLV_ENCRYPTED_DATA) else {
             warn!(
                 tlv = %incoming.debug_summary(),
                 "pair-verify M3 missing encrypted data"
             );
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
         let decrypted = match open(session_key, &nonce_from_label(b"PV-Msg03"), &[], &encrypted) {
             Ok(decrypted) => decrypted,
             Err(e) => {
-                warn!(
-                    %e,
-                    session_key = %hex_prefix(&session_key.0, 16),
-                    encrypted_len = encrypted.len(),
-                    encrypted = %hex_prefix(&encrypted, 24),
-                    "pair-verify M3 decryption failed"
-                );
-                return auth_error(4);
+                warn!(%e, encrypted_len = encrypted.len(), "pair-verify M3 decryption failed");
+                session.reset_verify();
+                return (auth_error(4), None);
             }
         };
 
         let inner = Tlv::parse(&decrypted);
         debug!(
             decrypted_len = decrypted.len(),
-            decrypted = %hex_prefix(&decrypted, 24),
             inner_tlv = %inner.debug_summary(),
             "pair-verify M3 decrypted"
         );
         let Some(client_id) = inner.first(TLV_IDENTIFIER) else {
             warn!(inner_tlv = %inner.debug_summary(), "pair-verify M3 missing client id");
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
         let Some(client_sig_raw) = inner.first(TLV_SIGNATURE) else {
             warn!(inner_tlv = %inner.debug_summary(), "pair-verify M3 missing client signature");
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
         let Ok(client_sig) = <[u8; 64]>::try_from(client_sig_raw) else {
             warn!(
                 signature_len = client_sig_raw.len(),
-                signature = %hex_prefix(client_sig_raw, 16),
                 "pair-verify M3 invalid client signature length"
             );
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
 
         let Some(client_public) = session.client_ephemeral_public_key else {
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
         let Some(ref agreement) = session.verify_agreement else {
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         };
 
         let our_pub = agreement.public_key();
@@ -770,47 +927,59 @@ impl PairingService {
         if !verified {
             warn!(
                 identifier = %client_identifier,
-                client_public = %hex_prefix(&client_public, 16),
-                server_public = %hex_prefix(&our_pub, 16),
-                client_sig = %hex_prefix(&client_sig, 16),
                 signed_message_len = signed_message.len(),
-                signed_message = %hex_prefix(&signed_message, 24),
                 "pair-verify: client signature verification failed"
             );
-            return auth_error(4);
+            session.reset_verify();
+            return (auth_error(4), None);
         }
 
         debug!(identifier = %client_identifier, "pair-verify: client authenticated");
         session.verified = true;
+
+        // Capture the shared secret before it's consumed.
+        let mut shared_secret = session
+            .verify_shared_secret
+            .expect("shared secret set in M1");
+        session.finish_verify_exchange();
+
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [4]);
-        out
+        let completion = PairingCompletion::Verify { shared_secret };
+        shared_secret.zeroize();
+        (out, Some(completion))
     }
 
-    fn pair_add(&self, session: &PairingSession, incoming: &Tlv) -> Tlv {
+    // ── Pair management ──────────────────────────────────────────────
+
+    fn pair_add(
+        &self,
+        session: &PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
         if !session.verified {
             warn!("pair-add attempted without verified session");
-            return auth_error(2);
+            return (auth_error(2), None);
         }
         let Some(encrypted) = incoming.joined(TLV_ENCRYPTED_DATA) else {
-            return auth_error(2);
+            return (auth_error(2), None);
         };
-        let Some(session_key) = session.verify_session_key.as_ref() else {
-            return auth_error(2);
+        let Some(ref session_key) = session.verify_session_key else {
+            return (auth_error(2), None);
         };
         let decrypted = match open(session_key, &nonce_from_label(b"PA-Msg04"), &[], &encrypted) {
             Ok(d) => d,
-            Err(_) => return auth_error(2),
+            Err(_) => return (auth_error(2), None),
         };
         let inner = Tlv::parse(&decrypted);
         let Some(identifier) = inner
             .first(TLV_IDENTIFIER)
             .map(|v| String::from_utf8_lossy(v).to_string())
         else {
-            return auth_error(2);
+            return (auth_error(2), None);
         };
         let Some(pk) = inner.first(TLV_PUBLIC_KEY).and_then(as_32_bytes) else {
-            return auth_error(2);
+            return (auth_error(2), None);
         };
 
         let mut db = self.db.write();
@@ -819,21 +988,30 @@ impl PairingService {
         info!(identifier, "client paired");
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [1]);
-        out
+        (out, None)
     }
 
-    fn pair_remove(&self, incoming: &Tlv) -> Tlv {
-        // pair-remove requires an already-authenticated session (key verified)
-        // Simplified: use the incoming encrypted data similarly to pair-add
-        let Some(encrypted) = incoming.joined(TLV_ENCRYPTED_DATA) else {
-            return auth_error(2);
+    fn pair_remove(
+        &self,
+        session: &PairingSession,
+        incoming: &Tlv,
+    ) -> (Tlv, Option<PairingCompletion>) {
+        if !session.verified {
+            warn!("pair-remove attempted without verified session");
+            return (auth_error(2), None);
+        }
+        // Preserve the existing payload interpretation; this phase adds only
+        // the verified-session authorization gate and does not invent a new
+        // nonce or encryption envelope for pair-remove.
+        let Some(payload) = incoming.joined(TLV_ENCRYPTED_DATA) else {
+            return (auth_error(2), None);
         };
-        let inner = Tlv::parse(&encrypted);
+        let inner = Tlv::parse(&payload);
         let Some(identifier) = inner
             .first(TLV_IDENTIFIER)
             .map(|v| String::from_utf8_lossy(v).to_string())
         else {
-            return auth_error(2);
+            return (auth_error(2), None);
         };
 
         let mut db = self.db.write();
@@ -843,10 +1021,14 @@ impl PairingService {
         }
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [1]);
-        out
+        (out, None)
     }
 
-    fn pair_list(&self) -> Tlv {
+    fn pair_list(&self, session: &PairingSession) -> (Tlv, Option<PairingCompletion>) {
+        if !session.verified {
+            warn!("pair-list attempted without verified session");
+            return (auth_error(2), None);
+        }
         let db = self.db.read();
         let mut out = Tlv::default();
         out.insert(TLV_STATE, [1]);
@@ -860,9 +1042,11 @@ impl PairingService {
             entry.extend_from_slice(&client.public_key);
             out.insert(0x0f, entry);
         }
-        out
+        (out, None)
     }
 }
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn auth_error(state: u8) -> Tlv {
     let mut out = Tlv::default();
@@ -889,19 +1073,6 @@ fn as_32_bytes(value: &[u8]) -> Option<[u8; 32]> {
 
 fn as_64_bytes(value: &[u8]) -> Option<[u8; 64]> {
     value.try_into().ok()
-}
-
-fn hex_prefix(bytes: &[u8], limit: usize) -> String {
-    let mut out = bytes
-        .iter()
-        .take(limit)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("");
-    if bytes.len() > limit {
-        out.push_str("...");
-    }
-    out
 }
 
 /// Chacha20-Poly1305 encrypt. Returns ciphertext || 16-byte tag.
@@ -987,6 +1158,8 @@ mod hex_serde {
     }
 }
 
+// ── Test helpers ─────────────────────────────────────────────────────────
+
 fn test_pairing_service() -> PairingService {
     let identity = IdentityKey::generate();
     let db = PairingDatabase {
@@ -1001,6 +1174,9 @@ fn test_pairing_service() -> PairingService {
     }
 }
 
+// ── Tests ────────────────────────────────────────────────────────────────
+
+// END PRODUCTION PAIRING SOURCE
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1186,8 @@ mod tests {
         groups::G3072,
         utils::{compute_hash, compute_m1_rfc5054},
     };
+
+    // ── Setup completion tests ─────────────────────────────────────────
 
     #[test]
     fn pair_setup_m1_returns_srp_salt_and_public_key() {
@@ -1028,10 +1206,11 @@ mod tests {
         assert_eq!(tlv.first(TLV_SALT).unwrap().len(), 16);
         assert!(tlv.joined(TLV_PUBLIC_KEY).unwrap().len() > 300);
         assert!(tlv.first(TLV_ERROR).is_none());
+        assert!(reply.completion.is_none()); // not yet complete
     }
 
     #[test]
-    fn transient_pair_setup_m3_accepts_parent_style_srp_proof() {
+    fn transient_pair_setup_completion_signals_after_m3() {
         let service = test_pairing_service();
         let mut session = PairingSession::default();
 
@@ -1079,10 +1258,176 @@ mod tests {
         assert_eq!(m4_tlv.first(TLV_PROOF).unwrap().len(), 64);
         assert!(session.verified);
         assert!(session.session_key().is_some());
+        // Completion signal is present for transient setup
+        assert!(m4.completion.is_some());
+        assert!(matches!(
+            m4.completion,
+            Some(PairingCompletion::TransientSetup { .. })
+        ));
     }
 
     #[test]
-    fn verify_reply_includes_ephemeral_key_and_signature() {
+    fn non_transient_pair_setup_completion_signals_after_m5_m6() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+
+        // M1: non-transient (no flags)
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_METHOD, [0]);
+        m1.insert(TLV_STATE, [1]);
+        let m2 = service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+        let m2_tlv = Tlv::parse(&m2.body);
+        assert!(m2.completion.is_none());
+
+        let salt = m2_tlv.first(TLV_SALT).unwrap();
+        let server_public = m2_tlv.joined(TLV_PUBLIC_KEY).unwrap();
+
+        // M3: SRP proof
+        let client = ClientG3072::<SrpSha512>::new_with_options(true);
+        let client_secret = [0x7bu8; 48];
+        let client_public = client.compute_public_ephemeral(&client_secret);
+        let client_verifier = client
+            .process_reply(
+                &client_secret,
+                PAIR_SETUP_USERNAME,
+                service.pin_text.as_bytes(),
+                salt,
+                &server_public,
+            )
+            .unwrap();
+        let sess_key = compute_hash::<SrpSha512>(client_verifier.key());
+        let proof = compute_m1_rfc5054::<SrpSha512>(
+            &G3072::generator(),
+            true,
+            PAIR_SETUP_USERNAME,
+            salt,
+            &client_public,
+            &server_public,
+            sess_key.as_slice(),
+        );
+
+        let mut m3 = Tlv::default();
+        m3.insert(TLV_STATE, [3]);
+        m3.insert(TLV_PUBLIC_KEY, client_public);
+        m3.insert(TLV_PROOF, proof.as_slice());
+        let m4 = service.handle(&mut session, PairingEndpoint::Setup, &m3.encode());
+        assert!(m4.completion.is_none()); // non-transient, not complete yet
+        assert!(!session.verified);
+        assert!(session.session_key().is_some());
+
+        // M5: client identity
+        let client_identity = IdentityKey::generate();
+        let enc_key = hkdf_sha512(
+            &sess_key,
+            b"Pair-Setup-Encrypt-Salt",
+            b"Pair-Setup-Encrypt-Info",
+        );
+        let device_x = hkdf_sha512(
+            &sess_key,
+            b"Pair-Setup-Controller-Sign-Salt",
+            b"Pair-Setup-Controller-Sign-Info",
+        );
+
+        let expected_id = "test-client-non-transient";
+        let mut signed_info = Vec::with_capacity(32 + expected_id.len() + 32);
+        signed_info.extend_from_slice(&device_x.0);
+        signed_info.extend_from_slice(expected_id.as_bytes());
+        signed_info.extend_from_slice(&client_identity.verifying_key());
+        let client_sig = client_identity.sign(&signed_info);
+
+        let mut inner_m5 = Tlv::default();
+        inner_m5.insert(TLV_IDENTIFIER, expected_id.as_bytes());
+        inner_m5.insert(TLV_PUBLIC_KEY, client_identity.verifying_key());
+        inner_m5.insert(TLV_SIGNATURE, client_sig);
+
+        let encrypted_m5 = seal(
+            &enc_key,
+            &nonce_from_label(b"PS-Msg05"),
+            &[],
+            &inner_m5.encode(),
+        )
+        .unwrap();
+        let mut m5 = Tlv::default();
+        m5.insert(TLV_STATE, [5]);
+        m5.insert(TLV_ENCRYPTED_DATA, encrypted_m5);
+
+        let m6 = service.handle(&mut session, PairingEndpoint::Setup, &m5.encode());
+        let m6_tlv = Tlv::parse(&m6.body);
+
+        assert_eq!(m6_tlv.first(TLV_STATE), Some([6].as_slice()));
+        assert!(m6_tlv.first(TLV_ERROR).is_none());
+        assert!(session.verified);
+        // Completion signal is present
+        assert!(m6.completion.is_some());
+        assert!(
+            matches!(m6.completion, Some(PairingCompletion::FullSetup { ref client_id, .. }) if *client_id == expected_id)
+        );
+
+        // Verify client was persisted to DB
+        let db = service.db.read();
+        assert!(db.find_client(expected_id).is_some());
+
+        // Verify M6 can be decrypted
+        let encrypted = m6_tlv.joined(TLV_ENCRYPTED_DATA).unwrap();
+        let plaintext = open(&enc_key, &nonce_from_label(b"PS-Msg06"), &[], &encrypted).unwrap();
+        let inner = Tlv::parse(&plaintext);
+        assert_eq!(
+            inner.first(TLV_IDENTIFIER),
+            Some(service.device_id.as_bytes())
+        );
+        assert_eq!(
+            inner.first(TLV_PUBLIC_KEY),
+            Some(service.identity.verifying_key().as_slice())
+        );
+        assert_eq!(inner.first(TLV_SIGNATURE).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn tlv_error_http_200_never_completes() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+
+        // M1
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_METHOD, [1]); // unsupported method → should fail
+        m1.insert(TLV_STATE, [1]);
+
+        let reply = service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+        assert_eq!(reply.status_code, 200);
+        let tlv = Tlv::parse(&reply.body);
+        assert!(tlv.first(TLV_ERROR).is_some());
+        assert!(reply.completion.is_none());
+    }
+
+    #[test]
+    fn tlv_error_in_transient_setup_m3_never_completes() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+
+        // M1: valid
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_METHOD, [0]);
+        m1.insert(TLV_STATE, [1]);
+        m1.insert(TLV_FLAGS, [PAIRING_FLAGS_TRANSIENT]);
+        service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+
+        // M3: corrupted client proof
+        let mut m3 = Tlv::default();
+        m3.insert(TLV_STATE, [3]);
+        m3.insert(TLV_PUBLIC_KEY, vec![0u8; 384]);
+        m3.insert(TLV_PROOF, vec![0x00u8; 64]);
+        let reply = service.handle(&mut session, PairingEndpoint::Setup, &m3.encode());
+        assert_eq!(reply.status_code, 200);
+        let tlv = Tlv::parse(&reply.body);
+        assert!(tlv.first(TLV_ERROR).is_some());
+        assert!(reply.completion.is_none());
+        assert!(!session.verified);
+    }
+
+    // ── Verify tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn verify_m1_includes_ephemeral_key_and_signature() {
         let service = test_pairing_service();
         let client = AgreementKey::generate();
         let mut input = Tlv::default();
@@ -1094,31 +1439,7 @@ mod tests {
         assert_eq!(tlv.first(TLV_PUBLIC_KEY).unwrap().len(), 32);
         assert!(tlv.first(TLV_ENCRYPTED_DATA).unwrap().len() > 64);
         assert!(session.verify_session_key.is_some());
-    }
-
-    #[test]
-    fn pair_setup_m6_includes_accessory_public_key() {
-        let service = test_pairing_service();
-        let session_key = [0x42u8; 64];
-        let reply_tlv = service.setup_m6(&PairingSession::default(), &session_key);
-        let encrypted = reply_tlv.joined(TLV_ENCRYPTED_DATA).unwrap();
-        let enc_key = hkdf_sha512(
-            &session_key,
-            b"Pair-Setup-Encrypt-Salt",
-            b"Pair-Setup-Encrypt-Info",
-        );
-        let plaintext = open(&enc_key, &nonce_from_label(b"PS-Msg06"), &[], &encrypted).unwrap();
-        let inner = Tlv::parse(&plaintext);
-
-        assert_eq!(
-            inner.first(TLV_IDENTIFIER),
-            Some(service.device_id.as_bytes())
-        );
-        assert_eq!(
-            inner.first(TLV_PUBLIC_KEY),
-            Some(service.identity.verifying_key().as_slice())
-        );
-        assert_eq!(inner.first(TLV_SIGNATURE).unwrap().len(), 64);
+        assert!(reply.completion.is_none()); // not complete yet
     }
 
     #[test]
@@ -1163,13 +1484,13 @@ mod tests {
         let m4 = service.handle(&mut session, PairingEndpoint::Verify, &m3.encode());
         let m4_tlv = Tlv::parse(&m4.body);
 
-        // Should fail because client is not in DB
         assert!(m4_tlv.first(TLV_ERROR).is_some());
+        assert!(m4.completion.is_none());
         assert!(!session.verified);
     }
 
     #[test]
-    fn verify_m3_succeeds_when_client_is_paired() {
+    fn verify_m3_completion_signals_after_success() {
         let client_ed25519 = IdentityKey::generate();
         let client_identifier = b"test-client";
 
@@ -1226,6 +1547,237 @@ mod tests {
         let m4_tlv = Tlv::parse(&m4.body);
 
         assert_eq!(m4_tlv.first(TLV_STATE), Some([4].as_slice()));
+        assert!(m4_tlv.first(TLV_ERROR).is_none());
         assert!(session.verified);
+        assert!(m4.completion.is_some());
+        assert!(matches!(
+            m4.completion,
+            Some(PairingCompletion::Verify { .. })
+        ));
+    }
+
+    #[test]
+    fn control_secret_prefers_verified_pair_verify_secret() {
+        let mut session = PairingSession::default();
+        session.setup_session_key = Some([0x11; 64]);
+        session.verify_shared_secret = Some([0x22; 32]);
+        session.verified = true;
+        assert_eq!(session.control_secret(), Some([0x22; 32].as_slice()));
+    }
+
+    // ── Stale state reset tests ──────────────────────────────────────
+
+    #[test]
+    fn setup_m1_resets_stale_setup_state() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+
+        // Start a setup
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_METHOD, [0]);
+        m1.insert(TLV_STATE, [1]);
+        m1.insert(TLV_FLAGS, [PAIRING_FLAGS_TRANSIENT]);
+        service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+        assert!(session.setup.is_some());
+        assert!(session.setup_session_key.is_none());
+
+        // Send another M1 — should reset the stale setup
+        let reply = service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+        assert!(reply.completion.is_none());
+        assert!(session.setup.is_some()); // new setup created
+    }
+
+    #[test]
+    fn auth_failure_in_setup_m3_resets_state() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+
+        // M1
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_METHOD, [0]);
+        m1.insert(TLV_STATE, [1]);
+        m1.insert(TLV_FLAGS, [PAIRING_FLAGS_TRANSIENT]);
+        service.handle(&mut session, PairingEndpoint::Setup, &m1.encode());
+        assert!(session.setup.is_some());
+
+        // M3: corrupted
+        let mut m3 = Tlv::default();
+        m3.insert(TLV_STATE, [3]);
+        m3.insert(TLV_PUBLIC_KEY, vec![0u8; 384]);
+        m3.insert(TLV_PROOF, vec![0x00u8; 64]);
+        let reply = service.handle(&mut session, PairingEndpoint::Setup, &m3.encode());
+        assert!(Tlv::parse(&reply.body).first(TLV_ERROR).is_some());
+        assert!(session.setup.is_none()); // reset on failure
+    }
+
+    #[test]
+    fn verify_m1_resets_stale_verify_state() {
+        let service = test_pairing_service();
+        let client = AgreementKey::generate();
+        let mut session = PairingSession::default();
+
+        // First M1
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_STATE, [1]);
+        m1.insert(TLV_PUBLIC_KEY, client.public_key());
+        service.handle(&mut session, PairingEndpoint::Verify, &m1.encode());
+        assert!(session.verify_session_key.is_some());
+
+        // Second M1 — should reset
+        service.handle(&mut session, PairingEndpoint::Verify, &m1.encode());
+        assert!(session.verify_session_key.is_some());
+    }
+
+    #[test]
+    fn auth_failure_in_verify_m3_resets_state() {
+        let service = test_pairing_service();
+        let client = AgreementKey::generate();
+        let mut session = PairingSession::default();
+
+        // M1
+        let mut m1 = Tlv::default();
+        m1.insert(TLV_STATE, [1]);
+        m1.insert(TLV_PUBLIC_KEY, client.public_key());
+        service.handle(&mut session, PairingEndpoint::Verify, &m1.encode());
+        assert!(session.verify_session_key.is_some());
+
+        // M3: corrupted encrypted data
+        let mut m3 = Tlv::default();
+        m3.insert(TLV_STATE, [3]);
+        m3.insert(TLV_ENCRYPTED_DATA, vec![0u8; 32]);
+        let reply = service.handle(&mut session, PairingEndpoint::Verify, &m3.encode());
+        assert!(Tlv::parse(&reply.body).first(TLV_ERROR).is_some());
+        assert!(!session.verified);
+        assert!(session.verify_session_key.is_none()); // reset on failure
+    }
+
+    #[test]
+    fn unsupported_pairing_state_clears_stale_exchange() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+        session.setup_session_key = Some([0x41; 64]);
+        session.verify_shared_secret = Some([0x42; 32]);
+        session.verified = true;
+        let mut request = Tlv::default();
+        request.insert(TLV_STATE, [9]);
+        let reply = service.handle(&mut session, PairingEndpoint::Setup, &request.encode());
+        assert!(Tlv::parse(&reply.body).first(TLV_ERROR).is_some());
+        assert!(session.setup_session_key.is_none());
+    }
+
+    // ── Pair management auth gate tests ──────────────────────────────
+
+    #[test]
+    fn pair_add_rejects_unverified_session() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+        let mut body = Tlv::default();
+        body.insert(TLV_ENCRYPTED_DATA, vec![0u8; 10]);
+        let reply = service.handle(&mut session, PairingEndpoint::Add, &body.encode());
+        let tlv = Tlv::parse(&reply.body);
+        assert!(tlv.first(TLV_ERROR).is_some());
+    }
+
+    #[test]
+    fn pair_remove_rejects_unverified_session() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+        let mut body = Tlv::default();
+        body.insert(TLV_ENCRYPTED_DATA, vec![0u8; 10]);
+        let reply = service.handle(&mut session, PairingEndpoint::Remove, &body.encode());
+        let tlv = Tlv::parse(&reply.body);
+        assert!(tlv.first(TLV_ERROR).is_some());
+    }
+
+    #[test]
+    fn pair_list_rejects_unverified_session() {
+        let service = test_pairing_service();
+        let mut session = PairingSession::default();
+        let reply = service.handle(&mut session, PairingEndpoint::List, &[]);
+        let tlv = Tlv::parse(&reply.body);
+        assert!(tlv.first(TLV_ERROR).is_some());
+    }
+
+    // ── Zeroization test ─────────────────────────────────────────────
+
+    #[test]
+    fn reset_setup_zeros_session_key() {
+        let mut session = PairingSession::default();
+        session.setup_session_key = Some([0xabu8; 64]);
+        let _key_ptr = session.setup_session_key.as_ref().unwrap().as_ptr();
+
+        session.reset_setup();
+        // Keys should be zero
+        assert!(session.setup_session_key.is_none());
+        // The memory that was at key_ptr is now freed; this is a best-effort
+        // smoke test. In practice, we rely on the Drop impl.
+    }
+
+    #[test]
+    fn pairing_session_clear_zeros_all() {
+        let mut session = PairingSession::default();
+        session.setup_session_key = Some([0x42u8; 64]);
+        session.verify_shared_secret = Some([0x43u8; 32]);
+        session.verify_session_key = Some(hkdf_sha512(b"test", b"salt", b"info"));
+        session.verified = true;
+        session.client_device_id = Some("test-device".to_string());
+
+        session.clear();
+
+        assert!(session.setup_session_key.is_none());
+        assert!(session.verify_shared_secret.is_none());
+        assert!(!session.verified);
+        assert!(session.client_device_id.is_none());
+    }
+
+    // ── Secret logging guard ─────────────────────────────────────────
+
+    #[test]
+    fn production_logs_do_not_format_secret_material() {
+        let production = include_str!("pairing.rs")
+            .split_once("// END PRODUCTION PAIRING SOURCE")
+            .map(|(production, _)| production)
+            .expect("production source boundary marker");
+        for forbidden in [
+            "hex_prefix(",
+            "shared_secret = %",
+            "session_key = %",
+            "server_private = %",
+            "premaster = %",
+            "enc_key = %",
+            "plaintext = %",
+            "decrypted = %",
+            "first={}",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "secret logging fragment present: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_m6_includes_accessory_public_key() {
+        let service = test_pairing_service();
+        let session_key = [0x42u8; 64];
+        let reply_tlv = service.setup_m6(&session_key).unwrap();
+        let encrypted = reply_tlv.joined(TLV_ENCRYPTED_DATA).unwrap();
+        let enc_key = hkdf_sha512(
+            &session_key,
+            b"Pair-Setup-Encrypt-Salt",
+            b"Pair-Setup-Encrypt-Info",
+        );
+        let plaintext = open(&enc_key, &nonce_from_label(b"PS-Msg06"), &[], &encrypted).unwrap();
+        let inner = Tlv::parse(&plaintext);
+
+        assert_eq!(
+            inner.first(TLV_IDENTIFIER),
+            Some(service.device_id.as_bytes())
+        );
+        assert_eq!(
+            inner.first(TLV_PUBLIC_KEY),
+            Some(service.identity.verifying_key().as_slice())
+        );
+        assert_eq!(inner.first(TLV_SIGNATURE).unwrap().len(), 64);
     }
 }

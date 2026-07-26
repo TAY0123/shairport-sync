@@ -14,9 +14,10 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{debug, info, trace, warn};
+use zeroize::Zeroizing;
 
 use crate::{
-    airplay::pairing::{PairingEndpoint, PairingService, PairingSession},
+    airplay::pairing::{PairingCompletion, PairingEndpoint, PairingService, PairingSession},
     airplay::sdp::parse_sdp,
     airplay::session_crypto::SessionCrypto,
     airplay::{
@@ -24,7 +25,7 @@ use crate::{
         ap2::contract::{Ap2StreamType, Ap2TimingProtocol},
         ap2::session::{
             Ap2SessionPhase, Ap2SessionState, Ap2Stream, Ap2StreamState, Ap2TeardownTarget,
-            validate_add_stream_phase, validate_transition,
+            TransitionError, validate_add_stream_phase, validate_transition,
         },
         crypto::{IdentityKey, PairCipher},
         dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
@@ -200,6 +201,7 @@ fn spawn_ap2_event_listener(
     group_contains_group_leader: Option<bool>,
     ap2_policy: Ap2CapabilityPolicy,
 ) -> anyhow::Result<(u16, JoinHandle<()>)> {
+    let shared_secret = Arc::new(Zeroizing::new(shared_secret));
     let socket = match bind_addr {
         SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
         SocketAddr::V6(_) => {
@@ -222,11 +224,11 @@ fn spawn_ap2_event_listener(
                 Ok((mut stream, peer)) => {
                     info!(%peer, "AP2 event connection opened");
                     let config = config.clone();
-                    let shared_secret = shared_secret.clone();
+                    let shared_secret = Arc::clone(&shared_secret);
                     let group_uuid = group_uuid.clone();
                     let ap2_policy = ap2_policy;
                     tokio::spawn(async move {
-                        let mut cipher = PairCipher::events_for_server(&shared_secret);
+                        let mut cipher = PairCipher::events_for_server(shared_secret.as_slice());
                         match build_ap2_update_info_event(
                             &config,
                             peer_addr,
@@ -277,7 +279,6 @@ fn spawn_ap2_event_listener(
                                                 debug!(
                                                     %peer,
                                                     plaintext_len = plain.len(),
-                                                    plaintext = %String::from_utf8_lossy(&plain),
                                                     "AP2 event payload received"
                                                 );
                                             }
@@ -624,6 +625,91 @@ async fn handle_connection(
     result
 }
 
+/// Maximum plaintext buffer size for an RTSP control connection.
+///
+/// Metadata and artwork requests can be substantially larger than ordinary
+/// RTSP control messages. This 16 MiB bound permits those requests while
+/// preventing unbounded accumulation from a never-ending message.
+const MAX_PLAINTEXT_CONTROL_BUF: usize = 16 * 1024 * 1024;
+
+/// Maximum encrypted buffer size for an RTSP control connection.
+///
+/// Each encrypted block carries at most `MAX_BLOCK + 2 + 16 = 1042` bytes,
+/// so this buffer holds ~62 blocks.  Encrypted frames that never
+/// complete will exhaust this buffer and the connection is dropped.
+const MAX_ENCRYPTED_CONTROL_BUF: usize = 65536;
+
+/// Decrypt one or more blocks from `encrypted_buf` and append decrypted
+/// plaintext into `plaintext_buf`.  Returns the number of encrypted bytes
+/// consumed (may be zero for incomplete frames).
+///
+/// # Errors
+///
+/// Returns [`CipherError::BlockTooLarge`] if a length prefix exceeds
+/// [`MAX_BLOCK`], or [`CipherError::AuthFailed`] if authentication fails.
+/// Neither error advances the cipher counter.
+fn append_control_plaintext(plaintext_buf: &mut Vec<u8>, plaintext: &[u8]) -> anyhow::Result<()> {
+    let new_len = plaintext_buf
+        .len()
+        .checked_add(plaintext.len())
+        .ok_or_else(|| anyhow::anyhow!("plaintext control buffer length overflow"))?;
+    if new_len > MAX_PLAINTEXT_CONTROL_BUF {
+        return Err(anyhow::anyhow!("plaintext control buffer limit exceeded"));
+    }
+    plaintext_buf.extend_from_slice(plaintext);
+    Ok(())
+}
+
+fn append_encrypted_control(encrypted_buf: &mut Vec<u8>, encrypted: &[u8]) -> anyhow::Result<()> {
+    let new_len = encrypted_buf
+        .len()
+        .checked_add(encrypted.len())
+        .ok_or_else(|| anyhow::anyhow!("encrypted control buffer length overflow"))?;
+    if new_len > MAX_ENCRYPTED_CONTROL_BUF {
+        return Err(anyhow::anyhow!("encrypted control buffer limit exceeded"));
+    }
+    encrypted_buf.extend_from_slice(encrypted);
+    Ok(())
+}
+
+fn decrypt_control_blocks(
+    cipher: &mut PairCipher,
+    encrypted_buf: &[u8],
+    plaintext_buf: &mut Vec<u8>,
+) -> anyhow::Result<usize> {
+    let (plaintext, consumed) = cipher
+        .decrypt_blocks(encrypted_buf)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    append_control_plaintext(plaintext_buf, &plaintext)?;
+    Ok(consumed)
+}
+
+/// Move bytes that followed a terminal plaintext pairing request into the
+/// newly activated encrypted stream. This must run only on the exact
+/// plaintext-to-encrypted transition; residual bytes from an already-encrypted
+/// request are already plaintext and must never be decrypted twice.
+fn handoff_coalesced_encrypted_control(
+    cipher_was_active: bool,
+    cipher: Option<&mut PairCipher>,
+    plaintext_buf: &mut Vec<u8>,
+    encrypted_buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    if cipher_was_active || plaintext_buf.is_empty() {
+        return Ok(());
+    }
+    let Some(cipher) = cipher else {
+        return Ok(());
+    };
+
+    let residual = std::mem::take(plaintext_buf);
+    append_encrypted_control(encrypted_buf, &residual)?;
+    let consumed = decrypt_control_blocks(cipher, encrypted_buf, plaintext_buf)?;
+    if consumed > 0 {
+        encrypted_buf.drain(..consumed);
+    }
+    Ok(())
+}
+
 /// Inner request/response loop extracted from [`handle_connection`] so that
 /// every exit path (EOF, read/write error, encryption failure) returns to a
 /// single point where per-connection cleanup is guaranteed.
@@ -643,23 +729,23 @@ async fn process_rtsp_requests(
             return Ok(());
         }
         trace!(%peer, bytes_read = read, "RTSP raw read");
+
         if let Some(ref mut cipher) = session.control_cipher {
-            encrypted_buf.extend_from_slice(&chunk[..read]);
-            match cipher.decrypt_blocks(&encrypted_buf) {
-                Ok((plaintext, consumed)) => {
+            append_encrypted_control(&mut encrypted_buf, &chunk[..read]).map_err(|e| {
+                warn!(%peer, %e, "encrypted control buffer rejected");
+                e
+            })?;
+            match decrypt_control_blocks(cipher, &encrypted_buf, &mut buf) {
+                Ok(consumed) => {
                     trace!(
                         %peer,
                         encrypted_read = read,
                         encrypted_pending = encrypted_buf.len(),
                         encrypted_consumed = consumed,
-                        plaintext_len = plaintext.len(),
                         "RTSP control stream decrypted"
                     );
                     if consumed > 0 {
                         encrypted_buf.drain(..consumed);
-                    }
-                    if !plaintext.is_empty() {
-                        buf.extend_from_slice(&plaintext);
                     }
                 }
                 Err(e) => {
@@ -669,20 +755,24 @@ async fn process_rtsp_requests(
                         encrypted_pending = encrypted_buf.len(),
                         "RTSP control stream decryption failed"
                     );
-                    return Err(e);
+                    return Err(anyhow::anyhow!(e.to_string()));
                 }
             }
         } else {
-            buf.extend_from_slice(&chunk[..read]);
+            append_control_plaintext(&mut buf, &chunk[..read]).map_err(|e| {
+                warn!(%peer, %e, "plaintext control buffer rejected");
+                e
+            })?;
         }
+
         while let Some((request, consumed)) = parse_request(&buf) {
             log_request(peer, &request);
 
-            // If this request arrived after the control stream cipher was active,
-            // the entire RTSP response must be encrypted too. Capture this before
-            // routing, because /pair-setup M3 activates the cipher for later
-            // requests while its own M4 response is still plaintext.
-            let encrypt_response = session.control_cipher.is_some();
+            // Capture cipher state BEFORE routing: a terminal pairing
+            // request may install the control cipher, but its own
+            // response must still be sent as plaintext.
+            let cipher_was_active = session.control_cipher.is_some();
+            let encrypt_response = cipher_was_active;
 
             let response = route_request(svc, session, &request);
 
@@ -701,20 +791,36 @@ async fn process_rtsp_requests(
                     }
                     Err(e) => {
                         warn!(%peer, %e, "RTSP control stream encryption failed");
-                        return Err(e);
+                        return Err(anyhow::anyhow!(e.to_string()));
                     }
                 }
             }
-            trace!(%peer, wire_len = wire.len(), wire = %String::from_utf8_lossy(&wire), encrypted = encrypt_response, "RTSP response wire");
+            trace!(%peer, wire_len = wire.len(), encrypted = encrypt_response, "RTSP response wire");
             stream.write_all(&wire).await?;
             buf.drain(..consumed);
+
+            // A terminal plaintext pairing request may activate encryption.
+            // Only in that exact transition are residual bytes ciphertext.
+            if !cipher_was_active && session.control_cipher.is_some() && !buf.is_empty() {
+                debug!(
+                    %peer,
+                    residual_len = buf.len(),
+                    "coalesced transition: decrypting bytes after terminal pairing request"
+                );
+                handoff_coalesced_encrypted_control(
+                    cipher_was_active,
+                    session.control_cipher.as_mut(),
+                    &mut buf,
+                    &mut encrypted_buf,
+                )?;
+            }
         }
         // If we have residual data but no complete message, log at trace
         if !buf.is_empty() {
-            trace!(%peer, pending = buf.len(), pending_hex = ?buf, "RTSP incomplete frame waiting for more data");
+            trace!(%peer, pending = buf.len(), "RTSP incomplete frame waiting for more data");
         }
         if !encrypted_buf.is_empty() {
-            trace!(%peer, encrypted_pending = encrypted_buf.len(), encrypted_pending_hex = ?encrypted_buf, "RTSP encrypted frame waiting for more data");
+            trace!(%peer, encrypted_pending = encrypted_buf.len(), "RTSP encrypted frame waiting for more data");
         }
     }
 }
@@ -762,6 +868,26 @@ fn perform_connection_cleanup(
     let _ = session.ap2.close();
 }
 
+fn activate_pairing_completion(
+    session: &mut RtspSession,
+    completion: &PairingCompletion,
+) -> Result<(), TransitionError> {
+    // Validate lifecycle state before installing any new ciphers.
+    session.ap2.mark_paired()?;
+    match completion {
+        PairingCompletion::TransientSetup { key, .. }
+        | PairingCompletion::FullSetup { key, .. } => {
+            session.control_cipher = Some(PairCipher::control_for_server(key));
+            session.event_cipher = Some(PairCipher::events_for_server(key));
+        }
+        PairingCompletion::Verify { shared_secret } => {
+            session.control_cipher = Some(PairCipher::control_for_server(shared_secret));
+            session.event_cipher = Some(PairCipher::events_for_server(shared_secret));
+        }
+    }
+    Ok(())
+}
+
 fn route_request(
     svc: &ConnectionServices<'_>,
     session: &mut RtspSession,
@@ -791,7 +917,6 @@ fn route_request(
             uri = %request.uri,
             content_type = request.headers.get("Content-Type").map(|s| s.as_str()).unwrap_or(""),
             body_len = request.body.len(),
-            body_hex = %body_preview(&request.body),
             "RTSP handler"
         );
     }
@@ -932,23 +1057,14 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("POST", "/pair-setup") => {
-            let reply = pairing.handle(&mut session.pairing, PairingEndpoint::Setup, &request.body);
-            // After pair-setup M4, activate control cipher if SRP session key is available
-            if session.control_cipher.is_none()
-                && let Some(sk) = session.pairing.session_key()
+            let mut reply =
+                pairing.handle(&mut session.pairing, PairingEndpoint::Setup, &request.body);
+            if let Some(ref completion) = reply.completion
+                && let Err(e) = activate_pairing_completion(session, completion)
             {
-                session.control_cipher = Some(PairCipher::control_for_server(sk));
-                session.event_cipher = Some(PairCipher::events_for_server(sk));
-                info!("AP2 control cipher activated from pair-setup session key");
-            }
-            // Mark session as Paired only when pair-setup succeeds (2xx)
-            // and the pairing service has a session key.
-            if reply.status_code >= 200
-                && reply.status_code < 300
-                && session.pairing.session_key().is_some()
-                && let Err(e) = session.ap2.mark_paired()
-            {
-                warn!(%e, "pair-setup succeeded but mark_paired failed — phase is {:?}", session.ap2.phase());
+                session.pairing.clear();
+                reply.completion = None;
+                warn!(%e, "pair-setup completion rejected by lifecycle");
                 return response(455, "Method Not Valid in This State")
                     .header("X-Reason", format!("cannot mark paired: {e}"))
                     .with_cseq(request);
@@ -956,7 +1072,7 @@ fn route_request(
             info!(
                 status = reply.status_code,
                 body_len = reply.body.len(),
-                has_shared_secret = session.pairing.shared_secret().is_some(),
+                completed = reply.completion.is_some(),
                 "pair-setup step"
             );
             response(reply.status_code, "OK")
@@ -988,35 +1104,23 @@ fn route_request(
                 .with_cseq(request)
         }
         ("POST", "/pair-verify") => {
-            let reply =
+            let mut reply =
                 pairing.handle(&mut session.pairing, PairingEndpoint::Verify, &request.body);
-            if session.control_cipher.is_none()
-                && let Some(shared_secret) = session.pairing.shared_secret()
+            if let Some(ref completion) = reply.completion
+                && let Err(e) = activate_pairing_completion(session, completion)
             {
-                let ss: &[u8] = shared_secret;
-                session.control_cipher = Some(PairCipher::control_for_server(ss));
-                session.event_cipher = Some(PairCipher::events_for_server(ss));
-                info!("AP2 control and event ciphers activated");
-            } else {
-                info!(
-                    status = reply.status_code,
-                    has_cipher = session.control_cipher.is_some(),
-                    has_shared = session.pairing.shared_secret().is_some(),
-                    "pair-verify"
-                );
-            }
-            // Mark session as Paired only when pair-verify succeeds (2xx)
-            // and the pairing service has a shared secret.
-            if reply.status_code >= 200
-                && reply.status_code < 300
-                && session.pairing.shared_secret().is_some()
-                && let Err(e) = session.ap2.mark_paired()
-            {
-                warn!(%e, "pair-verify succeeded but mark_paired failed — phase is {:?}", session.ap2.phase());
+                session.pairing.clear();
+                reply.completion = None;
+                warn!(%e, "pair-verify completion rejected by lifecycle");
                 return response(455, "Method Not Valid in This State")
                     .header("X-Reason", format!("cannot mark paired: {e}"))
                     .with_cseq(request);
             }
+            info!(
+                status = reply.status_code,
+                completed = reply.completion.is_some(),
+                "pair-verify step"
+            );
             response(reply.status_code, "OK")
                 .header("Content-Type", "application/octet-stream")
                 .body(reply.body)
@@ -1542,20 +1646,15 @@ fn log_request(peer: SocketAddr, request: &RtspRequest) {
     trace!(
         %peer,
         headers = ?request.headers,
-        body_preview = %body_preview(&request.body),
+        body_len = request.body.len(),
         "RTSP request details"
     );
 }
 
-/// Log the raw wire bytes of a request (called from handle_connection at trace level)
-fn log_raw_request(peer: SocketAddr, raw: &[u8], consumed: usize) {
+/// Record request framing progress without logging wire payload bytes.
+fn log_raw_request(peer: SocketAddr, _raw: &[u8], consumed: usize) {
     if consumed > 0 {
-        trace!(
-            %peer,
-            consumed,
-            raw = %std::str::from_utf8(&raw[..consumed]).unwrap_or("<non-utf8>"),
-            "RTSP raw request consumed"
-        );
+        trace!(%peer, consumed, "RTSP raw request consumed");
     }
 }
 
@@ -1602,26 +1701,9 @@ fn log_response(peer: SocketAddr, request: &RtspRequest, response: &RtspResponse
     );
     trace!(
         %peer,
-        body_preview = %body_preview(&response.body),
+        body_len = response.body.len(),
         "RTSP response details"
     );
-}
-
-fn body_preview(body: &[u8]) -> String {
-    const LIMIT: usize = 96;
-    if body.is_empty() {
-        return String::new();
-    }
-    let mut preview = body
-        .iter()
-        .take(LIMIT)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if body.len() > LIMIT {
-        preview.push_str(" ...");
-    }
-    preview
 }
 
 fn plist_xml_preview(value: &plist::Value) -> String {
@@ -2273,8 +2355,8 @@ fn handle_ap2_setup(
             let event_port = if let Some(port) = session.event_port {
                 port
             } else {
-                let Some(shared_secret) = session.pairing.session_key() else {
-                    warn!("cannot open AP2 event listener before pair-setup session key");
+                let Some(shared_secret) = session.pairing.control_secret() else {
+                    warn!("cannot open AP2 event listener before pairing completion");
                     return response(503, "Service Unavailable");
                 };
                 let event_bind = event_bind_addr(session.local_addr, local_ip);
@@ -6325,5 +6407,139 @@ mod tests {
         assert_eq!(before.active, after.active);
         assert_eq!(before.player_state, after.player_state);
         assert_eq!(before.track.title, after.track.title);
+    }
+
+    #[test]
+    fn coalesced_cipher_activation_decrypts_residual_once() {
+        let secret = [0x42u8; 32];
+        let mut client = PairCipher::control_for_client(&secret);
+        let mut server = PairCipher::control_for_server(&secret);
+        let request = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let encrypted = client.encrypt_blocks(request).unwrap();
+        let mut plaintext_buf = encrypted;
+        let mut encrypted_buf = Vec::new();
+
+        handoff_coalesced_encrypted_control(
+            false,
+            Some(&mut server),
+            &mut plaintext_buf,
+            &mut encrypted_buf,
+        )
+        .unwrap();
+
+        assert!(encrypted_buf.is_empty());
+        let (parsed, consumed) = parse_request(&plaintext_buf).unwrap();
+        assert_eq!(parsed.method, "OPTIONS");
+        assert_eq!(consumed, plaintext_buf.len());
+    }
+
+    #[test]
+    fn already_encrypted_pipelined_requests_are_not_decrypted_twice() {
+        let secret = [0x24u8; 32];
+        let mut client = PairCipher::control_for_client(&secret);
+        let mut server = PairCipher::control_for_server(&secret);
+        let first = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let second = b"GET /info RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(first);
+        combined.extend_from_slice(second);
+        let encrypted = client.encrypt_blocks(&combined).unwrap();
+        let mut plaintext_buf = Vec::new();
+        let mut encrypted_buf = encrypted;
+        let consumed =
+            decrypt_control_blocks(&mut server, &encrypted_buf, &mut plaintext_buf).unwrap();
+        encrypted_buf.drain(..consumed);
+
+        handoff_coalesced_encrypted_control(
+            true,
+            Some(&mut server),
+            &mut plaintext_buf,
+            &mut encrypted_buf,
+        )
+        .unwrap();
+
+        assert!(encrypted_buf.is_empty());
+        let (request1, used1) = parse_request(&plaintext_buf).unwrap();
+        assert_eq!(request1.method, "OPTIONS");
+        let (request2, used2) = parse_request(&plaintext_buf[used1..]).unwrap();
+        assert_eq!(request2.method, "GET");
+        assert_eq!(used1 + used2, plaintext_buf.len());
+    }
+
+    #[test]
+    fn control_buffer_limits_accept_boundary_and_reject_overflow() {
+        let mut plaintext = vec![0u8; MAX_PLAINTEXT_CONTROL_BUF - 1];
+        append_control_plaintext(&mut plaintext, &[1]).unwrap();
+        assert_eq!(plaintext.len(), MAX_PLAINTEXT_CONTROL_BUF);
+        assert!(append_control_plaintext(&mut plaintext, &[2]).is_err());
+
+        let mut encrypted = vec![0u8; MAX_ENCRYPTED_CONTROL_BUF - 1];
+        append_encrypted_control(&mut encrypted, &[1]).unwrap();
+        assert_eq!(encrypted.len(), MAX_ENCRYPTED_CONTROL_BUF);
+        assert!(append_encrypted_control(&mut encrypted, &[2]).is_err());
+    }
+
+    #[test]
+    fn pairing_tlv_error_never_activates_control_cipher() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        let mut tlv = crate::airplay::tlv::Tlv::default();
+        tlv.insert(crate::airplay::pairing::TLV_STATE, [1]);
+        tlv.insert(crate::airplay::pairing::TLV_METHOD, [1]);
+        let request = RtspRequest {
+            method: "POST".to_string(),
+            uri: "/pair-setup".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: tlv.encode(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        let reply_tlv = crate::airplay::tlv::Tlv::parse(&response.body);
+        assert_eq!(response.code, 200);
+        assert!(
+            reply_tlv
+                .first(crate::airplay::pairing::TLV_ERROR)
+                .is_some()
+        );
+        assert!(session.control_cipher.is_none());
+        assert!(session.event_cipher.is_none());
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
+    }
+
+    #[test]
+    fn rejected_pairing_completion_installs_no_cipher() {
+        let mut session = RtspSession::default();
+        session.ap2.begin_teardown().unwrap();
+        session.ap2.close().unwrap();
+        let completion = PairingCompletion::Verify {
+            shared_secret: [0x33; 32],
+        };
+        assert!(activate_pairing_completion(&mut session, &completion).is_err());
+        assert!(session.control_cipher.is_none());
+        assert!(session.event_cipher.is_none());
     }
 }
