@@ -1,64 +1,82 @@
-//! AirPlay 2 session-phase state machine.
+//! AirPlay 2 per-connection session state machine.
 //!
-//! Tracks the logical lifecycle of an AP2 session from idle through pairing,
-//! stream setup, playback, and teardown.  The [`Ap2SessionPhase`] enum
-//! captures each distinct phase; [`validate_transition`] enforces valid
-//! ordering without side-effects.
+//! Tracks the strict lifecycle of an AP2 session from connection through
+//! pairing, timing configuration, stream setup, playback, and teardown.
+//! [`Ap2SessionPhase`] captures each distinct lifecycle phase;
+//! [`validate_transition`] enforces valid ordering without side-effects.
+//! [`Ap2SessionState`] owns all AP2 logical data for one connection.
 //!
 //! # Phase diagram
 //!
 //! ```text
-//! Idle ──▶ Paired ──▶ Configured ──▶ StreamSetup ──▶ Recording
-//!                                                    │
-//!                                          ┌─────────┼─────────┐
-//!                                          ▼         ▼         ▼
-//!                                        Paused   Flushed   Teardown
-//!                                          │         │         │
-//!                                          └────┬────┘         │
-//!                                               ▼              │
-//!                                          Recording ◀─────────┘
-//!                                          (via SETRATEANCHORTIME rate=1)
-//!                                          or Idle (session TEARDOWN)
+//! Connected ──▶ Paired ──▶ TimingConfigured ──▶ StreamConfigured ──▶ Recording
+//!                │                  │                    │                │
+//!                │                  ├──▶ PeersConfigured │                │
+//!                │                  │        │           │                │
+//!                │                  │        ▼           │                │
+//!                │                  │   StreamConfigured │                │
+//!                │                  │                    │                │
+//!                ▼                  ▼                    ▼                ▼
+//!             TearingDown ◀────────────────────────────────────────────── Paused
+//!                │                                                        │
+//!                ▼                                                        │
+//!              Closed                                            Recording (rate=1)
+//!                                                                 or TearingDown
 //! ```
-//!
-//! All transitions are validated as pure functions — the caller decides
-//! whether to apply the transition to its own state.
 
 use std::fmt;
 
-/// Logical phase of an AirPlay 2 session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+use crate::airplay::ap2::contract::{Ap2StreamType, Ap2TimingProtocol};
+use crate::codec::AudioFormat;
+
+/// Maximum number of concurrent AP2 streams per session.
+pub const MAX_AP2_STREAMS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Lifecycle phases
+// ---------------------------------------------------------------------------
+
+/// Lifecycle phase of an AirPlay 2 session.
+///
+/// Every connection starts in [`Connected`](Ap2SessionPhase::Connected) and
+/// progresses through well-defined transitions.  Transitions that would skip
+/// required intermediate phases are rejected with a [`TransitionError`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub enum Ap2SessionPhase {
-    /// No session established.
-    Idle,
-    /// Pair-verify completed; shared secret and ciphers active.
+    /// New connection, no state established.
+    #[default]
+    Connected,
+    /// Pair-setup or pair-verify completed; pairing key material active.
     Paired,
-    /// Configuration received (`/configure`, `/fp-setup`, `/audioMode`).
-    Configured,
-    /// At least one SETUP has been processed (stream ports open).
-    StreamSetup,
+    /// Initial PTP SETUP completed; event listener and timing peer info set.
+    TimingConfigured,
+    /// SETPEERS / SETPEERSX completed.
+    PeersConfigured,
+    /// At least one stream SETUP has been processed.
+    StreamConfigured,
     /// RECORD or SETRATEANCHORTIME with rate=1 — audio is playing.
     Recording,
-    /// PAUSE — audio paused but session alive.
+    /// PAUSE or SETRATEANCHORTIME with rate=0 — audio paused but session alive.
     Paused,
-    /// FLUSHBUFFERED — audio flushed and paused.
-    Flushed,
-    /// TEARDOWN (session) — session fully torn down.
-    Teardown,
+    /// TEARDOWN in progress — closing listeners and clearing secrets.
+    TearingDown,
+    /// Fully closed — no further operations permitted.
+    Closed,
 }
 
 impl Ap2SessionPhase {
     /// Human-readable label for the phase.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Idle => "idle",
+            Self::Connected => "connected",
             Self::Paired => "paired",
-            Self::Configured => "configured",
-            Self::StreamSetup => "stream-setup",
+            Self::TimingConfigured => "timing-configured",
+            Self::PeersConfigured => "peers-configured",
+            Self::StreamConfigured => "stream-configured",
             Self::Recording => "recording",
             Self::Paused => "paused",
-            Self::Flushed => "flushed",
-            Self::Teardown => "teardown",
+            Self::TearingDown => "tearing-down",
+            Self::Closed => "closed",
         }
     }
 }
@@ -68,6 +86,10 @@ impl fmt::Display for Ap2SessionPhase {
         f.write_str(self.name())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Transition validation
+// ---------------------------------------------------------------------------
 
 /// Error returned when a requested phase transition is invalid.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,46 +116,39 @@ impl fmt::Display for TransitionError {
 /// Returns `Ok(())` if the transition is legal; otherwise returns a
 /// [`TransitionError`] describing why.
 ///
+/// Same-phase transitions are always idempotent and return `Ok(())`.
+///
 /// # Allowed transitions
 ///
-/// | From          | To             | Trigger                          |
-/// |---------------|----------------|----------------------------------|
-/// | Idle          | Paired         | pair-verify success              |
-/// | Paired        | Configured     | /configure, /fp-setup, /audioMode|
-/// | Paired        | Idle           | TEARDOWN (session)               |
-/// | Configured    | StreamSetup    | SETUP (first stream)             |
-/// | Configured    | Idle           | TEARDOWN (session)               |
-/// | StreamSetup   | Recording      | RECORD, SETRATEANCHORTIME rate=1 |
-/// | StreamSetup   | Idle           | TEARDOWN (session)               |
-/// | Recording     | Paused         | PAUSE                            |
-/// | Recording     | Flushed        | FLUSHBUFFERED                    |
-/// | Recording     | Idle           | TEARDOWN (session)               |
-/// | Paused        | Recording      | SETRATEANCHORTIME rate=1         |
-/// | Paused        | Flushed        | FLUSHBUFFERED                    |
-/// | Paused        | Idle           | TEARDOWN (session)               |
-/// | Flushed       | Recording      | SETRATEANCHORTIME rate=1         |
-/// | Flushed       | Paused         | PAUSE (redundant, allowed)       |
-/// | Flushed       | Idle           | TEARDOWN (session)               |
-/// | Teardown      | Idle           | (reset)                          |
-/// | Idle          | StreamSetup    | SETUP (unpaired initial)         |
-/// | Paired        | StreamSetup    | SETUP (additional stream add)    |
-/// | Configured    | StreamSetup    | SETUP (additional stream add)    |
-/// | Recording     | StreamSetup    | SETUP (additional stream add)    |
-/// | Paused        | StreamSetup    | SETUP (additional stream add)    |
-/// | Flushed       | StreamSetup    | SETUP (additional stream add)    |
+/// | From               | To                  | Trigger                          |
+/// |--------------------|---------------------|----------------------------------|
+/// | Connected          | Paired              | pair-verify success              |
+/// | Connected          | TearingDown         | connection drop / early teardown |
+/// | Paired             | TimingConfigured    | initial PTP SETUP (no streams)   |
+/// | Paired             | TearingDown         | TEARDOWN (session)               |
+/// | TimingConfigured   | PeersConfigured     | SETPEERS / SETPEERSX             |
+/// | TimingConfigured   | StreamConfigured    | SETUP (first stream)             |
+/// | TimingConfigured   | TearingDown         | TEARDOWN (session)               |
+/// | PeersConfigured    | StreamConfigured    | SETUP (first stream)             |
+/// | PeersConfigured    | TearingDown         | TEARDOWN (session)               |
+/// | StreamConfigured   | Recording           | RECORD, SETRATEANCHORTIME rate=1 |
+/// | StreamConfigured   | Paused              | PAUSE, FLUSHBUFFERED              |
+/// | StreamConfigured   | TearingDown         | TEARDOWN (session)               |
+/// | Recording          | Paused              | PAUSE, SETRATEANCHORTIME rate=0  |
+/// | Recording          | TearingDown         | TEARDOWN (session)               |
+/// | Paused             | Recording           | SETRATEANCHORTIME rate=1         |
+/// | Paused             | TearingDown         | TEARDOWN (session)               |
+/// | TearingDown        | Closed              | cleanup complete                 |
 ///
 /// Notes:
-/// - Additional StreamSetup (subsequent SETUP) is only valid from active
-///   phases: Paired, Configured, StreamSetup, Recording, Paused, Flushed.
-///   It is **not** valid from Idle (that path is the distinct "initial"
-///   SETUP) or Teardown.
-/// - Teardown may **only** transition to Idle; it may not transition
-///   directly to StreamSetup or any other phase.
-/// - Stream teardown (TEARDOWN with body) stays in the current phase — it
-///   only closes a single stream listener and does **not** transition the
-///   session.
-/// - PAUSE during Flushed is allowed (redundant, equivalent).
-/// - Idempotent transitions (same → same) are always allowed.
+/// - `add_stream` is an explicit method on [`Ap2SessionState`]; it preserves
+///   the current phase. It is only valid from `TimingConfigured`,
+///   `PeersConfigured`, `StreamConfigured`, `Recording`, or `Paused`.
+/// - `remove_stream` preserves the current phase while streams remain. When
+///   the last stream is removed, the session returns to `PeersConfigured` or
+///   `TimingConfigured` according to whether peers were configured.
+/// - `FLUSHBUFFERED` preserves the session but transitions to `Paused`.
+/// - `Closed` is a terminal state — no transitions out.
 pub fn validate_transition(
     from: Ap2SessionPhase,
     to: Ap2SessionPhase,
@@ -143,45 +158,38 @@ pub fn validate_transition(
     }
 
     let allowed = match (from, to) {
-        // Idle — only way out is pairing or direct SETUP (unpaired AP2 path)
-        (Ap2SessionPhase::Idle, Ap2SessionPhase::Paired) => true,
-        (Ap2SessionPhase::Idle, Ap2SessionPhase::StreamSetup) => true,
+        // Connected — only way out is pairing or teardown
+        (Ap2SessionPhase::Connected, Ap2SessionPhase::Paired) => true,
+        (Ap2SessionPhase::Connected, Ap2SessionPhase::TearingDown) => true,
 
         // Paired
-        (Ap2SessionPhase::Paired, Ap2SessionPhase::Configured) => true,
-        (Ap2SessionPhase::Paired, Ap2SessionPhase::StreamSetup) => true,
-        (Ap2SessionPhase::Paired, Ap2SessionPhase::Idle) => true,
+        (Ap2SessionPhase::Paired, Ap2SessionPhase::TimingConfigured) => true,
+        (Ap2SessionPhase::Paired, Ap2SessionPhase::TearingDown) => true,
 
-        // Configured
-        (Ap2SessionPhase::Configured, Ap2SessionPhase::StreamSetup) => true,
-        (Ap2SessionPhase::Configured, Ap2SessionPhase::Idle) => true,
+        // TimingConfigured
+        (Ap2SessionPhase::TimingConfigured, Ap2SessionPhase::PeersConfigured) => true,
+        (Ap2SessionPhase::TimingConfigured, Ap2SessionPhase::StreamConfigured) => true,
+        (Ap2SessionPhase::TimingConfigured, Ap2SessionPhase::TearingDown) => true,
 
-        // StreamSetup — into recording or back to idle
-        (Ap2SessionPhase::StreamSetup, Ap2SessionPhase::Recording) => true,
-        (Ap2SessionPhase::StreamSetup, Ap2SessionPhase::Idle) => true,
+        // PeersConfigured
+        (Ap2SessionPhase::PeersConfigured, Ap2SessionPhase::StreamConfigured) => true,
+        (Ap2SessionPhase::PeersConfigured, Ap2SessionPhase::TearingDown) => true,
 
-        // Recording — pause, flush, or teardown
+        // StreamConfigured — into recording or teardown
+        (Ap2SessionPhase::StreamConfigured, Ap2SessionPhase::Recording) => true,
+        (Ap2SessionPhase::StreamConfigured, Ap2SessionPhase::Paused) => true,
+        (Ap2SessionPhase::StreamConfigured, Ap2SessionPhase::TearingDown) => true,
+
+        // Recording — pause or teardown
         (Ap2SessionPhase::Recording, Ap2SessionPhase::Paused) => true,
-        (Ap2SessionPhase::Recording, Ap2SessionPhase::Flushed) => true,
-        (Ap2SessionPhase::Recording, Ap2SessionPhase::Idle) => true,
+        (Ap2SessionPhase::Recording, Ap2SessionPhase::TearingDown) => true,
 
-        // Paused — resume, flush, or teardown
+        // Paused — resume or teardown
         (Ap2SessionPhase::Paused, Ap2SessionPhase::Recording) => true,
-        (Ap2SessionPhase::Paused, Ap2SessionPhase::Flushed) => true,
-        (Ap2SessionPhase::Paused, Ap2SessionPhase::Idle) => true,
+        (Ap2SessionPhase::Paused, Ap2SessionPhase::TearingDown) => true,
 
-        // Flushed — resume, pause (redundant), or teardown
-        (Ap2SessionPhase::Flushed, Ap2SessionPhase::Recording) => true,
-        (Ap2SessionPhase::Flushed, Ap2SessionPhase::Paused) => true,
-        (Ap2SessionPhase::Flushed, Ap2SessionPhase::Idle) => true,
-
-        // Teardown — only back to idle
-        (Ap2SessionPhase::Teardown, Ap2SessionPhase::Idle) => true,
-
-        // Additional StreamSetup from active phases not already covered above.
-        (Ap2SessionPhase::Recording, Ap2SessionPhase::StreamSetup) => true,
-        (Ap2SessionPhase::Paused, Ap2SessionPhase::StreamSetup) => true,
-        (Ap2SessionPhase::Flushed, Ap2SessionPhase::StreamSetup) => true,
+        // TearingDown → Closed is the terminal path
+        (Ap2SessionPhase::TearingDown, Ap2SessionPhase::Closed) => true,
 
         _ => false,
     };
@@ -197,6 +205,500 @@ pub fn validate_transition(
     }
 }
 
+/// Validate that a stream may be added in the given phase.
+///
+/// Streams can be added from TimingConfigured, PeersConfigured,
+/// StreamConfigured, Recording, or Paused.  The phase advances to
+/// StreamConfigured if not already there.
+///
+/// Paired is intentionally excluded: the session must have completed
+/// initial timing SETUP before any stream SETUP is accepted.
+pub fn validate_add_stream_phase(phase: Ap2SessionPhase) -> Result<(), TransitionError> {
+    match phase {
+        Ap2SessionPhase::TimingConfigured
+        | Ap2SessionPhase::PeersConfigured
+        | Ap2SessionPhase::StreamConfigured
+        | Ap2SessionPhase::Recording
+        | Ap2SessionPhase::Paused => Ok(()),
+        _ => Err(TransitionError {
+            from: phase,
+            to: phase,
+            reason: "cannot add stream in this phase",
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Teardown target
+// ---------------------------------------------------------------------------
+
+/// What a TEARDOWN body targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ap2TeardownTarget {
+    /// Tear down the entire session.
+    Session,
+    /// Tear down a single stream of the given type.
+    Stream(Ap2StreamType),
+}
+
+impl Ap2TeardownTarget {
+    /// Parse a TEARDOWN binary-plist body into a typed target.
+    ///
+    /// - An empty body or a body without a `streams` key targets the session.
+    /// - A body with `streams` containing exactly one element with a known
+    ///   `type` targets that stream.
+    /// - A body with malformed, missing, or unknown stream type returns `None`
+    ///   (the caller must respond 400, never full-teardown).
+    pub fn from_teardown_body(body: &[u8]) -> Option<Self> {
+        if body.is_empty() {
+            return Some(Self::Session);
+        }
+        let dict = plist::from_bytes::<plist::Dictionary>(body).ok()?;
+        let streams = match dict.get("streams") {
+            None => return Some(Self::Session),
+            Some(plist::Value::Array(arr)) if arr.len() == 1 => arr,
+            Some(_) => return None,
+        };
+        let stream = streams.first()?.as_dictionary()?;
+        let type_val = match stream.get("type") {
+            Some(plist::Value::Integer(i)) => i.as_unsigned(),
+            Some(plist::Value::Real(r)) if r.fract() == 0.0 && *r >= 0.0 => Some(*r as u64),
+            _ => None,
+        }?;
+        match type_val {
+            96 => Some(Self::Stream(Ap2StreamType::RealtimeAudio)),
+            103 => Some(Self::Stream(Ap2StreamType::BufferedAudio)),
+            130 => Some(Self::Stream(Ap2StreamType::DataStream)),
+            _ => None, // unknown stream type → malformed → 400
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AP2 stream state
+// ---------------------------------------------------------------------------
+
+/// State of an individual AP2 stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ap2StreamState {
+    /// Stream has been configured (listener bound, metadata stored).
+    Configured,
+    /// Stream is actively receiving data.
+    Active,
+}
+
+/// An AP2 stream record owned by the session.
+///
+/// Each configured stream tracks its type, audio format, sample rate,
+/// media key, and data port so the session can tear down individual
+/// streams without disturbing others.
+///
+/// This type is intentionally **not** [`Clone`] to avoid copying secret
+/// key material.  On [`Drop`] the media key is zeroed.
+#[derive(Debug)]
+pub struct Ap2Stream {
+    /// Unique stream identifier assigned at SETUP time.
+    pub stream_id: u32,
+    /// Optional connection identifier from the client.
+    pub stream_connection_id: Option<u64>,
+    /// Stream type (buffered audio, realtime audio, or data).
+    pub stream_type: Ap2StreamType,
+    /// Negotiated audio format.
+    pub audio_format: AudioFormat,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Frames per packet.
+    pub frames_per_packet: u32,
+    /// Per-stream media key (shared secret for this stream).
+    pub media_key: [u8; 32],
+    /// UDP or TCP data port bound for this stream.
+    pub data_port: u16,
+    /// Current stream state.
+    pub state: Ap2StreamState,
+}
+
+impl Drop for Ap2Stream {
+    fn drop(&mut self) {
+        self.media_key.fill(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AP2 session state
+// ---------------------------------------------------------------------------
+
+/// All AirPlay 2 logical data owned by a single connection.
+///
+/// Replaces the scattered `ap2_*` fields that were previously embedded
+/// directly in [`RtspSession`].  Listeners, ports, and playback-owner
+/// tracking remain on `RtspSession` because AP1 also uses them.
+///
+/// Sensitive data (session key, stream media keys) is explicitly zeroed on
+/// [`clear_sensitive`](Ap2SessionState::clear_sensitive) and on [`Drop`].
+///
+/// This type is intentionally **not** [`Clone`] to avoid copying secret
+/// key material.
+#[derive(Debug)]
+pub struct Ap2SessionState {
+    phase: Ap2SessionPhase,
+    timing_protocol: Ap2TimingProtocol,
+    group_uuid: Option<String>,
+    group_contains_group_leader: Option<bool>,
+    active_remote: Option<String>,
+    dacp_id: Option<String>,
+    /// Whether SETPEERS / SETPEERSX has been successfully processed.
+    /// Used to determine the correct phase to return to when the last
+    /// stream is removed.
+    peers_configured: bool,
+    session_key: Option<[u8; 32]>,
+    streams: Vec<Ap2Stream>,
+}
+
+impl Default for Ap2SessionState {
+    fn default() -> Self {
+        Self {
+            phase: Ap2SessionPhase::Connected,
+            timing_protocol: Ap2TimingProtocol::None,
+            group_uuid: None,
+            group_contains_group_leader: None,
+            active_remote: None,
+            dacp_id: None,
+            peers_configured: false,
+            session_key: None,
+            streams: Vec::with_capacity(MAX_AP2_STREAMS),
+        }
+    }
+}
+
+impl Ap2SessionState {
+    // ── Accessors ───────────────────────────────────────────────────────
+
+    /// Current lifecycle phase.
+    pub fn phase(&self) -> Ap2SessionPhase {
+        self.phase
+    }
+
+    /// Current timing protocol (typed).
+    pub fn timing_protocol(&self) -> Ap2TimingProtocol {
+        self.timing_protocol
+    }
+
+    /// Group UUID from the initial PTP SETUP.
+    pub fn group_uuid(&self) -> Option<&str> {
+        self.group_uuid.as_deref()
+    }
+
+    /// Whether the group contains a group leader.
+    pub fn group_contains_group_leader(&self) -> Option<bool> {
+        self.group_contains_group_leader
+    }
+
+    /// Active remote identifier.
+    pub fn active_remote(&self) -> Option<&str> {
+        self.active_remote.as_deref()
+    }
+
+    /// DACP identifier.
+    pub fn dacp_id(&self) -> Option<&str> {
+        self.dacp_id.as_deref()
+    }
+
+    /// Session media key (raw 32-byte array reference).
+    pub fn session_key(&self) -> Option<&[u8; 32]> {
+        self.session_key.as_ref()
+    }
+
+    /// Configured streams (immutable view).
+    pub fn streams(&self) -> &[Ap2Stream] {
+        &self.streams
+    }
+
+    /// Number of configured streams.
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Whether the session has at least one configured stream.
+    pub fn has_streams(&self) -> bool {
+        !self.streams.is_empty()
+    }
+
+    /// Whether this session is in an AP2-like state (paired or beyond).
+    pub fn is_ap2_active(&self) -> bool {
+        self.phase != Ap2SessionPhase::Connected && self.phase != Ap2SessionPhase::Closed
+    }
+
+    // ── Transition helpers ─────────────────────────────────────────────
+
+    /// Validate and apply a phase transition.
+    fn apply_transition(&mut self, to: Ap2SessionPhase) -> Result<(), TransitionError> {
+        validate_transition(self.phase, to)?;
+        self.phase = to;
+        Ok(())
+    }
+
+    /// Mark this session as paired (pair-verify completed).
+    pub fn mark_paired(&mut self) -> Result<(), TransitionError> {
+        self.apply_transition(Ap2SessionPhase::Paired)
+    }
+
+    /// Configure timing after a successful initial PTP SETUP.
+    ///
+    /// Requires the session to be [`Paired`](Ap2SessionPhase::Paired).
+    /// Stores the timing protocol, group UUID, and group-leader flag.
+    pub fn configure_timing(
+        &mut self,
+        protocol: Ap2TimingProtocol,
+        group_uuid: Option<String>,
+        group_contains_group_leader: Option<bool>,
+    ) -> Result<(), TransitionError> {
+        self.apply_transition(Ap2SessionPhase::TimingConfigured)?;
+        self.timing_protocol = protocol;
+        self.group_uuid = group_uuid;
+        self.group_contains_group_leader = group_contains_group_leader;
+        Ok(())
+    }
+
+    /// Record that SETPEERS / SETPEERSX has been processed.
+    ///
+    /// Valid from [`TimingConfigured`](Ap2SessionPhase::TimingConfigured)
+    /// or already [`PeersConfigured`](Ap2SessionPhase::PeersConfigured)
+    /// (idempotent).
+    pub fn update_peers_phase(&mut self) -> Result<(), TransitionError> {
+        if self.phase == Ap2SessionPhase::PeersConfigured {
+            return Ok(()); // idempotent
+        }
+        self.apply_transition(Ap2SessionPhase::PeersConfigured)?;
+        self.peers_configured = true;
+        Ok(())
+    }
+
+    /// Add a stream to the session.
+    ///
+    /// Preserves the current phase (does not transition) but requires the
+    /// session to be in a stream-capable phase.  Rejects duplicate stream
+    /// IDs and sessions that have reached [`MAX_AP2_STREAMS`].
+    ///
+    /// The caller is responsible for binding the listener socket and
+    /// updating `AppState` *before* calling this method; on failure the
+    /// caller must unwind any side-effects.
+    pub fn add_stream(&mut self, stream: Ap2Stream) -> Result<(), TransitionError> {
+        validate_add_stream_phase(self.phase)?;
+
+        if self.streams.len() >= MAX_AP2_STREAMS {
+            return Err(TransitionError {
+                from: self.phase,
+                to: self.phase,
+                reason: "maximum stream count reached",
+            });
+        }
+
+        if self.streams.iter().any(|s| s.stream_id == stream.stream_id) {
+            return Err(TransitionError {
+                from: self.phase,
+                to: self.phase,
+                reason: "duplicate stream ID",
+            });
+        }
+
+        self.streams.push(stream);
+
+        // If this is the first stream, advance to StreamConfigured.
+        if self.phase == Ap2SessionPhase::TimingConfigured
+            || self.phase == Ap2SessionPhase::PeersConfigured
+        {
+            self.phase = Ap2SessionPhase::StreamConfigured;
+        }
+
+        Ok(())
+    }
+
+    /// Remove a stream by its stream ID.
+    ///
+    /// If the last stream is removed, the phase regresses to
+    /// [`PeersConfigured`](Ap2SessionPhase::PeersConfigured) (if
+    /// SETPEERS/SETPEERSX was processed) or back to
+    /// [`TimingConfigured`](Ap2SessionPhase::TimingConfigured).
+    /// Returns `true` if a stream was removed.
+    pub fn remove_stream(&mut self, stream_id: u32) -> bool {
+        let len_before = self.streams.len();
+        self.streams.retain(|s| s.stream_id != stream_id);
+        let removed = self.streams.len() < len_before;
+
+        if removed && self.streams.is_empty() {
+            // Regress phase: if peers were configured, go there;
+            // otherwise go back to TimingConfigured.
+            let target = if self.peers_configured {
+                Ap2SessionPhase::PeersConfigured
+            } else {
+                Ap2SessionPhase::TimingConfigured
+            };
+            if self.phase != target {
+                self.phase = target;
+            }
+        }
+
+        removed
+    }
+
+    /// Find a stream by its stream ID.
+    pub fn find_stream(&self, stream_id: u32) -> Option<&Ap2Stream> {
+        self.streams.iter().find(|s| s.stream_id == stream_id)
+    }
+
+    /// Allocate the first unused stream ID.
+    pub fn allocate_stream_id(&self) -> u32 {
+        let used: std::collections::BTreeSet<u32> =
+            self.streams.iter().map(|s| s.stream_id).collect();
+        (0u32..).find(|id| !used.contains(id)).unwrap_or(0)
+    }
+
+    /// Find a stream by its stream type, returning the first match.
+    pub fn find_stream_by_type(&self, stream_type: Ap2StreamType) -> Option<&Ap2Stream> {
+        self.streams.iter().find(|s| s.stream_type == stream_type)
+    }
+
+    /// Begin recording (audio playback active).
+    ///
+    /// Requires at least one configured stream and a valid phase.
+    /// Transitions to [`Recording`](Ap2SessionPhase::Recording).
+    pub fn begin_recording(&mut self) -> Result<(), TransitionError> {
+        if self.streams.is_empty() {
+            return Err(TransitionError {
+                from: self.phase,
+                to: Ap2SessionPhase::Recording,
+                reason: "no streams configured",
+            });
+        }
+        self.apply_transition(Ap2SessionPhase::Recording)
+    }
+
+    /// Pause playback.
+    ///
+    /// Transitions to [`Paused`](Ap2SessionPhase::Paused).  Valid from
+    /// `Recording`, `StreamConfigured`, or `Paused` (idempotent).
+    pub fn pause(&mut self) -> Result<(), TransitionError> {
+        if self.phase == Ap2SessionPhase::Paused {
+            return Ok(());
+        }
+        self.apply_transition(Ap2SessionPhase::Paused)
+    }
+
+    /// Resume playback (SETRATEANCHORTIME with rate=1).
+    ///
+    /// Transitions back to [`Recording`](Ap2SessionPhase::Recording).
+    /// Valid from `Paused`, `Recording` (idempotent), or `StreamConfigured`
+    /// (first play without explicit RECORD).
+    pub fn resume(&mut self) -> Result<(), TransitionError> {
+        if self.phase == Ap2SessionPhase::Recording {
+            return Ok(());
+        }
+        self.apply_transition(Ap2SessionPhase::Recording)
+    }
+
+    /// Begin session teardown.
+    ///
+    /// Transitions to [`TearingDown`](Ap2SessionPhase::TearingDown).
+    /// Valid from any phase except `Closed` and `TearingDown` (which is
+    /// idempotent).
+    pub fn begin_teardown(&mut self) -> Result<(), TransitionError> {
+        if self.phase == Ap2SessionPhase::TearingDown {
+            return Ok(()); // already tearing down
+        }
+        if self.phase == Ap2SessionPhase::Closed {
+            return Err(TransitionError {
+                from: self.phase,
+                to: Ap2SessionPhase::TearingDown,
+                reason: "session is already closed",
+            });
+        }
+        self.apply_transition(Ap2SessionPhase::TearingDown)
+    }
+
+    /// Mark the session as fully closed.
+    ///
+    /// Only valid from [`TearingDown`](Ap2SessionPhase::TearingDown)
+    /// or already [`Closed`](Ap2SessionPhase::Closed) (idempotent).
+    /// Clears all connection data: session key, streams, group,
+    /// remote, DACP, and timing fields.
+    pub fn close(&mut self) -> Result<(), TransitionError> {
+        if self.phase == Ap2SessionPhase::Closed {
+            return Ok(());
+        }
+        self.apply_transition(Ap2SessionPhase::Closed)?;
+        self.clear_sensitive();
+        Ok(())
+    }
+
+    /// Clear all sensitive data (session key, stream media keys) and
+    /// logical connection data (group, remote, DACP, timing).
+    ///
+    /// Uses explicit zeroing without `unsafe`.  After this call the
+    /// session key and all stream keys are zeroed, streams are dropped,
+    /// and logical fields are cleared to defaults.
+    pub fn clear_sensitive(&mut self) {
+        if let Some(ref mut key) = self.session_key {
+            key.fill(0);
+        }
+        self.session_key = None;
+
+        for stream in &mut self.streams {
+            stream.media_key.fill(0);
+        }
+        self.streams.clear();
+
+        // Clear logical connection data.
+        self.group_uuid = None;
+        self.group_contains_group_leader = None;
+        self.active_remote = None;
+        self.dacp_id = None;
+        self.timing_protocol = Ap2TimingProtocol::None;
+        self.peers_configured = false;
+    }
+
+    // ── Mutators for fields set during protocol handling ───────────────
+
+    /// Set the active remote identifier (from plist `activeRemote`).
+    pub fn set_active_remote(&mut self, remote: String) {
+        self.active_remote = Some(remote);
+    }
+
+    /// Set the DACP identifier (from plist `dacpID`).
+    pub fn set_dacp_id(&mut self, id: String) {
+        self.dacp_id = Some(id);
+    }
+
+    /// Set the session media key from a 32-byte array.
+    ///
+    /// Any previous key value is zeroed before being replaced.
+    pub fn set_session_key(&mut self, key: [u8; 32]) {
+        if let Some(ref mut old) = self.session_key {
+            old.fill(0);
+        }
+        self.session_key = Some(key);
+    }
+
+    /// Zero and clear the session key without touching other fields.
+    pub fn zero_session_key(&mut self) {
+        if let Some(ref mut key) = self.session_key {
+            key.fill(0);
+        }
+        self.session_key = None;
+    }
+
+    /// Set the active remote and DACP ID together.
+    pub fn set_remote_and_dacp(&mut self, remote: Option<String>, dacp: Option<String>) {
+        self.active_remote = remote;
+        self.dacp_id = dacp;
+    }
+}
+
+impl Drop for Ap2SessionState {
+    fn drop(&mut self) {
+        self.clear_sensitive();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -205,17 +707,26 @@ pub fn validate_transition(
 mod tests {
     use super::*;
 
+    // ── Phase transition tests ─────────────────────────────────────────
+
+    #[test]
+    fn default_is_connected() {
+        let state = Ap2SessionState::default();
+        assert_eq!(state.phase(), Ap2SessionPhase::Connected);
+    }
+
     #[test]
     fn same_phase_always_allowed() {
         for phase in [
-            Ap2SessionPhase::Idle,
+            Ap2SessionPhase::Connected,
             Ap2SessionPhase::Paired,
-            Ap2SessionPhase::Configured,
-            Ap2SessionPhase::StreamSetup,
+            Ap2SessionPhase::TimingConfigured,
+            Ap2SessionPhase::PeersConfigured,
+            Ap2SessionPhase::StreamConfigured,
             Ap2SessionPhase::Recording,
             Ap2SessionPhase::Paused,
-            Ap2SessionPhase::Flushed,
-            Ap2SessionPhase::Teardown,
+            Ap2SessionPhase::TearingDown,
+            Ap2SessionPhase::Closed,
         ] {
             assert!(
                 validate_transition(phase, phase).is_ok(),
@@ -225,84 +736,90 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_lifecycle() {
-        let seq = [
-            Ap2SessionPhase::Idle,
-            Ap2SessionPhase::Paired,
-            Ap2SessionPhase::Configured,
-            Ap2SessionPhase::StreamSetup,
-            Ap2SessionPhase::Recording,
-            Ap2SessionPhase::Paused,
-            Ap2SessionPhase::Recording,
-            Ap2SessionPhase::Flushed,
-            Ap2SessionPhase::Recording,
-            Ap2SessionPhase::Idle,
-        ];
-        for w in seq.windows(2) {
-            let (from, to) = (w[0], w[1]);
-            assert!(
-                validate_transition(from, to).is_ok(),
-                "transition {from} → {to} should be allowed"
-            );
-        }
+    fn happy_path_full_lifecycle() {
+        let mut state = Ap2SessionState::default();
+        assert_eq!(state.phase(), Ap2SessionPhase::Connected);
+
+        state.mark_paired().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paired);
+
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, Some("uuid".into()), Some(true))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::TimingConfigured);
+
+        state.update_peers_phase().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::PeersConfigured);
+
+        // Add a stream (advances to StreamConfigured)
+        let stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        state.add_stream(stream).unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
+
+        state.begin_recording().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+
+        state.pause().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+
+        state.resume().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+
+        state.pause().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+
+        state.begin_teardown().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::TearingDown);
+
+        state.close().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Closed);
     }
 
     #[test]
-    fn idle_direct_to_streamsetup() {
-        // Unpaired AP2 client might SETUP directly
-        assert!(validate_transition(Ap2SessionPhase::Idle, Ap2SessionPhase::StreamSetup).is_ok());
+    fn skip_peers_still_works() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        // Add stream directly from TimingConfigured (no SETPEERS)
+        let stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        state.add_stream(stream).unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
     }
 
     #[test]
-    fn recording_direct_to_idle() {
-        assert!(validate_transition(Ap2SessionPhase::Recording, Ap2SessionPhase::Idle).is_ok());
+    fn connected_to_teardown() {
+        let mut state = Ap2SessionState::default();
+        // Connection dropped before pairing
+        state.begin_teardown().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::TearingDown);
+        state.close().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Closed);
     }
 
     #[test]
-    fn paused_to_flushed() {
-        assert!(validate_transition(Ap2SessionPhase::Paused, Ap2SessionPhase::Flushed).is_ok());
+    fn paired_direct_to_teardown() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state.begin_teardown().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::TearingDown);
     }
 
-    #[test]
-    fn flushed_to_paused() {
-        assert!(validate_transition(Ap2SessionPhase::Flushed, Ap2SessionPhase::Paused).is_ok());
-    }
+    // ── Invalid transitions ────────────────────────────────────────────
 
     #[test]
-    fn teardown_to_idle() {
-        assert!(validate_transition(Ap2SessionPhase::Teardown, Ap2SessionPhase::Idle).is_ok());
-    }
-
-    #[test]
-    fn additional_setup_from_any_active_phase() {
-        for from in [
-            Ap2SessionPhase::Paired,
-            Ap2SessionPhase::Configured,
-            Ap2SessionPhase::StreamSetup,
-            Ap2SessionPhase::Recording,
-            Ap2SessionPhase::Paused,
-            Ap2SessionPhase::Flushed,
-        ] {
-            assert!(
-                validate_transition(from, Ap2SessionPhase::StreamSetup).is_ok(),
-                "SETUP (additional stream) from {from} should be allowed"
-            );
-        }
-    }
-
-    // ── Invalid transitions ─────────────────────────────────────────────
-
-    #[test]
-    fn idle_to_recording_invalid() {
-        let err =
-            validate_transition(Ap2SessionPhase::Idle, Ap2SessionPhase::Recording).unwrap_err();
-        assert_eq!(err.from, Ap2SessionPhase::Idle);
+    fn connected_to_recording_invalid() {
+        let err = validate_transition(Ap2SessionPhase::Connected, Ap2SessionPhase::Recording)
+            .unwrap_err();
+        assert_eq!(err.from, Ap2SessionPhase::Connected);
         assert_eq!(err.to, Ap2SessionPhase::Recording);
     }
 
     #[test]
-    fn idle_to_paused_invalid() {
-        assert!(validate_transition(Ap2SessionPhase::Idle, Ap2SessionPhase::Paused).is_err());
+    fn connected_to_paused_invalid() {
+        assert!(validate_transition(Ap2SessionPhase::Connected, Ap2SessionPhase::Paused).is_err());
     }
 
     #[test]
@@ -313,56 +830,837 @@ mod tests {
     #[test]
     fn recording_to_configured_invalid() {
         assert!(
-            validate_transition(Ap2SessionPhase::Recording, Ap2SessionPhase::Configured).is_err()
+            validate_transition(
+                Ap2SessionPhase::Recording,
+                Ap2SessionPhase::TimingConfigured
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn teardown_to_recording_invalid() {
-        assert!(
-            validate_transition(Ap2SessionPhase::Teardown, Ap2SessionPhase::Recording).is_err()
-        );
+    fn closed_to_anything_invalid() {
+        for target in [
+            Ap2SessionPhase::Connected,
+            Ap2SessionPhase::Paired,
+            Ap2SessionPhase::TimingConfigured,
+            Ap2SessionPhase::Recording,
+            Ap2SessionPhase::Paused,
+        ] {
+            assert!(
+                validate_transition(Ap2SessionPhase::Closed, target).is_err(),
+                "Closed → {target} should be invalid"
+            );
+        }
     }
 
     #[test]
-    fn teardown_to_paused_invalid() {
-        assert!(validate_transition(Ap2SessionPhase::Teardown, Ap2SessionPhase::Paused).is_err());
+    fn tearingdown_to_anything_but_closed_invalid() {
+        // TearingDown → Closed is valid, everything else invalid
+        for target in [
+            Ap2SessionPhase::Connected,
+            Ap2SessionPhase::Paired,
+            Ap2SessionPhase::TimingConfigured,
+            Ap2SessionPhase::PeersConfigured,
+            Ap2SessionPhase::StreamConfigured,
+            Ap2SessionPhase::Recording,
+            Ap2SessionPhase::Paused,
+        ] {
+            assert!(
+                validate_transition(Ap2SessionPhase::TearingDown, target).is_err(),
+                "TearingDown → {target} should be invalid"
+            );
+        }
     }
 
     #[test]
-    fn teardown_to_streamsetup_invalid() {
-        // Regression: the catch-all `(_, StreamSetup) => true` used to allow
-        // this illegal transition.  Teardown must only go to Idle.
-        let err = validate_transition(Ap2SessionPhase::Teardown, Ap2SessionPhase::StreamSetup)
+    fn recording_to_paired_invalid() {
+        assert!(validate_transition(Ap2SessionPhase::Recording, Ap2SessionPhase::Paired).is_err());
+    }
+
+    // ── Stream add/remove tests ────────────────────────────────────────
+
+    #[test]
+    fn add_stream_from_connected_fails() {
+        let mut state = Ap2SessionState::default();
+        let stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        let err = state.add_stream(stream).unwrap_err();
+        assert!(err.to_string().contains("cannot add stream"));
+    }
+
+    #[test]
+    fn add_stream_from_paired_fails() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        let stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        let err = state.add_stream(stream).unwrap_err();
+        assert!(err.to_string().contains("cannot add stream"));
+        assert_eq!(state.phase(), Ap2SessionPhase::Paired);
+    }
+
+    #[test]
+    fn duplicate_stream_id_rejected() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        state
+            .add_stream(test_stream(42, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        let err = state
+            .add_stream(test_stream(42, Ap2StreamType::BufferedAudio))
             .unwrap_err();
-        assert_eq!(err.from, Ap2SessionPhase::Teardown);
-        assert_eq!(err.to, Ap2SessionPhase::StreamSetup);
+        assert!(err.to_string().contains("duplicate stream ID"));
     }
 
     #[test]
-    fn paused_to_configured_invalid() {
-        assert!(validate_transition(Ap2SessionPhase::Paused, Ap2SessionPhase::Configured).is_err());
+    fn max_streams_rejected() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        for i in 0..MAX_AP2_STREAMS {
+            state
+                .add_stream(test_stream(i as u32, Ap2StreamType::BufferedAudio))
+                .unwrap();
+        }
+        assert_eq!(state.stream_count(), MAX_AP2_STREAMS);
+
+        let err = state
+            .add_stream(test_stream(99, Ap2StreamType::BufferedAudio))
+            .unwrap_err();
+        assert!(err.to_string().contains("maximum stream count"));
     }
 
-    // ── Display ─────────────────────────────────────────────────────────
+    #[test]
+    fn add_stream_from_multiple_phases() {
+        for setup_phase in [
+            Ap2SessionPhase::TimingConfigured,
+            Ap2SessionPhase::PeersConfigured,
+        ] {
+            let mut state = Ap2SessionState::default();
+            state.mark_paired().unwrap();
+            state
+                .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+                .unwrap();
+            if setup_phase == Ap2SessionPhase::PeersConfigured {
+                state.update_peers_phase().unwrap();
+            }
+            assert!(
+                state
+                    .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+                    .is_ok()
+            );
+            assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
+        }
+    }
+
+    #[test]
+    fn add_stream_from_recording_preserves_phase() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state.begin_recording().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+
+        // Add a second stream while recording
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+    }
+
+    #[test]
+    fn add_stream_from_paused_preserves_phase() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state.begin_recording().unwrap();
+        state.pause().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+    }
+
+    #[test]
+    fn remove_stream_with_peers_regression() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state.update_peers_phase().unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
+
+        assert!(state.remove_stream(1));
+        assert_eq!(state.stream_count(), 1);
+        // Still have streams — phase unchanged
+        assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
+
+        // Remove last stream — regress to PeersConfigured
+        assert!(state.remove_stream(2));
+        assert_eq!(state.stream_count(), 0);
+        assert_eq!(state.phase(), Ap2SessionPhase::PeersConfigured);
+    }
+
+    #[test]
+    fn remove_last_stream_without_peers_regresses_to_timing() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        // No SETPEERS — skip directly to stream
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::StreamConfigured);
+
+        // Remove last stream — regress to TimingConfigured (no peers)
+        assert!(state.remove_stream(1));
+        assert_eq!(state.stream_count(), 0);
+        assert_eq!(state.phase(), Ap2SessionPhase::TimingConfigured);
+    }
+
+    #[test]
+    fn remove_nonexistent_stream() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert!(!state.remove_stream(999));
+        assert_eq!(state.stream_count(), 1);
+    }
+
+    // ── RECORD / PAUSE / resume tests ──────────────────────────────────
+
+    #[test]
+    fn record_without_streams_fails() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        // No streams added — begin_recording should fail
+        let err = state.begin_recording().unwrap_err();
+        assert!(err.to_string().contains("no streams configured"));
+    }
+
+    #[test]
+    fn pause_before_record_allowed() {
+        // FLUSHBUFFERED can transition StreamConfigured → Paused
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        // Pause from StreamConfigured is valid
+        state.pause().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+    }
+
+    #[test]
+    fn resume_from_paused() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state.begin_recording().unwrap();
+        state.pause().unwrap();
+        state.resume().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+    }
+
+    // ── TearingDown / Closed tests ─────────────────────────────────────
+
+    #[test]
+    fn teardown_idempotent() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state.begin_teardown().unwrap();
+        // Second teardown is idempotent
+        state.begin_teardown().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::TearingDown);
+    }
+
+    #[test]
+    fn closed_teardown_rejected() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state.begin_teardown().unwrap();
+        state.close().unwrap();
+        let err = state.begin_teardown().unwrap_err();
+        assert!(err.to_string().contains("already closed"));
+    }
+
+    #[test]
+    fn close_idempotent() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state.begin_teardown().unwrap();
+        state.close().unwrap();
+        state.close().unwrap(); // idempotent
+        assert_eq!(state.phase(), Ap2SessionPhase::Closed);
+    }
+
+    // ── Sensitive data tests ───────────────────────────────────────────
+
+    #[test]
+    fn clear_sensitive_zeros_keys() {
+        let mut state = Ap2SessionState::default();
+        state.set_session_key([0xAAu8; 32]);
+        assert!(state.session_key().is_some());
+
+        state.clear_sensitive();
+        assert!(state.session_key().is_none());
+    }
+
+    #[test]
+    fn clear_sensitive_zeros_stream_keys() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        stream.media_key = [0x42u8; 32];
+        state.add_stream(stream).unwrap();
+        assert_eq!(state.stream_count(), 1);
+
+        state.clear_sensitive();
+        // Streams are dropped — count is zero.
+        assert_eq!(state.stream_count(), 0);
+    }
+
+    /// A test-only helper that zeroes the session key without dropping
+    /// the stream, so we can verify the media key was cleared.
+    #[cfg(test)]
+    fn clear_key_for_test(state: &mut Ap2SessionState) {
+        if let Some(ref mut key) = state.session_key {
+            key.fill(0);
+        }
+        state.session_key = None;
+        for stream in &mut state.streams {
+            stream.media_key.fill(0);
+        }
+    }
+
+    #[test]
+    fn clear_key_test_helper_zeros_stream_key() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        stream.media_key = [0x42u8; 32];
+        state.add_stream(stream).unwrap();
+
+        clear_key_for_test(&mut state);
+        let s = state.find_stream(1).unwrap();
+        assert_eq!(s.media_key, [0u8; 32]);
+        assert!(state.session_key().is_none());
+    }
+
+    #[test]
+    fn drop_clears_sensitive() {
+        let mut state = Ap2SessionState::default();
+        state.set_session_key([0xBBu8; 32]);
+
+        // Create a stream with non-zero key
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
+        stream.media_key = [0xCCu8; 32];
+        state.add_stream(stream).unwrap();
+
+        // Verify session key is set before drop
+        let key_before = state.session_key().copied();
+        assert_eq!(key_before, Some([0xBBu8; 32]));
+
+        drop(state);
+        // After drop, state is consumed — the Drop impl zeroes secrets.
+        // We can't observe post-drop state, but the impl is exercised.
+    }
+
+    // ── Two-session isolation tests ────────────────────────────────────
+
+    #[test]
+    fn two_sessions_independent_phases() {
+        let mut s1 = Ap2SessionState::default();
+        let mut s2 = Ap2SessionState::default();
+
+        s1.mark_paired().unwrap();
+        assert_eq!(s1.phase(), Ap2SessionPhase::Paired);
+        assert_eq!(s2.phase(), Ap2SessionPhase::Connected);
+
+        s2.mark_paired().unwrap();
+        s2.configure_timing(Ap2TimingProtocol::Ptp, Some("uuid2".into()), None)
+            .unwrap();
+        assert_eq!(s2.phase(), Ap2SessionPhase::TimingConfigured);
+        assert_eq!(s1.phase(), Ap2SessionPhase::Paired);
+    }
+
+    #[test]
+    fn two_sessions_independent_streams() {
+        let mut s1 = Ap2SessionState::default();
+        let mut s2 = Ap2SessionState::default();
+
+        // Set up both sessions to stream-capable phase
+        for s in [&mut s1, &mut s2] {
+            s.mark_paired().unwrap();
+            s.configure_timing(Ap2TimingProtocol::Ptp, None, None)
+                .unwrap();
+        }
+
+        s1.add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        s2.add_stream(test_stream(100, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        s2.add_stream(test_stream(101, Ap2StreamType::DataStream))
+            .unwrap();
+
+        assert_eq!(s1.stream_count(), 1);
+        assert_eq!(s2.stream_count(), 2);
+        assert!(s1.find_stream(100).is_none());
+        assert!(s2.find_stream(100).is_some());
+    }
+
+    #[test]
+    fn two_sessions_independent_keys() {
+        let mut s1 = Ap2SessionState::default();
+        let mut s2 = Ap2SessionState::default();
+
+        s1.set_session_key([0x01u8; 32]);
+        s2.set_session_key([0x02u8; 32]);
+
+        assert_eq!(s1.session_key().unwrap(), &[0x01u8; 32]);
+        assert_eq!(s2.session_key().unwrap(), &[0x02u8; 32]);
+
+        s1.clear_sensitive();
+        assert!(s1.session_key().is_none());
+        assert!(s2.session_key().is_some());
+    }
+
+    // ── Failure rollback tests ─────────────────────────────────────────
+
+    #[test]
+    fn add_stream_failure_does_not_mutate() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        // Add a valid stream
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        let phase_before = state.phase();
+        let count_before = state.stream_count();
+
+        // Try to add duplicate — must fail and leave state unchanged
+        let result = state.add_stream(test_stream(1, Ap2StreamType::BufferedAudio));
+        assert!(result.is_err());
+        assert_eq!(state.phase(), phase_before);
+        assert_eq!(state.stream_count(), count_before);
+    }
+
+    #[test]
+    fn max_streams_failure_no_mutation() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        for i in 0..MAX_AP2_STREAMS {
+            state
+                .add_stream(test_stream(i as u32, Ap2StreamType::BufferedAudio))
+                .unwrap();
+        }
+
+        let phase_before = state.phase();
+        let count_before = state.stream_count();
+
+        let result = state.add_stream(test_stream(999, Ap2StreamType::BufferedAudio));
+        assert!(result.is_err());
+        assert_eq!(state.phase(), phase_before);
+        assert_eq!(state.stream_count(), count_before);
+    }
+
+    // ── Display / formatting ───────────────────────────────────────────
 
     #[test]
     fn phase_display() {
-        assert_eq!(Ap2SessionPhase::Idle.to_string(), "idle");
+        assert_eq!(Ap2SessionPhase::Connected.to_string(), "connected");
         assert_eq!(Ap2SessionPhase::Recording.to_string(), "recording");
-        assert_eq!(Ap2SessionPhase::Teardown.to_string(), "teardown");
+        assert_eq!(Ap2SessionPhase::Closed.to_string(), "closed");
+        assert_eq!(Ap2SessionPhase::TearingDown.to_string(), "tearing-down");
     }
 
     #[test]
     fn transition_error_display() {
         let err = TransitionError {
-            from: Ap2SessionPhase::Idle,
+            from: Ap2SessionPhase::Connected,
             to: Ap2SessionPhase::Recording,
             reason: "must set up a stream first",
         };
         let s = err.to_string();
-        assert!(s.contains("idle"));
+        assert!(s.contains("connected"));
         assert!(s.contains("recording"));
         assert!(s.contains("must set up a stream first"));
+    }
+
+    #[test]
+    fn phase_default() {
+        assert_eq!(Ap2SessionPhase::default(), Ap2SessionPhase::Connected);
+    }
+
+    // ── Accessor tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn accessors_return_set_values() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, Some("group-1".into()), Some(true))
+            .unwrap();
+
+        assert_eq!(state.timing_protocol(), Ap2TimingProtocol::Ptp);
+        assert_eq!(state.group_uuid(), Some("group-1"));
+        assert_eq!(state.group_contains_group_leader(), Some(true));
+        assert!(state.is_ap2_active());
+    }
+
+    #[test]
+    fn set_remote_and_dacp() {
+        let mut state = Ap2SessionState::default();
+        state.set_remote_and_dacp(Some("remote-1".into()), Some("dacp-1".into()));
+        assert_eq!(state.active_remote(), Some("remote-1"));
+        assert_eq!(state.dacp_id(), Some("dacp-1"));
+    }
+
+    #[test]
+    fn set_session_key_replaces_old() {
+        let mut state = Ap2SessionState::default();
+        state.set_session_key([0xAAu8; 32]);
+        assert_eq!(state.session_key().copied(), Some([0xAAu8; 32]));
+
+        // Replace — old key must be zeroed, new key stored.
+        state.set_session_key([0x55u8; 32]);
+        assert_eq!(state.session_key().copied(), Some([0x55u8; 32]));
+    }
+
+    #[test]
+    fn find_stream_by_type() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state
+            .add_stream(test_stream(2, Ap2StreamType::DataStream))
+            .unwrap();
+
+        assert!(
+            state
+                .find_stream_by_type(Ap2StreamType::BufferedAudio)
+                .is_some()
+        );
+        assert!(
+            state
+                .find_stream_by_type(Ap2StreamType::RealtimeAudio)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn is_ap2_active() {
+        let mut state = Ap2SessionState::default();
+        assert!(!state.is_ap2_active());
+
+        state.mark_paired().unwrap();
+        assert!(state.is_ap2_active());
+
+        state.begin_teardown().unwrap();
+        state.close().unwrap();
+        assert!(!state.is_ap2_active());
+    }
+
+    // ── Close / cleanup tests ──────────────────────────────────────────
+
+    #[test]
+    fn close_clears_all_logical_fields() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, Some("g1".into()), Some(true))
+            .unwrap();
+        state.set_active_remote("r1".into());
+        state.set_dacp_id("d1".into());
+        state.set_session_key([0x42u8; 32]);
+
+        state.begin_teardown().unwrap();
+        state.close().unwrap();
+
+        assert_eq!(state.phase(), Ap2SessionPhase::Closed);
+        assert!(state.session_key().is_none());
+        assert_eq!(state.stream_count(), 0);
+        assert_eq!(state.group_uuid(), None);
+        assert_eq!(state.active_remote(), None);
+        assert_eq!(state.dacp_id(), None);
+        assert_eq!(state.timing_protocol(), Ap2TimingProtocol::None);
+    }
+
+    #[test]
+    fn clear_sensitive_clears_logical_fields() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, Some("g1".into()), Some(true))
+            .unwrap();
+        state.set_active_remote("r1".into());
+        state.set_dacp_id("d1".into());
+        state.set_session_key([0x42u8; 32]);
+
+        state.clear_sensitive();
+        assert!(state.session_key().is_none());
+        assert_eq!(state.stream_count(), 0);
+        assert_eq!(state.group_uuid(), None);
+        assert_eq!(state.active_remote(), None);
+        assert_eq!(state.dacp_id(), None);
+        assert_eq!(state.timing_protocol(), Ap2TimingProtocol::None);
+    }
+
+    #[test]
+    fn repeated_cleanup_is_idempotent() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state.set_session_key([0x42u8; 32]);
+
+        // First cleanup
+        state.clear_sensitive();
+        // Second cleanup — must not panic
+        state.clear_sensitive();
+        assert!(state.session_key().is_none());
+
+        // close after begin_teardown (re-Setup on fresh state)
+        let mut state2 = Ap2SessionState::default();
+        state2.mark_paired().unwrap();
+        state2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state2.begin_teardown().unwrap();
+        state2.close().unwrap();
+        // close again (idempotent)
+        assert!(state2.close().is_ok());
+        assert_eq!(state2.phase(), Ap2SessionPhase::Closed);
+        // clear_sensitive on closed state is safe
+        state2.clear_sensitive();
+    }
+
+    #[test]
+    fn peers_configured_tracks_flag() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        // Before SETPEERS, stream removal regresses to TimingConfigured
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert!(state.remove_stream(1));
+        assert_eq!(state.phase(), Ap2SessionPhase::TimingConfigured);
+
+        // After SETPEERS, stream removal regresses to PeersConfigured
+        state.update_peers_phase().unwrap();
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert!(state.remove_stream(2));
+        assert_eq!(state.phase(), Ap2SessionPhase::PeersConfigured);
+    }
+
+    #[test]
+    fn add_stream_preserves_recording_phase() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state.begin_recording().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+
+        // Additional stream — Recording must be preserved
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Recording);
+    }
+
+    #[test]
+    fn add_stream_preserves_paused_phase() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        state
+            .add_stream(test_stream(1, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        state.pause().unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+
+        // Additional stream — Paused must be preserved
+        state
+            .add_stream(test_stream(2, Ap2StreamType::BufferedAudio))
+            .unwrap();
+        assert_eq!(state.phase(), Ap2SessionPhase::Paused);
+    }
+
+    // ── TEARDOWN target parsing ───────────────────────────────────────
+
+    #[test]
+    fn teardown_empty_body_targets_session() {
+        assert_eq!(
+            Ap2TeardownTarget::from_teardown_body(&[]),
+            Some(Ap2TeardownTarget::Session)
+        );
+    }
+
+    #[test]
+    fn teardown_plist_without_streams_targets_session() {
+        let mut body = Vec::new();
+        plist::to_writer_binary(
+            &mut body,
+            &plist::Value::Dictionary(plist::Dictionary::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            Ap2TeardownTarget::from_teardown_body(&body),
+            Some(Ap2TeardownTarget::Session)
+        );
+    }
+
+    #[test]
+    fn teardown_malformed_stream_shapes_are_rejected() {
+        for streams in [
+            plist::Value::String("bad".to_string()),
+            plist::Value::Array(Vec::new()),
+            plist::Value::Array(vec![
+                plist::Value::Dictionary(plist::Dictionary::new()),
+                plist::Value::Dictionary(plist::Dictionary::new()),
+            ]),
+        ] {
+            let mut dict = plist::Dictionary::new();
+            dict.insert("streams".to_string(), streams);
+            let mut body = Vec::new();
+            plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+            assert_eq!(Ap2TeardownTarget::from_teardown_body(&body), None);
+        }
+    }
+
+    #[test]
+    fn teardown_unknown_stream_type_is_rejected() {
+        let mut stream = plist::Dictionary::new();
+        stream.insert(
+            "type".to_string(),
+            plist::Value::Integer(plist::Integer::from(999u64)),
+        );
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+        assert_eq!(Ap2TeardownTarget::from_teardown_body(&body), None);
+    }
+
+    #[test]
+    fn teardown_known_stream_type_is_typed() {
+        let mut stream = plist::Dictionary::new();
+        stream.insert(
+            "type".to_string(),
+            plist::Value::Integer(plist::Integer::from(103u64)),
+        );
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dict)).unwrap();
+        assert_eq!(
+            Ap2TeardownTarget::from_teardown_body(&body),
+            Some(Ap2TeardownTarget::Stream(Ap2StreamType::BufferedAudio))
+        );
+    }
+
+    // ── Helper ─────────────────────────────────────────────────────────
+
+    fn test_stream(id: u32, st: Ap2StreamType) -> Ap2Stream {
+        use crate::codec::AudioFormat;
+        Ap2Stream {
+            stream_id: id,
+            stream_connection_id: None,
+            stream_type: st,
+            audio_format: AudioFormat::Alac44100S16Stereo,
+            sample_rate: 44100,
+            frames_per_packet: 352,
+            media_key: [0u8; 32],
+            data_port: 6000 + id as u16,
+            state: Ap2StreamState::Configured,
+        }
     }
 }

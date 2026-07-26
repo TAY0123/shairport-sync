@@ -253,6 +253,12 @@ pub enum Ap2StateEffect {
     ActiveSet,
     /// General diagnostic / metadata update.
     DiagnosticUpdate,
+    /// Session phase changed (connected → paired → configured → …).
+    PhaseTransition,
+    /// AP2 stream added to session.
+    StreamAdded,
+    /// AP2 stream removed from session.
+    StreamRemoved,
 }
 
 impl fmt::Display for Ap2StateEffect {
@@ -275,6 +281,9 @@ impl fmt::Display for Ap2StateEffect {
             Self::PeersUpdated => "peers-updated",
             Self::ActiveSet => "active-set",
             Self::DiagnosticUpdate => "diagnostic-update",
+            Self::PhaseTransition => "phase-transition",
+            Self::StreamAdded => "stream-added",
+            Self::StreamRemoved => "stream-removed",
         })
     }
 }

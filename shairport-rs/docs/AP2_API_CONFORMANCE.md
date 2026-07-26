@@ -104,22 +104,91 @@ are pure functions that consume lightweight borrowed views
 
 ## Session phase state machine
 
-`src/airplay/ap2/session.rs` defines a pure `Ap2SessionPhase` enum
-and `validate_transition(from, to) -> Result<(), TransitionError>` that
-enforces the valid lifecycle ordering:
+`src/airplay/ap2/session.rs` defines a strict per-connection lifecycle
+state machine via `Ap2SessionState` and `Ap2SessionPhase`.  Every new
+connection starts in `Connected` and progresses through well-defined
+phases:
 
 ```text
-Idle ──▶ Paired ──▶ Configured ──▶ StreamSetup ──▶ Recording
-                                                   │
-                                         ┌─────────┼─────────┐
-                                         ▼         ▼         ▼
-                                       Paused   Flushed   Teardown
-                                         │         │         │
-                                         └────┬────┘         │
-                                              ▼              │
-                                         Recording ◀─────────┘
-                                         or Idle (session TEARDOWN)
+Connected ──▶ Paired ──▶ TimingConfigured ──▶ StreamConfigured ──▶ Recording
+               │                  │                    │                │
+               │                  ├──▶ PeersConfigured │                │
+               │                  │        │           │                │
+               │                  │        ▼           │                │
+               │                  │   StreamConfigured │                │
+               │                  │                    │                │
+               ▼                  ▼                    ▼                ▼
+            TearingDown ◀────────────────────────────────────────────── Paused
+               │                                                        │
+               ▼                                                        │
+             Closed                                            Recording (rate=1)
+                                                               or TearingDown
 ```
+
+`validate_transition(from, to)` enforces valid ordering and returns a
+typed `TransitionError` for invalid attempts.  Same-phase transitions
+are always idempotent.
+
+### Phase definitions
+
+| Phase             | Meaning                                                        |
+|-------------------|----------------------------------------------------------------|
+| Connected         | New connection; no state established (default).                |
+| Paired            | Pair-setup or pair-verify completed; pairing key material active. |
+| TimingConfigured  | Initial PTP SETUP succeeded; event listener open.             |
+| PeersConfigured   | SETPEERS / SETPEERSX processed.                               |
+| StreamConfigured  | At least one stream SETUP processed; audio ports bound.       |
+| Recording         | RECORD or SETRATEANCHORTIME (rate=1) — audio playing.         |
+| Paused            | PAUSE, FLUSHBUFFERED, or SETRATEANCHORTIME (rate=0).          |
+| TearingDown       | TEARDOWN in progress — closing listeners.                     |
+| Closed            | Fully closed; no further operations permitted.                |
+
+### Stream management
+
+`Ap2Stream` records track per-stream metadata (stream ID, type,
+audio format, sample rate, frames-per-packet, media key, data port).
+Up to `MAX_AP2_STREAMS` (8) concurrent streams are supported.
+`add_stream` and `remove_stream` are explicit methods that preserve
+the current phase when adding/removing streams from `Recording` or
+`Paused`.  Duplicate stream IDs are rejected.
+
+### Transaction methods
+
+`Ap2SessionState` provides transaction-like methods that validate
+phase preconditions before mutating:
+
+| Method              | Precondition              | Postcondition             |
+|---------------------|---------------------------|---------------------------|
+| `mark_paired`       | Connected                 | Paired                    |
+| `configure_timing`  | Paired                    | TimingConfigured          |
+| `update_peers_phase`| TimingConfigured/Peers    | PeersConfigured           |
+| `add_stream`        | Timing/Peers/Stream/Rec/Paused | StreamConfigured or preserves Rec/Paused |
+| `remove_stream`     | any (no-op if missing)    | preserves phase while streams remain; otherwise Timing/Peers |
+| `begin_recording`   | StreamConfigured/Rec/Paused| Recording                |
+| `pause`             | StreamConfigured/Rec/Paused| Paused                   |
+| `resume`            | StreamConfigured/Paused/Rec | Recording               |
+| `begin_teardown`    | any except Closed         | TearingDown               |
+| `close`             | TearingDown               | Closed                    |
+| `clear_sensitive`   | any                       | zeros all keys            |
+
+### Error responses
+
+Invalid phase requests return `455 Method Not Valid in This State`
+with a diagnostic `X-Reason` header.  The session state is never
+mutated on error — all validation happens before any side-effect.
+
+### Integration
+
+`RtspSession` embeds a single `ap2: Ap2SessionState` field replacing
+the previously scattered `ap2_timing_protocol`, `ap2_streams`,
+`ap2_group_uuid`, `group_contains_group_leader`, `dacp_id`,
+`active_remote`, and `session_key` fields.  Listener handles, ports,
+and `is_playback_owner` remain on `RtspSession` because AP1 also uses them.
+
+`perform_connection_cleanup` clears the session's AP2 secrets via
+`clear_sensitive()` and aborts all listeners.  Non-owner cleanup
+never clears another session's global playback state but always
+clears its own AP2 secrets.
 
 ## Timing protocol support
 
