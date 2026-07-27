@@ -54,11 +54,7 @@ impl Tlv {
             .map(|(ty, values)| {
                 let joined_len: usize = values.iter().map(Vec::len).sum();
                 let fragments = values.len();
-                let first = values.first().map(Vec::as_slice).unwrap_or_default();
-                format!(
-                    "{ty}:frags={fragments},len={joined_len},first={}",
-                    hex_prefix(first, 12)
-                )
+                format!("{ty}:frags={fragments},len={joined_len}")
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -87,19 +83,6 @@ impl Tlv {
         }
         out
     }
-}
-
-fn hex_prefix(bytes: &[u8], limit: usize) -> String {
-    let mut out = bytes
-        .iter()
-        .take(limit)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("");
-    if bytes.len() > limit {
-        out.push_str("...");
-    }
-    out
 }
 
 #[cfg(test)]
@@ -187,7 +170,9 @@ mod tests {
         tlv.insert(1, b"hello");
         tlv.insert(3, vec![0x42u8; 300]);
         let summary = Tlv::parse(&tlv.encode()).debug_summary();
-        assert!(summary.contains("1:frags=1,len=5,first=68656c6c6f"));
-        assert!(summary.contains("3:frags=2,len=300,first=424242424242424242424242..."));
+        assert!(summary.contains("1:frags=1,len=5"));
+        assert!(summary.contains("3:frags=2,len=300"));
+        assert!(!summary.contains("68656c6c6f"));
+        assert!(!summary.contains("42424242"));
     }
 }

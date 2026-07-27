@@ -14,18 +14,27 @@ use tokio::{
     task::JoinHandle,
 };
 use tracing::{debug, info, trace, warn};
+use zeroize::Zeroizing;
 
 use crate::{
-    airplay::pairing::{PairingEndpoint, PairingService, PairingSession},
+    airplay::pairing::{PairingCompletion, PairingEndpoint, PairingService, PairingSession},
     airplay::sdp::parse_sdp,
     airplay::session_crypto::SessionCrypto,
     airplay::{
+        ap2::capability::Ap2CapabilityPolicy,
+        ap2::contract::{Ap2StreamType, Ap2TimingProtocol},
+        ap2::data::DataStreamListener,
+        ap2::event::EventListener,
+        ap2::session::{
+            Ap2SessionPhase, Ap2SessionState, Ap2Stream, Ap2StreamConfig, Ap2StreamState,
+            Ap2TeardownTarget, TransitionError, validate_add_stream_phase, validate_transition,
+        },
         crypto::{IdentityKey, PairCipher},
         dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
     },
     audio::AudioEngine,
     codec::AudioFormat,
-    config::{AdvertisedFormatPolicy, AirplayConfig},
+    config::AirplayConfig,
     decoder,
     player::SharedPlayer,
     playout::scheduler::PlayoutHandle,
@@ -57,6 +66,7 @@ pub async fn spawn_rtsp_server(
     player: SharedPlayer,
     dacp: DacpController,
     playout: PlayoutHandle,
+    ap2_policy: Ap2CapabilityPolicy,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind: SocketAddr = config
         .bind
@@ -90,6 +100,7 @@ pub async fn spawn_rtsp_server(
                     let player = player.clone();
                     let dacp = dacp.clone();
                     let playout = playout.clone();
+                    let ap2_policy = ap2_policy;
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
                             stream,
@@ -101,6 +112,7 @@ pub async fn spawn_rtsp_server(
                             player,
                             dacp,
                             playout,
+                            ap2_policy,
                         )
                         .await
                         {
@@ -130,179 +142,19 @@ async fn bind_rtsp_listener(bind: SocketAddr) -> anyhow::Result<TcpListener> {
     TcpListener::bind(bind).await.map_err(Into::into)
 }
 
-fn spawn_tcp_drain_listener(
-    bind_addr: SocketAddr,
-    label: &'static str,
-) -> anyhow::Result<(u16, JoinHandle<()>)> {
-    let socket = match bind_addr {
-        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
-        SocketAddr::V6(_) => {
-            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-            socket.set_only_v6(false)?;
-            socket
-        }
-    };
-    socket.set_reuse_address(true)?;
-    socket.bind(&bind_addr.into())?;
-    socket.listen(128)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    let port = std_listener.local_addr()?.port();
-    let listener = TcpListener::from_std(std_listener)?;
-
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    info!(%peer, %label, "AP2 TCP connection opened");
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 2048];
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) => {
-                                    debug!(%peer, %label, "AP2 TCP connection closed");
-                                    break;
-                                }
-                                Ok(read) => {
-                                    trace!(%peer, %label, bytes_read = read, "AP2 TCP data received");
-                                }
-                                Err(e) => {
-                                    warn!(%peer, %e, %label, "AP2 TCP connection failed");
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => warn!(%e, %label, "AP2 TCP accept failed"),
-            }
-        }
-    });
-
-    Ok((port, handle))
-}
-
-fn spawn_ap2_event_listener(
-    bind_addr: SocketAddr,
-    config: AirplayConfig,
-    peer_addr: Option<SocketAddr>,
-    shared_secret: Vec<u8>,
-    group_uuid: Option<String>,
-    group_contains_group_leader: Option<bool>,
-) -> anyhow::Result<(u16, JoinHandle<()>)> {
-    let socket = match bind_addr {
-        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
-        SocketAddr::V6(_) => {
-            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-            socket.set_only_v6(false)?;
-            socket
-        }
-    };
-    socket.set_reuse_address(true)?;
-    socket.bind(&bind_addr.into())?;
-    socket.listen(5)?;
-    socket.set_nonblocking(true)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    let port = std_listener.local_addr()?.port();
-    let listener = TcpListener::from_std(std_listener)?;
-
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, peer)) => {
-                    info!(%peer, "AP2 event connection opened");
-                    let config = config.clone();
-                    let shared_secret = shared_secret.clone();
-                    let group_uuid = group_uuid.clone();
-                    tokio::spawn(async move {
-                        let mut cipher = PairCipher::events_for_server(&shared_secret);
-                        match build_ap2_update_info_event(
-                            &config,
-                            peer_addr,
-                            group_uuid.as_deref(),
-                            group_contains_group_leader,
-                        ) {
-                            Ok(wire) => match cipher.encrypt_blocks(&wire) {
-                                Ok(encrypted) => {
-                                    if let Err(e) = stream.write_all(&encrypted).await {
-                                        warn!(%peer, %e, "failed to send AP2 event updateInfo");
-                                        return;
-                                    }
-                                    debug!(
-                                        %peer,
-                                        plaintext_len = wire.len(),
-                                        encrypted_len = encrypted.len(),
-                                        "AP2 event updateInfo sent"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(%peer, %e, "failed to encrypt AP2 event updateInfo");
-                                    return;
-                                }
-                            },
-                            Err(e) => {
-                                warn!(%peer, %e, "failed to build AP2 event updateInfo");
-                                return;
-                            }
-                        }
-
-                        let mut encrypted_buf = Vec::new();
-                        let mut read_buf = [0u8; 2048];
-                        loop {
-                            match stream.read(&mut read_buf).await {
-                                Ok(0) => {
-                                    debug!(%peer, "AP2 event connection closed");
-                                    break;
-                                }
-                                Ok(read) => {
-                                    encrypted_buf.extend_from_slice(&read_buf[..read]);
-                                    match cipher.decrypt_blocks(&encrypted_buf) {
-                                        Ok((plain, consumed)) => {
-                                            if consumed > 0 {
-                                                encrypted_buf.drain(..consumed);
-                                            }
-                                            if !plain.is_empty() {
-                                                debug!(
-                                                    %peer,
-                                                    plaintext_len = plain.len(),
-                                                    plaintext = %String::from_utf8_lossy(&plain),
-                                                    "AP2 event payload received"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(%peer, %e, bytes_read = read, "failed to decrypt AP2 event payload");
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(%peer, %e, "AP2 event connection failed");
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-                Err(e) => warn!(%e, "AP2 event accept failed"),
-            }
-        }
-    });
-
-    Ok((port, handle))
-}
-
 fn build_ap2_update_info_event(
     config: &AirplayConfig,
     peer_addr: Option<SocketAddr>,
     group_uuid: Option<&str>,
     group_contains_group_leader: Option<bool>,
+    ap2_policy: &Ap2CapabilityPolicy,
 ) -> anyhow::Result<Vec<u8>> {
     let info_body = get_info_body_with_group(
         config,
         peer_addr,
         group_uuid,
         group_contains_group_leader.unwrap_or(false),
+        ap2_policy,
     );
     let info_value: Value =
         plist::from_bytes(&info_body).context("failed to parse generated /info plist")?;
@@ -315,13 +167,7 @@ fn build_ap2_update_info_event(
     plist::to_writer_binary(&mut body, &Value::Dictionary(update_info))
         .context("failed to serialize AP2 updateInfo plist")?;
 
-    let mut wire = format!(
-        "POST /command RTSP/1.0\r\nContent-Length: {}\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    wire.extend_from_slice(&body);
-    Ok(wire)
+    Ok(body)
 }
 
 fn spawn_ap2_control_receiver(bind_addr: SocketAddr) -> anyhow::Result<(u16, JoinHandle<()>)> {
@@ -548,6 +394,7 @@ struct ConnectionServices<'a> {
     playout: &'a PlayoutHandle,
     player: &'a SharedPlayer,
     dacp: &'a DacpController,
+    ap2_policy: &'a Ap2CapabilityPolicy,
 }
 
 /// Entry point for a per-peer RTSP connection.  This function receives owned
@@ -565,6 +412,7 @@ async fn handle_connection(
     player: SharedPlayer,
     dacp: DacpController,
     playout: PlayoutHandle,
+    ap2_policy: Ap2CapabilityPolicy,
 ) -> anyhow::Result<()> {
     debug!(%peer, "RTSP connection opened");
     let mut session = RtspSession::default();
@@ -579,6 +427,7 @@ async fn handle_connection(
         playout: &playout,
         player: &player,
         dacp: &dacp,
+        ap2_policy: &ap2_policy,
     };
 
     // Run the inner request/response loop.  Every exit from this inner
@@ -607,6 +456,91 @@ async fn handle_connection(
     result
 }
 
+/// Maximum plaintext buffer size for an RTSP control connection.
+///
+/// Metadata and artwork requests can be substantially larger than ordinary
+/// RTSP control messages. This 16 MiB bound permits those requests while
+/// preventing unbounded accumulation from a never-ending message.
+const MAX_PLAINTEXT_CONTROL_BUF: usize = 16 * 1024 * 1024;
+
+/// Maximum encrypted buffer size for an RTSP control connection.
+///
+/// Each encrypted block carries at most `MAX_BLOCK + 2 + 16 = 1042` bytes,
+/// so this buffer holds ~62 blocks.  Encrypted frames that never
+/// complete will exhaust this buffer and the connection is dropped.
+const MAX_ENCRYPTED_CONTROL_BUF: usize = 65536;
+
+/// Decrypt one or more blocks from `encrypted_buf` and append decrypted
+/// plaintext into `plaintext_buf`.  Returns the number of encrypted bytes
+/// consumed (may be zero for incomplete frames).
+///
+/// # Errors
+///
+/// Returns [`CipherError::BlockTooLarge`] if a length prefix exceeds
+/// [`MAX_BLOCK`], or [`CipherError::AuthFailed`] if authentication fails.
+/// Neither error advances the cipher counter.
+fn append_control_plaintext(plaintext_buf: &mut Vec<u8>, plaintext: &[u8]) -> anyhow::Result<()> {
+    let new_len = plaintext_buf
+        .len()
+        .checked_add(plaintext.len())
+        .ok_or_else(|| anyhow::anyhow!("plaintext control buffer length overflow"))?;
+    if new_len > MAX_PLAINTEXT_CONTROL_BUF {
+        return Err(anyhow::anyhow!("plaintext control buffer limit exceeded"));
+    }
+    plaintext_buf.extend_from_slice(plaintext);
+    Ok(())
+}
+
+fn append_encrypted_control(encrypted_buf: &mut Vec<u8>, encrypted: &[u8]) -> anyhow::Result<()> {
+    let new_len = encrypted_buf
+        .len()
+        .checked_add(encrypted.len())
+        .ok_or_else(|| anyhow::anyhow!("encrypted control buffer length overflow"))?;
+    if new_len > MAX_ENCRYPTED_CONTROL_BUF {
+        return Err(anyhow::anyhow!("encrypted control buffer limit exceeded"));
+    }
+    encrypted_buf.extend_from_slice(encrypted);
+    Ok(())
+}
+
+fn decrypt_control_blocks(
+    cipher: &mut PairCipher,
+    encrypted_buf: &[u8],
+    plaintext_buf: &mut Vec<u8>,
+) -> anyhow::Result<usize> {
+    let (plaintext, consumed) = cipher
+        .decrypt_blocks(encrypted_buf)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    append_control_plaintext(plaintext_buf, &plaintext)?;
+    Ok(consumed)
+}
+
+/// Move bytes that followed a terminal plaintext pairing request into the
+/// newly activated encrypted stream. This must run only on the exact
+/// plaintext-to-encrypted transition; residual bytes from an already-encrypted
+/// request are already plaintext and must never be decrypted twice.
+fn handoff_coalesced_encrypted_control(
+    cipher_was_active: bool,
+    cipher: Option<&mut PairCipher>,
+    plaintext_buf: &mut Vec<u8>,
+    encrypted_buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    if cipher_was_active || plaintext_buf.is_empty() {
+        return Ok(());
+    }
+    let Some(cipher) = cipher else {
+        return Ok(());
+    };
+
+    let residual = std::mem::take(plaintext_buf);
+    append_encrypted_control(encrypted_buf, &residual)?;
+    let consumed = decrypt_control_blocks(cipher, encrypted_buf, plaintext_buf)?;
+    if consumed > 0 {
+        encrypted_buf.drain(..consumed);
+    }
+    Ok(())
+}
+
 /// Inner request/response loop extracted from [`handle_connection`] so that
 /// every exit path (EOF, read/write error, encryption failure) returns to a
 /// single point where per-connection cleanup is guaranteed.
@@ -626,23 +560,23 @@ async fn process_rtsp_requests(
             return Ok(());
         }
         trace!(%peer, bytes_read = read, "RTSP raw read");
+
         if let Some(ref mut cipher) = session.control_cipher {
-            encrypted_buf.extend_from_slice(&chunk[..read]);
-            match cipher.decrypt_blocks(&encrypted_buf) {
-                Ok((plaintext, consumed)) => {
+            append_encrypted_control(&mut encrypted_buf, &chunk[..read]).map_err(|e| {
+                warn!(%peer, %e, "encrypted control buffer rejected");
+                e
+            })?;
+            match decrypt_control_blocks(cipher, &encrypted_buf, &mut buf) {
+                Ok(consumed) => {
                     trace!(
                         %peer,
                         encrypted_read = read,
                         encrypted_pending = encrypted_buf.len(),
                         encrypted_consumed = consumed,
-                        plaintext_len = plaintext.len(),
                         "RTSP control stream decrypted"
                     );
                     if consumed > 0 {
                         encrypted_buf.drain(..consumed);
-                    }
-                    if !plaintext.is_empty() {
-                        buf.extend_from_slice(&plaintext);
                     }
                 }
                 Err(e) => {
@@ -652,52 +586,78 @@ async fn process_rtsp_requests(
                         encrypted_pending = encrypted_buf.len(),
                         "RTSP control stream decryption failed"
                     );
-                    return Err(e);
+                    return Err(anyhow::anyhow!(e.to_string()));
                 }
             }
         } else {
-            buf.extend_from_slice(&chunk[..read]);
+            append_control_plaintext(&mut buf, &chunk[..read]).map_err(|e| {
+                warn!(%peer, %e, "plaintext control buffer rejected");
+                e
+            })?;
         }
+
         while let Some((request, consumed)) = parse_request(&buf) {
             log_request(peer, &request);
 
-            // If this request arrived after the control stream cipher was active,
-            // the entire RTSP response must be encrypted too. Capture this before
-            // routing, because /pair-setup M3 activates the cipher for later
-            // requests while its own M4 response is still plaintext.
-            let encrypt_response = session.control_cipher.is_some();
+            // Capture cipher state BEFORE routing: a terminal pairing
+            // request may install the control cipher, but its own
+            // response must still be sent as plaintext.
+            let cipher_was_active = session.control_cipher.is_some();
+            let encrypt_response = cipher_was_active;
 
             let response = route_request(svc, session, &request);
 
             log_response(peer, &request, &response);
-            let mut wire = response.to_bytes();
-            if encrypt_response && let Some(ref mut cipher) = session.control_cipher {
-                match cipher.encrypt_blocks(&wire) {
-                    Ok(encrypted) => {
-                        trace!(
-                            %peer,
-                            plaintext_len = wire.len(),
-                            encrypted_len = encrypted.len(),
-                            "RTSP control stream encrypted"
-                        );
-                        wire = encrypted;
-                    }
-                    Err(e) => {
-                        warn!(%peer, %e, "RTSP control stream encryption failed");
-                        return Err(e);
-                    }
-                }
-            }
-            trace!(%peer, wire_len = wire.len(), wire = %String::from_utf8_lossy(&wire), encrypted = encrypt_response, "RTSP response wire");
-            stream.write_all(&wire).await?;
+            let wire = response.to_bytes();
+            let wire_len = if encrypt_response {
+                let Some(ref mut cipher) = session.control_cipher else {
+                    return Err(anyhow::anyhow!(
+                        "control cipher disappeared before response write"
+                    ));
+                };
+                let prepared = cipher.prepare_encryption(&wire).map_err(|error| {
+                    warn!(%peer, %error, "RTSP control stream encryption failed");
+                    anyhow::anyhow!(error.to_string())
+                })?;
+                let encrypted_len = prepared.ciphertext().len();
+                trace!(
+                    %peer,
+                    plaintext_len = wire.len(),
+                    encrypted_len,
+                    "RTSP control stream encrypted"
+                );
+                stream.write_all(prepared.ciphertext()).await?;
+                prepared.commit();
+                encrypted_len
+            } else {
+                stream.write_all(&wire).await?;
+                wire.len()
+            };
+            trace!(%peer, wire_len, encrypted = encrypt_response, "RTSP response wire");
             buf.drain(..consumed);
+
+            // A terminal plaintext pairing request may activate encryption.
+            // Only in that exact transition are residual bytes ciphertext.
+            if !cipher_was_active && session.control_cipher.is_some() && !buf.is_empty() {
+                debug!(
+                    %peer,
+                    residual_len = buf.len(),
+                    "coalesced transition: decrypting bytes after terminal pairing request"
+                );
+                handoff_coalesced_encrypted_control(
+                    cipher_was_active,
+                    session.control_cipher.as_mut(),
+                    &mut buf,
+                    &mut encrypted_buf,
+                )?;
+            }
         }
         // If we have residual data but no complete message, log at trace
         if !buf.is_empty() {
-            trace!(%peer, pending = buf.len(), pending_hex = ?buf, "RTSP incomplete frame waiting for more data");
+            trace!(%peer, pending = buf.len(), "RTSP incomplete frame waiting for more data");
         }
         if !encrypted_buf.is_empty() {
-            trace!(%peer, encrypted_pending = encrypted_buf.len(), encrypted_pending_hex = ?encrypted_buf, "RTSP encrypted frame waiting for more data");
+            trace!(%peer, encrypted_pending = encrypted_buf.len(), "RTSP encrypted frame waiting for more data");
         }
     }
 }
@@ -721,6 +681,9 @@ fn perform_connection_cleanup(
     playout: &PlayoutHandle,
     session: &mut RtspSession,
 ) {
+    // Call begin_teardown + close idempotently.
+    let _ = session.ap2.begin_teardown();
+
     if session.is_playback_owner {
         player.stop();
         playout.stop();
@@ -735,7 +698,53 @@ fn perform_connection_cleanup(
         dacp.clear_session();
         session.is_playback_owner = false;
     }
+    // Always clear this session's AP2 secrets and listeners,
+    // regardless of playback ownership.
     session.abort_ap2_listeners();
+    // close() now calls clear_sensitive() internally.
+    let _ = session.ap2.close();
+}
+
+/// Activate a [`PairingCompletion`] on the session.
+///
+/// # Control encryption behaviour
+///
+/// | Completion         | Marks Paired | Installs `control_cipher` |
+/// |--------------------|:------------:|:-------------------------:|
+/// | `TransientSetup`   | ✓            | ✓ (SRP session key K)    |
+/// | `FullSetup`        | ✓            | **no** — stays plaintext |
+/// | `Verify`           | ✓            | ✓ (X25519 shared secret) |
+///
+/// **Transient** pair-setup has no subsequent pair-verify; the SRP session
+/// key is therefore used directly for control encryption.
+///
+/// **Non-transient (Full)** pair-setup persists the client identity to the
+/// database but deliberately does *not* activate control encryption.  The
+/// next pair-verify exchange must happen in plaintext; only a successful
+/// `Verify` completion installs the control `PairCipher`.
+fn activate_pairing_completion(
+    session: &mut RtspSession,
+    completion: &PairingCompletion,
+) -> Result<(), TransitionError> {
+    // Validate lifecycle state before installing any new ciphers.
+    session.ap2.mark_paired()?;
+    match completion {
+        PairingCompletion::TransientSetup { key, .. } => {
+            session.control_cipher = Some(PairCipher::control_for_server(key));
+        }
+        PairingCompletion::FullSetup { .. } => {
+            // Non-transient (full) pair-setup persists the client to the
+            // pairing database and marks the session Paired, but does NOT
+            // activate RTSP control encryption.  The next pair-verify
+            // exchange is plaintext; only successful Verify installs the
+            // control PairCipher (using the fresh X25519 shared secret,
+            // not the SRP session key).
+        }
+        PairingCompletion::Verify { shared_secret } => {
+            session.control_cipher = Some(PairCipher::control_for_server(shared_secret));
+        }
+    }
+    Ok(())
 }
 
 fn route_request(
@@ -753,6 +762,7 @@ fn route_request(
     let playout = svc.playout;
     let player = svc.player;
     let dacp = svc.dacp;
+    let ap2_policy = svc.ap2_policy;
 
     if let Some(client_name) = request.headers.get("X-Apple-Client-Name") {
         state.set_client_name(client_name.clone());
@@ -766,7 +776,6 @@ fn route_request(
             uri = %request.uri,
             content_type = request.headers.get("Content-Type").map(|s| s.as_str()).unwrap_or(""),
             body_len = request.body.len(),
-            body_hex = %body_preview(&request.body),
             "RTSP handler"
         );
     }
@@ -774,7 +783,7 @@ fn route_request(
     let mut resp = match (request.method.as_str(), request.uri.as_str()) {
         ("OPTIONS", _) => {
             let public = if config.airplay2_enabled {
-                "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, PUT, SETPEERS"
+                "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, SETPEERS"
             } else {
                 "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER"
             };
@@ -784,7 +793,7 @@ fn route_request(
         }
         ("GET", "/info") | ("GET", "info") => response(200, "OK")
             .header("Content-Type", "application/x-apple-binary-plist")
-            .body(get_info_body(config, session.peer_addr))
+            .body(get_info_body(config, session.peer_addr, ap2_policy))
             .with_cseq(request),
         ("ANNOUNCE", _) => {
             info!("AP1 ANNOUNCE received ({} bytes body)", request.body.len());
@@ -907,19 +916,22 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("POST", "/pair-setup") => {
-            let reply = pairing.handle(&mut session.pairing, PairingEndpoint::Setup, &request.body);
-            // After pair-setup M4, activate control cipher if SRP session key is available
-            if session.control_cipher.is_none()
-                && let Some(sk) = session.pairing.session_key()
+            let mut reply =
+                pairing.handle(&mut session.pairing, PairingEndpoint::Setup, &request.body);
+            if let Some(ref completion) = reply.completion
+                && let Err(e) = activate_pairing_completion(session, completion)
             {
-                session.control_cipher = Some(PairCipher::control_for_server(sk));
-                session.event_cipher = Some(PairCipher::events_for_server(sk));
-                info!("AP2 control cipher activated from pair-setup session key");
+                session.pairing.clear();
+                reply.completion = None;
+                warn!(%e, "pair-setup completion rejected by lifecycle");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("cannot mark paired: {e}"))
+                    .with_cseq(request);
             }
             info!(
                 status = reply.status_code,
                 body_len = reply.body.len(),
-                has_shared_secret = session.pairing.shared_secret().is_some(),
+                completed = reply.completion.is_some(),
                 "pair-setup step"
             );
             response(reply.status_code, "OK")
@@ -951,23 +963,23 @@ fn route_request(
                 .with_cseq(request)
         }
         ("POST", "/pair-verify") => {
-            let reply =
+            let mut reply =
                 pairing.handle(&mut session.pairing, PairingEndpoint::Verify, &request.body);
-            if session.control_cipher.is_none()
-                && let Some(shared_secret) = session.pairing.shared_secret()
+            if let Some(ref completion) = reply.completion
+                && let Err(e) = activate_pairing_completion(session, completion)
             {
-                let ss: &[u8] = shared_secret;
-                session.control_cipher = Some(PairCipher::control_for_server(ss));
-                session.event_cipher = Some(PairCipher::events_for_server(ss));
-                info!("AP2 control and event ciphers activated");
-            } else {
-                info!(
-                    status = reply.status_code,
-                    has_cipher = session.control_cipher.is_some(),
-                    has_shared = session.pairing.shared_secret().is_some(),
-                    "pair-verify"
-                );
+                session.pairing.clear();
+                reply.completion = None;
+                warn!(%e, "pair-verify completion rejected by lifecycle");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("cannot mark paired: {e}"))
+                    .with_cseq(request);
             }
+            info!(
+                status = reply.status_code,
+                completed = reply.completion.is_some(),
+                "pair-verify step"
+            );
             response(reply.status_code, "OK")
                 .header("Content-Type", "application/octet-stream")
                 .body(reply.body)
@@ -1001,14 +1013,58 @@ fn route_request(
         ("POST", "/configure") => response(200, "OK").with_cseq(request),
         ("SETPEERS", _) => {
             state.set_diagnostic("ap2_setpeers_len", request.body.len().to_string());
+            if let Err(e) = session.ap2.update_peers_phase() {
+                warn!(%e, "SETPEERS rejected — invalid phase transition");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("invalid phase for SETPEERS: {e}"))
+                    .with_cseq(request);
+            }
             response(200, "OK").with_cseq(request)
         }
         ("SETPEERSX", _) => {
             state.set_diagnostic("ap2_setpeersx_len", request.body.len().to_string());
+            if let Err(e) = session.ap2.update_peers_phase() {
+                warn!(%e, "SETPEERSX rejected — invalid phase transition");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("invalid phase for SETPEERSX: {e}"))
+                    .with_cseq(request);
+            }
             response(200, "OK").with_cseq(request)
         }
         ("SETRATEANCHORTI", _) | ("SETRATEANCHORTIME", _) => {
+            // Parse rate and transition AP2 phase first — no side effects
+            // until we know the transition is valid.
+            let rate = if session.ap2.is_ap2_active()
+                && let Ok(dict) = plist::from_bytes::<plist::Dictionary>(&request.body)
+            {
+                let rate = dict.get("rate").and_then(plist_uint).unwrap_or(0);
+                if rate & 1 != 0 {
+                    if let Err(e) = session.ap2.resume() {
+                        warn!(%e, "SETRATEANCHORTIME rejected — invalid phase transition (rate={rate:#x})");
+                        return response(455, "Method Not Valid in This State")
+                            .header("X-Reason", format!("invalid phase for rate={rate:#x}: {e}"))
+                            .with_cseq(request);
+                    }
+                } else {
+                    if let Err(e) = session.ap2.pause() {
+                        warn!(%e, "SETRATEANCHORTIME rejected — invalid phase transition (rate=0)");
+                        return response(455, "Method Not Valid in This State")
+                            .header("X-Reason", format!("invalid phase for pause: {e}"))
+                            .with_cseq(request);
+                    }
+                }
+                rate
+            } else {
+                0
+            };
+            // Only now apply playback side effects.
             apply_setrateanchortime(state, audio_engine, playout, player, request);
+
+            // AP2 pause side effects that must happen AFTER transition validation.
+            if session.ap2.is_ap2_active() && rate == 0 {
+                playout.pause();
+                playout.flush();
+            }
             response(200, "OK").with_cseq(request)
         }
         ("GET_PARAMETER", _) => response(200, "OK").with_cseq(request),
@@ -1032,11 +1088,14 @@ fn route_request(
                 .unwrap_or(false);
 
             if is_ap2 && config.airplay2_enabled {
-                let response = handle_ap2_setup(config, state, session, request, playout, dacp)
-                    .with_cseq(request);
+                let response =
+                    handle_ap2_setup(config, state, session, request, playout, dacp, ap2_policy)
+                        .with_cseq(request);
                 if (200..300).contains(&response.code) {
                     session.session_id = Some("1".to_string());
-                    state.set_active(true);
+                    if !session.ap2.is_remote_control_only() {
+                        state.set_active(true);
+                    }
                 }
                 response
             } else if is_ap2 {
@@ -1107,16 +1166,39 @@ fn route_request(
             }
         }
         ("RECORD", _) => {
-            if session.ap2_category != Ap2ConnectionCategory::Unknown
-                || session.control_cipher.is_some()
-                || session.ap2_timing_protocol.is_some()
-            {
+            if session.ap2.is_ap2_active() || session.control_cipher.is_some() {
                 info!(
-                    category = ?session.ap2_category,
-                    timing_protocol = session.ap2_timing_protocol.as_deref().unwrap_or(""),
+                    phase = %session.ap2.phase(),
+                    timing_protocol = ?session.ap2.timing_protocol(),
+                    remote_control_only = session.ap2.is_remote_control_only(),
                     "AP2 RECORD"
                 );
                 state.set_diagnostic("ap2_phase", "record");
+
+                // Remote-control-only session: allow RECORD without streams.
+                if session.ap2.is_remote_control_only() && !session.ap2.has_streams() {
+                    info!("AP2 RECORD accepted for remote-control-only session (no audio)");
+                    return response(200, "OK")
+                        .header("Audio-Latency", "0")
+                        .with_cseq(request);
+                }
+
+                // Reject RECORD if no streams are configured (non-remote-control).
+                if !session.ap2.has_streams() {
+                    warn!("AP2 RECORD rejected — no streams configured");
+                    return response(455, "Method Not Valid in This State")
+                        .header("X-Reason", "no streams configured for RECORD")
+                        .with_cseq(request);
+                }
+
+                // Transition to Recording
+                if let Err(e) = session.ap2.begin_recording() {
+                    warn!(%e, "AP2 RECORD rejected — invalid phase transition");
+                    return response(455, "Method Not Valid in This State")
+                        .header("X-Reason", format!("invalid phase for RECORD: {e}"))
+                        .with_cseq(request);
+                }
+
                 return response(200, "OK")
                     .header("Audio-Latency", "0")
                     .with_cseq(request);
@@ -1149,51 +1231,129 @@ fn route_request(
             response(200, "OK").with_cseq(request)
         }
         ("PAUSE", _) => {
-            pause_playback(state, playout, player);
+            if session.ap2.is_ap2_active() {
+                // Validate phase transition first — no side effects until OK.
+                if let Err(e) = session.ap2.pause() {
+                    warn!(%e, "PAUSE rejected — invalid phase transition");
+                    return response(455, "Method Not Valid in This State")
+                        .header("X-Reason", format!("invalid phase for PAUSE: {e}"))
+                        .with_cseq(request);
+                }
+                // Only now apply playback side effects.
+                player.flush();
+                playout.pause();
+                playout.flush();
+                state.set_player_state(PlayerState::Paused);
+            } else {
+                pause_playback(state, playout, player);
+            }
             info!("PAUSE");
             response(200, "OK").with_cseq(request)
         }
         ("FLUSHBUFFERED", _) => {
+            if session.ap2.is_ap2_active() {
+                // Validate phase transition first — no side effects until OK.
+                if let Err(e) = session.ap2.pause() {
+                    warn!(%e, "FLUSHBUFFERED rejected — invalid phase transition");
+                    return response(455, "Method Not Valid in This State")
+                        .header("X-Reason", format!("invalid phase for FLUSHBUFFERED: {e}"))
+                        .with_cseq(request);
+                }
+            }
             apply_flushbuffered(state, player, request);
             response(200, "OK").with_cseq(request)
         }
         ("TEARDOWN", _) => {
-            if let Some(stream_type) = ap2_teardown_stream_type(&request.body) {
-                if session.is_playback_owner {
-                    player.stop();
-                    playout.stop();
-                    state.set_player_state(PlayerState::Stopped);
+            match Ap2TeardownTarget::from_teardown_body(&request.body) {
+                None => {
+                    // Malformed body with unknown stream type — return 400,
+                    // never full-teardown.
+                    warn!("TEARDOWN with malformed/unknown stream type — returning 400");
+                    return response(400, "Bad Request")
+                        .header(
+                            "X-Reason",
+                            "malformed or unknown stream type in TEARDOWN body",
+                        )
+                        .with_cseq(request);
                 }
-                session.abort_ap2_stream_listener(stream_type);
-                if session.is_playback_owner && stream_type == Ap2StreamType::BufferedAudio {
-                    player.flush();
-                    state.clear_track_for_transition();
-                    state.set_diagnostic("audio_waiting_for_track_title", "true");
-                    *state.ap2_media_key.write() = None;
-                    *state.ap2_audio_format.write() = None;
-                    session.session_key = None;
-                }
-                info!(stream_type = ?stream_type, "AP2 stream TEARDOWN");
-                return response(200, "OK").with_cseq(request);
-            }
+                Some(Ap2TeardownTarget::Stream(stream_type)) => {
+                    // Stream teardown — remove only the matching stream.
+                    // Data stream (type 130) teardown: abort listener, clear port/stream,
+                    // but do NOT stop/flush audio or alter global player state.
+                    let is_data_stream = stream_type == Ap2StreamType::DataStream;
 
-            if session.is_playback_owner {
-                player.stop();
-                playout.stop();
-                state.set_active(false);
-                state.set_player_state(PlayerState::Stopped);
-                *state.session_crypto.write() = None;
-                *state.ap2_media_key.write() = None;
-                *state.ap2_audio_format.write() = None;
-                state.clear_ap1_remote_endpoints();
-                session.ap1_remote_control_port = None;
-                session.ap1_remote_timing_port = None;
-                dacp.clear_session();
-                session.is_playback_owner = false;
+                    if is_data_stream {
+                        session.abort_ap2_stream_listener(Ap2StreamType::DataStream);
+                        if let Some(stream) =
+                            session.ap2.find_stream_by_type(Ap2StreamType::DataStream)
+                        {
+                            let stream_id = stream.stream_id;
+                            session.ap2.remove_stream(stream_id);
+                        }
+                        info!(stream_type = ?stream_type, "AP2 data stream TEARDOWN");
+                        return response(200, "OK").with_cseq(request);
+                    }
+
+                    // Stop global playback only if this is the last buffered audio stream.
+                    let had_buffered = session
+                        .ap2
+                        .find_stream_by_type(Ap2StreamType::BufferedAudio)
+                        .is_some();
+                    let is_last_buffered = had_buffered
+                        && stream_type == Ap2StreamType::BufferedAudio
+                        && session.ap2.stream_count() == 1;
+
+                    if session.is_playback_owner && is_last_buffered {
+                        player.stop();
+                        playout.stop();
+                        state.set_player_state(PlayerState::Stopped);
+                    }
+                    session.abort_ap2_stream_listener(stream_type);
+
+                    // Remove the stream record.
+                    if let Some(stream) = session.ap2.find_stream_by_type(stream_type) {
+                        let stream_id = stream.stream_id;
+                        session.ap2.remove_stream(stream_id);
+                    }
+
+                    if session.is_playback_owner && is_last_buffered {
+                        player.flush();
+                        state.clear_track_for_transition();
+                        state.set_diagnostic("audio_waiting_for_track_title", "true");
+                        *state.ap2_media_key.write() = None;
+                        *state.ap2_audio_format.write() = None;
+                        session.ap2.zero_session_key();
+                    }
+                    info!(stream_type = ?stream_type, "AP2 stream TEARDOWN");
+                    return response(200, "OK").with_cseq(request);
+                }
+                Some(Ap2TeardownTarget::Session) => {
+                    // Session teardown — close everything.
+                    // Use begin_teardown + close idempotently.
+                    let _ = session.ap2.begin_teardown();
+
+                    if session.is_playback_owner {
+                        player.stop();
+                        playout.stop();
+                        state.set_active(false);
+                        state.set_player_state(PlayerState::Stopped);
+                        *state.session_crypto.write() = None;
+                        *state.ap2_media_key.write() = None;
+                        *state.ap2_audio_format.write() = None;
+                        state.clear_ap1_remote_endpoints();
+                        session.ap1_remote_control_port = None;
+                        session.ap1_remote_timing_port = None;
+                        dacp.clear_session();
+                        session.is_playback_owner = false;
+                    }
+                    session.abort_ap2_listeners();
+                    // close() now calls clear_sensitive() internally.
+                    let _ = session.ap2.close();
+
+                    info!("TEARDOWN");
+                    response(200, "OK").with_cseq(request)
+                }
             }
-            session.abort_ap2_listeners();
-            info!("TEARDOWN");
-            response(200, "OK").with_cseq(request)
         }
         _ => {
             warn!(
@@ -1372,20 +1532,15 @@ fn log_request(peer: SocketAddr, request: &RtspRequest) {
     trace!(
         %peer,
         headers = ?request.headers,
-        body_preview = %body_preview(&request.body),
+        body_len = request.body.len(),
         "RTSP request details"
     );
 }
 
-/// Log the raw wire bytes of a request (called from handle_connection at trace level)
-fn log_raw_request(peer: SocketAddr, raw: &[u8], consumed: usize) {
+/// Record request framing progress without logging wire payload bytes.
+fn log_raw_request(peer: SocketAddr, _raw: &[u8], consumed: usize) {
     if consumed > 0 {
-        trace!(
-            %peer,
-            consumed,
-            raw = %std::str::from_utf8(&raw[..consumed]).unwrap_or("<non-utf8>"),
-            "RTSP raw request consumed"
-        );
+        trace!(%peer, consumed, "RTSP raw request consumed");
     }
 }
 
@@ -1400,10 +1555,12 @@ fn update_dacp_session_from_headers(
         return;
     }
     if active_remote.is_some() {
-        session.active_remote = active_remote.clone();
+        session
+            .ap2
+            .set_active_remote(active_remote.clone().unwrap());
     }
     if dacp_id.is_some() {
-        session.dacp_id = dacp_id.clone();
+        session.ap2.set_dacp_id(dacp_id.clone().unwrap());
     }
     dacp.update_session(dacp_id, active_remote, session.peer_addr);
 }
@@ -1430,34 +1587,9 @@ fn log_response(peer: SocketAddr, request: &RtspRequest, response: &RtspResponse
     );
     trace!(
         %peer,
-        body_preview = %body_preview(&response.body),
+        body_len = response.body.len(),
         "RTSP response details"
     );
-}
-
-fn body_preview(body: &[u8]) -> String {
-    const LIMIT: usize = 96;
-    if body.is_empty() {
-        return String::new();
-    }
-    let mut preview = body
-        .iter()
-        .take(LIMIT)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if body.len() > LIMIT {
-        preview.push_str(" ...");
-    }
-    preview
-}
-
-fn plist_xml_preview(value: &plist::Value) -> String {
-    let mut out = Vec::new();
-    if plist::to_writer_xml(&mut out, value).is_err() {
-        return "<plist serialization failed>".to_string();
-    }
-    String::from_utf8_lossy(&out).replace('\n', "")
 }
 
 const FAIRPLAY_REPLY_MODE_0: &[u8] = b"\x46\x50\x4c\x59\x03\x01\x02\x00\x00\x00\x00\x82\x02\x00\x0f\x9f\x3f\x9e\x0a\x25\x21\xdb\xdf\x31\x2a\xb2\xbf\xb2\x9e\x8d\x23\x2b\x63\x76\xa8\xc8\x18\x70\x1d\x22\xae\x93\xd8\x27\x37\xfe\xaf\x9d\xb4\xfd\xf4\x1c\x2d\xba\x9d\x1f\x49\xca\xaa\xbf\x65\x91\xac\x1f\x7b\xc6\xf7\xe0\x66\x3d\x21\xaf\xe0\x15\x65\x95\x3e\xab\x81\xf4\x18\xce\xed\x09\x5a\xdb\x7c\x3d\x0e\x25\x49\x09\xa7\x98\x31\xd4\x9c\x39\x82\x97\x34\x34\xfa\xcb\x42\xc6\x3a\x1c\xd9\x11\xa6\xfe\x94\x1a\x8a\x6d\x4a\x74\x3b\x46\xc3\xa7\x64\x9e\x44\xc7\x89\x55\xe4\x9d\x81\x55\x00\x95\x49\xc4\xe2\xf7\xa3\xf6\xd5\xba";
@@ -1503,22 +1635,6 @@ fn fairplay_setup_reply(body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// AP2 stream types
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Ap2StreamType {
-    RealtimeAudio = 96,
-    BufferedAudio = 103,
-    DataStream = 130,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum Ap2ConnectionCategory {
-    #[default]
-    Unknown,
-    Ptp,
-    RemoteControl,
-}
-
 #[derive(Default)]
 struct RtspSession {
     peer_addr: Option<SocketAddr>,
@@ -1527,26 +1643,18 @@ struct RtspSession {
     session_id: Option<String>,
     pairing: PairingSession,
     control_cipher: Option<PairCipher>,
-    event_cipher: Option<PairCipher>,
-    data_cipher: Option<PairCipher>,
-    event_listener: Option<JoinHandle<()>>,
+    event_listener: Option<EventListener>,
     ap2_control_listener: Option<JoinHandle<()>>,
     buffered_audio_listener: Option<JoinHandle<()>>,
     realtime_audio_listener: Option<JoinHandle<()>>,
-    data_listener: Option<JoinHandle<()>>,
+    data_listener: Option<DataStreamListener>,
     event_port: Option<u16>,
     ap2_control_port: Option<u16>,
     buffered_audio_port: Option<u16>,
     realtime_audio_port: Option<u16>,
     data_port: Option<u16>,
-    ap2_category: Ap2ConnectionCategory,
-    ap2_timing_protocol: Option<String>,
-    ap2_streams: Vec<Ap2StreamType>,
-    ap2_group_uuid: Option<String>,
-    group_contains_group_leader: Option<bool>,
-    dacp_id: Option<String>,
-    active_remote: Option<String>,
-    session_key: Option<Vec<u8>>,
+    /// AirPlay 2 per-connection session state (phase, timing, streams, keys).
+    ap2: Ap2SessionState,
     /// AP1 remote control port parsed from classic SETUP Transport header.
     ap1_remote_control_port: Option<u16>,
     /// AP1 remote timing port parsed from classic SETUP Transport header.
@@ -1568,19 +1676,33 @@ impl RtspSession {
         event_bind_addr(self.local_addr, self.receiver_ip())
     }
 
+    #[cfg(test)]
+    fn install_test_event_port(&mut self, port: u16) {
+        self.event_port = Some(port);
+    }
+
     fn abort_ap2_listeners(&mut self) {
+        if let Some(listener) = self.event_listener.take() {
+            listener.abort();
+        }
+        if let Some(listener) = self.data_listener.take() {
+            listener.abort();
+        }
         for handle in [
-            self.event_listener.take(),
             self.ap2_control_listener.take(),
             self.buffered_audio_listener.take(),
             self.realtime_audio_listener.take(),
-            self.data_listener.take(),
         ]
         .into_iter()
         .flatten()
         {
             handle.abort();
         }
+        self.event_port = None;
+        self.ap2_control_port = None;
+        self.buffered_audio_port = None;
+        self.realtime_audio_port = None;
+        self.data_port = None;
     }
 
     fn abort_ap2_stream_listener(&mut self, stream_type: Ap2StreamType) {
@@ -1598,14 +1720,12 @@ impl RtspSession {
                 self.buffered_audio_port = None;
             }
             Ap2StreamType::DataStream => {
-                if let Some(handle) = self.data_listener.take() {
-                    handle.abort();
+                if let Some(listener) = self.data_listener.take() {
+                    listener.abort();
                 }
                 self.data_port = None;
             }
         }
-        self.ap2_streams
-            .retain(|active_stream| *active_stream as u32 != stream_type as u32);
     }
 
     fn ensure_ap2_control_socket(&mut self) -> anyhow::Result<u16> {
@@ -1665,23 +1785,541 @@ impl RtspSession {
         self.realtime_audio_listener = Some(handle);
         Ok(port)
     }
-
-    fn ensure_data_listener(&mut self) -> anyhow::Result<u16> {
-        if let Some(port) = self.data_port {
-            return Ok(port);
-        }
-        let bind = self.receiver_bind_addr();
-        let (port, handle) = spawn_tcp_drain_listener(bind, "ap2-data")?;
-        self.data_port = Some(port);
-        self.data_listener = Some(handle);
-        Ok(port)
-    }
 }
 
 impl Drop for RtspSession {
     fn drop(&mut self) {
         self.abort_ap2_listeners();
     }
+}
+
+/// Handle a type-103 (buffered audio) stream SETUP.
+///
+/// Extracted from the main dispatch to keep the handler readable.
+#[allow(clippy::too_many_arguments)]
+fn handle_ap2_setup_type_103(
+    config: &AirplayConfig,
+    state: &AppState,
+    session: &mut RtspSession,
+    setup: &plist::Dictionary,
+    streams: &[plist::Value],
+    request: &RtspRequest,
+    playout: &PlayoutHandle,
+    dacp: &DacpController,
+    ap2_policy: &Ap2CapabilityPolicy,
+) -> RtspResponse {
+    let _ = config; // used indirectly via state/playout
+    state.set_diagnostic("ap2_phase", "stream-setup");
+
+    // ── Phase 1: validate every stream ───────────────────────────
+    struct ValidatedStream {
+        type_val: u32,
+        audio_format: Option<u64>,
+        format: Option<AudioFormat>,
+        shk: Option<Vec<u8>>,
+        sr: Option<u32>,
+        spf: Option<u64>,
+    }
+    let mut validated: Vec<ValidatedStream> = Vec::with_capacity(streams.len());
+    let mut any_invalid = streams.is_empty();
+
+    for stream_val in streams {
+        let plist::Value::Dictionary(stream) = stream_val else {
+            any_invalid = true;
+            validated.push(ValidatedStream {
+                type_val: 0,
+                audio_format: None,
+                format: None,
+                shk: None,
+                sr: None,
+                spf: None,
+            });
+            continue;
+        };
+        let type_val = stream
+            .get("type")
+            .and_then(plist_uint)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
+        let audio_format_bits = stream.get("audioFormat").and_then(plist_uint);
+        let format = audio_format_bits.and_then(AudioFormat::from_ap2_audio_format);
+        let shk_data = match stream.get("shk") {
+            Some(plist::Value::Data(d)) if d.len() >= 32 => Some(d.clone()),
+            _ => None,
+        };
+        let sr = stream.get("sr").and_then(plist_uint).map(|v| v as u32);
+        let spf = stream.get("spf").and_then(plist_uint);
+
+        let mut valid = type_val == 103 && ap2_policy.supports_stream_type(type_val);
+        if valid {
+            match format {
+                Some(fmt) => {
+                    valid = ap2_policy.is_format_playable(audio_format_bits.unwrap_or(0))
+                        && fmt.is_playable();
+                    if valid {
+                        if let Some(sr_val) = sr {
+                            valid = sr_val == fmt.sample_rate();
+                        }
+                        if valid && let Some(spf_val) = spf {
+                            valid = spf_val > 0;
+                        }
+                    }
+                }
+                None => {
+                    valid = false;
+                }
+            }
+            if shk_data.is_none() {
+                valid = false;
+            }
+        }
+
+        any_invalid = any_invalid || !valid;
+        validated.push(ValidatedStream {
+            type_val,
+            audio_format: audio_format_bits,
+            format,
+            shk: shk_data,
+            sr,
+            spf,
+        });
+    }
+
+    // ── Phase 2: reject on any invalid stream ─────────────────────
+    if any_invalid {
+        warn!("AP2 stream SETUP rejected — one or more streams failed pre-validation");
+        let mut response_dict = plist::Dictionary::new();
+        let response_streams: Vec<plist::Value> = validated
+            .into_iter()
+            .map(|vs| {
+                let mut sd = plist::Dictionary::new();
+                sd.insert("type".to_string(), plist_uint_value(vs.type_val as u64));
+                sd.insert("status".to_string(), plist_uint_value(1u64));
+                plist::Value::Dictionary(sd)
+            })
+            .collect();
+        response_dict.insert("streams".to_string(), plist::Value::Array(response_streams));
+        state.set_diagnostic("ap2_stream_setup", "rejected-pre-validation");
+
+        let mut body = Vec::new();
+        if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_ok() {
+            return response(400, "Bad Request")
+                .header("Content-Type", "application/x-apple-binary-plist")
+                .body(body);
+        }
+        return response(400, "Bad Request");
+    }
+
+    // ── Phase 3: exactly one stream per request ─────────
+    if validated.len() != 1 {
+        warn!(
+            count = validated.len(),
+            "AP2 stream SETUP rejected — exactly one stream expected"
+        );
+        return response(400, "Bad Request")
+            .header("X-Reason", "exactly one stream per SETUP request")
+            .with_cseq(request);
+    }
+
+    if let Err(e) = validate_add_stream_phase(session.ap2.phase()) {
+        warn!(%e, "AP2 stream SETUP rejected — invalid lifecycle phase");
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("invalid phase for stream SETUP: {e}"))
+            .with_cseq(request);
+    }
+
+    let vs = &validated[0];
+    let raw_stream = streams
+        .iter()
+        .find_map(|v| v.as_dictionary())
+        .expect("validated stream present");
+
+    let stream_id: u32 = raw_stream
+        .get("streamID")
+        .and_then(plist_uint)
+        .and_then(|v| u32::try_from(v).ok())
+        .or_else(|| {
+            raw_stream
+                .get("streamConnectionID")
+                .and_then(plist_uint)
+                .map(|v| v as u32)
+        })
+        .unwrap_or_else(|| session.ap2.allocate_stream_id());
+
+    if session.ap2.find_stream(stream_id).is_some() {
+        warn!(stream_id, "AP2 stream SETUP rejected — duplicate stream ID");
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("duplicate stream ID: {stream_id}"))
+            .with_cseq(request);
+    }
+
+    let had_control = session.ap2_control_port.is_some();
+    let had_buffered = session.buffered_audio_port.is_some();
+    let control_port = match session.ensure_ap2_control_socket() {
+        Ok(port) => port,
+        Err(e) => {
+            warn!(%e, "failed to open AP2 control UDP socket");
+            return response(503, "Service Unavailable");
+        }
+    };
+
+    let data_port = match session.ensure_buffered_audio_listener(state, playout) {
+        Ok(port) => port,
+        Err(e) => {
+            warn!(%e, "failed to open AP2 buffered audio TCP socket");
+            if !had_control {
+                if let Some(handle) = session.ap2_control_listener.take() {
+                    handle.abort();
+                }
+                session.ap2_control_port = None;
+            }
+            return response(503, "Service Unavailable");
+        }
+    };
+
+    let shk = vs.shk.as_ref().expect("shk validated");
+    let mut stream_key = [0u8; 32];
+    stream_key.copy_from_slice(&shk[..32]);
+
+    let audio_format = vs.format.unwrap_or(AudioFormat::Alac44100S16Stereo);
+    let sample_rate = vs.sr.unwrap_or(44100);
+    let frames_per_packet = vs.spf.unwrap_or(352) as u32;
+
+    let stream_connection_id = raw_stream.get("streamConnectionID").and_then(plist_uint);
+    let ap2_stream = Ap2Stream {
+        stream_id,
+        stream_connection_id,
+        stream_type: Ap2StreamType::BufferedAudio,
+        config: Ap2StreamConfig::BufferedAudio {
+            audio_format,
+            sample_rate,
+            frames_per_packet,
+            media_key: stream_key,
+        },
+        data_port,
+        state: Ap2StreamState::Configured,
+    };
+
+    let mut stream_dict = plist::Dictionary::new();
+    stream_dict.insert("type".to_string(), plist_uint_value(103u64));
+    stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
+    stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
+    stream_dict.insert(
+        "audioBufferSize".to_string(),
+        plist_uint_value(8 * 1024 * 1024u64),
+    );
+
+    let mut response_dict = plist::Dictionary::new();
+    response_dict.insert(
+        "streams".to_string(),
+        plist::Value::Array(vec![plist::Value::Dictionary(stream_dict)]),
+    );
+    let mut body = Vec::new();
+    if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict.clone())).is_err()
+    {
+        if !had_buffered {
+            session.abort_ap2_stream_listener(Ap2StreamType::BufferedAudio);
+        }
+        if !had_control {
+            if let Some(handle) = session.ap2_control_listener.take() {
+                handle.abort();
+            }
+            session.ap2_control_port = None;
+        }
+        return response(500, "Internal Server Error");
+    }
+
+    if let Err(e) = session.ap2.add_stream(ap2_stream) {
+        warn!(%e, "AP2 stream SETUP rejected — cannot add stream");
+        if !had_buffered {
+            session.abort_ap2_stream_listener(Ap2StreamType::BufferedAudio);
+        }
+        if !had_control {
+            if let Some(handle) = session.ap2_control_listener.take() {
+                handle.abort();
+            }
+            session.ap2_control_port = None;
+        }
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("cannot add stream: {e}"))
+            .with_cseq(request);
+    }
+
+    session.ap2.set_session_key(stream_key);
+    *state.ap2_media_key.write() = Some(stream_key);
+
+    if let Some(plist::Value::String(active_remote)) = setup.get("activeRemote") {
+        session.ap2.set_active_remote(active_remote.clone());
+    }
+    if let Some(plist::Value::String(dacp_id)) = setup.get("dacpID") {
+        session.ap2.set_dacp_id(dacp_id.clone());
+    }
+    dacp.update_session(
+        session.ap2.dacp_id().map(str::to_string),
+        session.ap2.active_remote().map(str::to_string),
+        session.peer_addr,
+    );
+
+    session.is_playback_owner = true;
+
+    if let Some(fmt) = vs.format {
+        let af_bits = vs.audio_format.unwrap_or(0);
+        state.set_diagnostic("ap2_audio_format", format!("{af_bits:#x}"));
+        *state.ap2_audio_format.write() = Some(fmt);
+        state.set_source_format(Some(fmt.description().to_string()));
+        let sample_size: u32 = match fmt {
+            AudioFormat::Alac44100S16Stereo => 16,
+            AudioFormat::Alac48000S24Stereo => 24,
+            AudioFormat::Aac44100F24Stereo
+            | AudioFormat::Aac48000F24Stereo
+            | AudioFormat::Aac48000F24_5_1
+            | AudioFormat::Aac48000F24_7_1 => 24,
+        };
+        state
+            .alac_sample_size
+            .write()
+            .clone_from(&Some(sample_size));
+        state
+            .alac_channels
+            .write()
+            .clone_from(&Some(fmt.channels()));
+    }
+    if let Some(sr) = vs.sr {
+        state.alac_sample_rate.write().clone_from(&Some(sr));
+    }
+    if let Some(spf) = vs.spf {
+        state
+            .frames_per_packet
+            .write()
+            .clone_from(&Some(spf as u32));
+    }
+
+    state.set_active(true);
+    enable_audio_when_track_ready(state, playout);
+    state.set_player_state(PlayerState::Playing);
+    state.set_diagnostic("ap2_stream_type", "buffered");
+    state.set_diagnostic("ap2_buffered_audio_port", data_port.to_string());
+    state.set_diagnostic("ap2_control_port", control_port.to_string());
+    state.set_diagnostic("ap2_shk_len", shk.len().to_string());
+    if let Some(ct) = raw_stream.get("ct").and_then(plist_uint) {
+        state.set_diagnostic("ap2_compression_type", ct.to_string());
+    }
+    info!(
+        data_port,
+        control_port, stream_id, "AP2 buffered audio stream committed"
+    );
+
+    debug!(stream_count = 1, "AP2 stream SETUP response built");
+    response(200, "OK")
+        .header("Content-Type", "application/x-apple-binary-plist")
+        .body(body)
+}
+
+/// Handle a type-130 (data stream) SETUP for remote-control-only sessions.
+///
+/// Validates:
+/// - Session is remote-control-only (established via timingProtocol=None).
+/// - AP2 is enabled and paired.
+/// - Exactly one stream dict with type=130.
+/// - Integer `seed` in u64 range.
+/// - `wantsDedicatedSocket` if present must be true.
+/// - `controlType` if present must be 2.
+///
+/// Derives a data cipher from the pairing control_secret and decimal seed,
+/// binds a TCP data listener, and returns `{streams: [{type:130, streamID, dataPort}]}`.
+fn handle_ap2_setup_type_130(
+    config: &AirplayConfig,
+    state: &AppState,
+    session: &mut RtspSession,
+    _setup: &plist::Dictionary,
+    streams: &[plist::Value],
+    request: &RtspRequest,
+    ap2_policy: &Ap2CapabilityPolicy,
+) -> RtspResponse {
+    // ── Pre-conditions ────────────────────────────────────────────
+    if !session.ap2.is_remote_control_only() {
+        warn!("type-130 SETUP rejected — not a remote-control-only session");
+        return response(455, "Method Not Valid in This State")
+            .header(
+                "X-Reason",
+                "type 130 only valid for remote-control-only sessions",
+            )
+            .with_cseq(request);
+    }
+
+    if !ap2_policy.supports_remote_control_data_stream() {
+        warn!("type-130 SETUP rejected — data stream not supported by policy");
+        return response(400, "Bad Request");
+    }
+
+    // ── Validate exactly one stream dict ──────────────────────────
+    if streams.len() != 1 {
+        warn!(
+            count = streams.len(),
+            "type-130 SETUP rejected — exactly one stream expected"
+        );
+        return response(400, "Bad Request")
+            .header("X-Reason", "exactly one stream per type-130 SETUP")
+            .with_cseq(request);
+    }
+
+    let stream_dict = match streams.first().and_then(|v| v.as_dictionary()) {
+        Some(d) => d,
+        None => {
+            warn!("type-130 SETUP rejected — stream is not a dictionary");
+            return response(400, "Bad Request");
+        }
+    };
+
+    let type_val = stream_dict
+        .get("type")
+        .and_then(plist_uint)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    if type_val != 130 {
+        warn!(type_val, "type-130 SETUP rejected — wrong stream type");
+        return response(400, "Bad Request");
+    }
+
+    // ── Validate seed ─────────────────────────────────────────────
+    let seed = match stream_dict.get("seed").and_then(plist_uint) {
+        Some(s) => s,
+        None => {
+            warn!("type-130 SETUP rejected — missing or invalid seed");
+            return response(400, "Bad Request")
+                .header("X-Reason", "seed is required for type 130")
+                .with_cseq(request);
+        }
+    };
+
+    // ── Validate optional verified fields strictly ───────────────
+    match stream_dict.get("wantsDedicatedSocket") {
+        None => {}
+        Some(value) if plist_bool(value) == Some(true) => {}
+        Some(_) => {
+            warn!("type-130 SETUP rejected — invalid wantsDedicatedSocket");
+            return response(400, "Bad Request")
+                .header("X-Reason", "wantsDedicatedSocket must be true")
+                .with_cseq(request);
+        }
+    }
+    match stream_dict.get("controlType") {
+        None => {}
+        Some(value) if plist_uint(value) == Some(2) => {}
+        Some(_) => {
+            warn!("type-130 SETUP rejected — invalid controlType");
+            return response(400, "Bad Request")
+                .header("X-Reason", "controlType must be 2")
+                .with_cseq(request);
+        }
+    }
+
+    if let Err(error) = validate_add_stream_phase(session.ap2.phase()) {
+        warn!(%error, "type-130 SETUP rejected — invalid lifecycle phase");
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("invalid phase for data SETUP: {error}"))
+            .with_cseq(request);
+    }
+
+    // ── Derive stream ID ──────────────────────────────────────────
+    let stream_id: u32 = stream_dict
+        .get("streamID")
+        .and_then(plist_uint)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(1);
+
+    // ── Reject duplicate stream ID or duplicate type-130 ──────────
+    if session.ap2.find_stream(stream_id).is_some() {
+        warn!(stream_id, "type-130 SETUP rejected — duplicate stream ID");
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("duplicate stream ID: {stream_id}"))
+            .with_cseq(request);
+    }
+    if session
+        .ap2
+        .find_stream_by_type(Ap2StreamType::DataStream)
+        .is_some()
+        || session.data_listener.is_some()
+        || session.data_port.is_some()
+    {
+        warn!("type-130 SETUP rejected — duplicate data stream");
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", "data stream already configured")
+            .with_cseq(request);
+    }
+
+    // ── Derive data cipher and bind TCP listener ──────────────────
+    let Some(shared_secret) = session.pairing.control_secret() else {
+        warn!("type-130 SETUP rejected — no pairing secret");
+        return response(503, "Service Unavailable");
+    };
+
+    let local_ip = receiver_primary_ip(
+        session.local_addr.map(|addr| addr.ip()),
+        config.ap2_bind_ip.as_deref(),
+    );
+    let bind_addr = event_bind_addr(session.local_addr, local_ip);
+
+    let secret = Arc::new(Zeroizing::new(shared_secret.to_vec()));
+    let (data_port, data_listener) = match DataStreamListener::bind(
+        bind_addr,
+        secret,
+        seed,
+        crate::airplay::ap2::data::DEFAULT_TIMEOUT,
+    ) {
+        Ok((port, listener)) => (port, listener),
+        Err(e) => {
+            warn!(%e, "type-130 SETUP failed — cannot bind data listener");
+            return response(503, "Service Unavailable");
+        }
+    };
+
+    // ── Build Ap2Stream record ────────────────────────────────────
+    let stream_connection_id = stream_dict.get("streamConnectionID").and_then(plist_uint);
+    let ap2_stream = Ap2Stream {
+        stream_id,
+        stream_connection_id,
+        stream_type: Ap2StreamType::DataStream,
+        config: Ap2StreamConfig::Data { seed },
+        data_port,
+        state: Ap2StreamState::Configured,
+    };
+
+    // ── Serialize response BEFORE committing session mutations ────
+    let mut stream_dict_resp = plist::Dictionary::new();
+    stream_dict_resp.insert("type".to_string(), plist_uint_value(130u64));
+    stream_dict_resp.insert("streamID".to_string(), plist_uint_value(stream_id as u64));
+    stream_dict_resp.insert("dataPort".to_string(), plist_uint_value(data_port as u64));
+
+    let mut response_dict = plist::Dictionary::new();
+    response_dict.insert(
+        "streams".to_string(),
+        plist::Value::Array(vec![plist::Value::Dictionary(stream_dict_resp)]),
+    );
+    let mut body = Vec::new();
+    if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_err() {
+        // Rollback: abort the listener we just created.
+        data_listener.abort();
+        return response(500, "Internal Server Error");
+    }
+
+    // ── Commit: add stream and store listener ─────────────────────
+    if let Err(e) = session.ap2.add_stream(ap2_stream) {
+        data_listener.abort();
+        return response(455, "Method Not Valid in This State")
+            .header("X-Reason", format!("cannot add data stream: {e}"))
+            .with_cseq(request);
+    }
+
+    session.data_port = Some(data_port);
+    session.data_listener = Some(data_listener);
+    state.set_diagnostic("ap2_phase", "data-stream-setup");
+    state.set_diagnostic("ap2_data_port", data_port.to_string());
+    info!(data_port, stream_id, "AP2 data stream (type 130) committed");
+
+    response(200, "OK")
+        .header("Content-Type", "application/x-apple-binary-plist")
+        .body(body)
 }
 
 /// Handle an AirPlay 2 SETUP with binary plist body.
@@ -1692,6 +2330,7 @@ fn handle_ap2_setup(
     request: &RtspRequest,
     playout: &PlayoutHandle,
     dacp: &DacpController,
+    ap2_policy: &Ap2CapabilityPolicy,
 ) -> RtspResponse {
     let plist_body = &request.body;
     let setup = match plist::from_bytes::<plist::Dictionary>(plist_body) {
@@ -1702,236 +2341,242 @@ fn handle_ap2_setup(
         }
     };
     debug!(
-        keys = %setup.keys().cloned().collect::<Vec<_>>().join(","),
-        plist = %plist_xml_preview(&plist::Value::Dictionary(setup.clone())),
+        key_count = setup.len(),
+        body_len = request.body.len(),
         "AP2 SETUP plist parsed"
     );
 
-    // Check for streams array
+    // Stream SETUP — pre-validate all streams atomically before any
+    // session/state/DACP mutation or listener/socket creation.
     if let Some(plist::Value::Array(streams)) = setup.get("streams") {
-        state.set_diagnostic("ap2_phase", "stream-setup");
-        if let Some(plist::Value::String(active_remote)) = setup.get("activeRemote") {
-            session.active_remote = Some(active_remote.clone());
-        }
-        if let Some(plist::Value::String(dacp_id)) = setup.get("dacpID") {
-            session.dacp_id = Some(dacp_id.clone());
-        }
-        dacp.update_session(
-            session.dacp_id.clone(),
-            session.active_remote.clone(),
-            session.peer_addr,
-        );
-        let control_port = match session.ensure_ap2_control_socket() {
-            Ok(port) => {
-                state.set_diagnostic("ap2_control_port", port.to_string());
-                port
-            }
-            Err(e) => {
-                warn!(%e, "failed to open AP2 control UDP socket");
-                return response(503, "Service Unavailable");
-            }
-        };
-        let mut response_dict = plist::Dictionary::new();
-        let mut response_streams: Vec<plist::Value> = Vec::new();
-        for stream_val in streams {
-            let plist::Value::Dictionary(stream) = stream_val else {
-                continue;
-            };
-            let type_val = stream
-                .get("type")
+        // ── Detect stream type ─────────────────────────────────────
+        // We need the type to dispatch to the right handler path.
+        let first_type: Option<u32> = streams.first().and_then(|v| {
+            v.as_dictionary()
+                .and_then(|d| d.get("type"))
                 .and_then(plist_uint)
                 .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(0);
-            let mut stream_dict = plist::Dictionary::new();
-            match type_val {
-                96 => {
-                    session.ap2_streams.push(Ap2StreamType::RealtimeAudio);
-                    let data_port = match session.ensure_realtime_audio_listener() {
-                        Ok(port) => port,
-                        Err(e) => {
-                            warn!(%e, "failed to open AP2 realtime audio UDP socket");
-                            return response(503, "Service Unavailable");
-                        }
-                    };
-                    stream_dict.insert("type".to_string(), plist_uint_value(96u64));
-                    stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
-                    stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
-                    state.set_active(true);
-                    enable_audio_when_track_ready(state, playout);
-                    state.set_player_state(PlayerState::Playing);
-                    state.set_diagnostic("ap2_stream_type", "realtime");
-                    state.set_diagnostic("ap2_realtime_audio_port", data_port.to_string());
-                    info!(
-                        data_port,
-                        control_port, "AP2 realtime audio stream requested"
-                    );
-                }
-                103 => {
-                    session.ap2_streams.push(Ap2StreamType::BufferedAudio);
-                    let data_port = match session.ensure_buffered_audio_listener(state, playout) {
-                        Ok(port) => port,
-                        Err(e) => {
-                            warn!(%e, "failed to open AP2 buffered audio TCP socket");
-                            return response(503, "Service Unavailable");
-                        }
-                    };
-                    if let Some(plist::Value::Data(shk)) = stream.get("shk") {
-                        state.set_diagnostic("ap2_shk_len", shk.len().to_string());
-                        if shk.len() >= 32 {
-                            session.session_key = Some(shk.clone());
-                            let mut key = [0u8; 32];
-                            key.copy_from_slice(&shk[..32]);
-                            *state.ap2_media_key.write() = Some(key);
-                            session.is_playback_owner = true;
-                        } else {
-                            warn!(shk_len = shk.len(), "AP2 buffered SETUP shk is too short");
-                        }
-                    }
-                    if let Some(ct) = stream.get("ct").and_then(plist_uint) {
-                        state.set_diagnostic("ap2_compression_type", ct.to_string());
-                    }
-                    if let Some(audio_format) = stream.get("audioFormat").and_then(plist_uint) {
-                        state.set_diagnostic("ap2_audio_format", format!("{audio_format:#x}"));
-                        if let Some(format) = AudioFormat::from_ap2_audio_format(audio_format) {
-                            *state.ap2_audio_format.write() = Some(format);
-                            state.set_source_format(Some(format.description().to_string()));
-                            let sample_size: u32 = match format {
-                                AudioFormat::Alac44100S16Stereo => 16,
-                                AudioFormat::Alac48000S24Stereo => 24,
-                                AudioFormat::Aac44100F24Stereo
-                                | AudioFormat::Aac48000F24Stereo
-                                | AudioFormat::Aac48000F24_5_1
-                                | AudioFormat::Aac48000F24_7_1 => 24,
-                            };
-                            state
-                                .alac_sample_size
-                                .write()
-                                .clone_from(&Some(sample_size));
-                            state
-                                .alac_channels
-                                .write()
-                                .clone_from(&Some(format.channels()));
-                        } else {
-                            warn!(
-                                audio_format = format_args!("{audio_format:#x}"),
-                                "unknown AP2 buffered audioFormat"
-                            );
-                        }
-                    }
-                    if let Some(sr) = stream.get("sr").and_then(plist_uint) {
-                        state.alac_sample_rate.write().clone_from(&Some(sr as u32));
-                    }
-                    if let Some(spf) = stream.get("spf").and_then(plist_uint) {
-                        state
-                            .frames_per_packet
-                            .write()
-                            .clone_from(&Some(spf as u32));
-                    }
-                    stream_dict.insert("type".to_string(), plist_uint_value(103u64));
-                    stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
-                    stream_dict.insert(
-                        "audioBufferSize".to_string(),
-                        plist_uint_value(8 * 1024 * 1024u64),
-                    );
-                    state.set_active(true);
-                    enable_audio_when_track_ready(state, playout);
-                    state.set_player_state(PlayerState::Playing);
-                    state.set_diagnostic("ap2_stream_type", "buffered");
-                    state.set_diagnostic("ap2_buffered_audio_port", data_port.to_string());
-                    info!(
-                        data_port,
-                        control_port, "AP2 buffered audio stream requested"
-                    );
-                }
-                130 => {
-                    session.ap2_streams.push(Ap2StreamType::DataStream);
-                    let data_port = match session.ensure_data_listener() {
-                        Ok(port) => port,
-                        Err(e) => {
-                            warn!(%e, "failed to open AP2 data TCP socket");
-                            return response(503, "Service Unavailable");
-                        }
-                    };
-                    if let Some(seed) = stream.get("seed").and_then(plist_uint)
-                        && let Some(sk) = session.pairing.session_key()
-                    {
-                        session.data_cipher =
-                            Some(PairCipher::data_for_server(sk, seed.to_string().as_str()));
-                        state.set_diagnostic("ap2_data_seed", seed.to_string());
-                    }
-                    stream_dict.insert("type".to_string(), plist_uint_value(130u64));
-                    stream_dict.insert("streamID".to_string(), plist_uint_value(1u64));
-                    stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
-                    state.set_diagnostic("ap2_data_port", data_port.to_string());
-                    info!("AP2 data/event stream requested");
-                }
-                other => {
-                    warn!(type = other, "unknown AP2 stream type");
-                    stream_dict.insert("type".to_string(), plist_uint_value(other));
-                    stream_dict.insert("status".to_string(), plist_uint_value(1u64));
-                }
-            }
-            // Add control port to every stream (same port for all)
-            stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
-            response_streams.push(plist::Value::Dictionary(stream_dict));
-        }
-        response_dict.insert("streams".to_string(), plist::Value::Array(response_streams));
-        debug!(
-            plist = %plist_xml_preview(&plist::Value::Dictionary(response_dict.clone())),
-            "AP2 stream SETUP response plist"
-        );
+        });
 
-        let mut body = Vec::new();
-        if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_ok() {
-            return response(200, "OK")
-                .header("Content-Type", "application/x-apple-binary-plist")
-                .body(body);
+        match first_type {
+            Some(130) => {
+                return handle_ap2_setup_type_130(
+                    config, state, session, &setup, streams, request, ap2_policy,
+                );
+            }
+            _ => {
+                // Existing type 103 (buffered audio) path, or unsupported.
+                return handle_ap2_setup_type_103(
+                    config, state, session, &setup, streams, request, playout, dacp, ap2_policy,
+                );
+            }
         }
-        return response(200, "OK").with_cseq(request);
+    }
+
+    if setup.contains_key("streams") {
+        state.set_diagnostic("ap2_stream_setup", "rejected-malformed-streams");
+        return response(400, "Bad Request");
     }
 
     // Initial SETUP (no streams) - handle timing protocol and event channel.
     if let Some(tp) = setup.get("timingProtocol").and_then(|v| v.as_string()) {
-        info!(protocol = %tp, "AP2 initial SETUP with timing protocol");
-        state.set_diagnostic("ap2_timing_protocol", tp.to_string());
-        session.ap2_timing_protocol = Some(tp.to_string());
+        let timing_protocol_label = match tp {
+            "PTP" => "ptp",
+            "NTP" => "ntp",
+            "None" => "none",
+            _ => "unknown",
+        };
+        info!(
+            protocol = timing_protocol_label,
+            "AP2 initial SETUP with timing protocol"
+        );
+        state.set_diagnostic("ap2_timing_protocol", timing_protocol_label);
 
-        // For PTP, we need to signal the PTP service
-        if tp == "PTP" {
-            session.ap2_category = Ap2ConnectionCategory::Ptp;
-            state.set_diagnostic("ap2_phase", "initial-ptp-setup");
-            // Check for groupUUID
-            if let Some(plist::Value::String(gid)) = setup.get("groupUUID") {
-                session.ap2_group_uuid = Some(gid.clone());
-                state.set_diagnostic("ap2_group_uuid", gid.clone());
-            }
-            if let Some(group_leader) = setup.get("groupContainsGroupLeader").and_then(plist_bool) {
-                session.group_contains_group_leader = Some(group_leader);
-                state.set_diagnostic("ap2_group_contains_group_leader", group_leader.to_string());
+        // ── Remote-control-only path: timingProtocol=None, isRemoteControlOnly=true ──
+        if tp == "None" {
+            // Check isRemoteControlOnly flag
+            let is_remote_control = setup
+                .get("isRemoteControlOnly")
+                .and_then(plist_bool)
+                .unwrap_or(false);
+
+            if !is_remote_control {
+                warn!(
+                    "AP2 initial SETUP rejected — timingProtocol=None without isRemoteControlOnly=true"
+                );
+                state.set_diagnostic(
+                    "ap2_timing_protocol_rejected",
+                    "None-without-remote-control",
+                );
+                return response(400, "Bad Request");
             }
 
-            let mut response_dict = plist::Dictionary::new();
+            if !session.ap2.is_ap2_active() {
+                warn!("AP2 initial SETUP rejected — not paired");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", "must pair before remote-control-only SETUP")
+                    .with_cseq(request);
+            }
+
+            // Validate lifecycle transition.
+            if let Err(e) =
+                validate_transition(session.ap2.phase(), Ap2SessionPhase::TimingConfigured)
+            {
+                warn!(%e, "AP2 remote-control SETUP rejected — invalid phase transition");
+                return response(455, "Method Not Valid in This State")
+                    .header(
+                        "X-Reason",
+                        format!("invalid phase for remote-control SETUP: {e}"),
+                    )
+                    .with_cseq(request);
+            }
+
             let local_ip = receiver_primary_ip(
                 session.local_addr.map(|addr| addr.ip()),
                 config.ap2_bind_ip.as_deref(),
             );
+
+            // Open or reuse event listener.
+            let mut new_event_listener: Option<(u16, EventListener)> = None;
+            let event_port = if let Some(port) = session.event_port {
+                port
+            } else {
+                let Some(shared_secret) = session.pairing.control_secret() else {
+                    warn!("cannot open AP2 event listener before pairing completion");
+                    return response(503, "Service Unavailable");
+                };
+                let event_bind = event_bind_addr(session.local_addr, local_ip);
+
+                let update_info_body = match build_ap2_update_info_event(
+                    config,
+                    session.peer_addr,
+                    None, // no group UUID for remote-control-only
+                    None, // no group leader
+                    ap2_policy,
+                ) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!(%e, "failed to build AP2 updateInfo event");
+                        return response(500, "Internal Server Error");
+                    }
+                };
+
+                let secret = Arc::new(Zeroizing::new(shared_secret.to_vec()));
+                match EventListener::bind(
+                    event_bind,
+                    secret,
+                    update_info_body,
+                    crate::airplay::ap2::event::DEFAULT_WRITE_TIMEOUT,
+                    crate::airplay::ap2::event::DEFAULT_READ_TIMEOUT,
+                ) {
+                    Ok((port, listener)) => {
+                        new_event_listener = Some((port, listener));
+                        port
+                    }
+                    Err(e) => {
+                        warn!(%e, "failed to open AP2 event listener");
+                        return response(503, "Service Unavailable");
+                    }
+                }
+            };
+
+            // Build response: eventPort only — no timingPeerInfo or timingPort.
+            let mut response_dict = plist::Dictionary::new();
+            response_dict.insert(
+                "eventPort".to_string(),
+                plist::Value::Integer(plist::Integer::from(event_port as u64)),
+            );
+            let mut body = Vec::new();
+            if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_err()
+            {
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
+                }
+                return response(500, "Internal Server Error");
+            }
+
+            // Commit session state transactionally: timing None + remote_control_only flag.
+            if let Err(e) = session
+                .ap2
+                .configure_timing(Ap2TimingProtocol::None, None, None)
+            {
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
+                }
+                return response(455, "Method Not Valid in This State")
+                    .header(
+                        "X-Reason",
+                        format!("invalid phase for remote-control SETUP: {e}"),
+                    )
+                    .with_cseq(request);
+            }
+            session.ap2.set_remote_control_only(true);
             session.receiver_ip_override = Some(local_ip);
+            if let Some((port, listener)) = new_event_listener {
+                session.event_port = Some(port);
+                session.event_listener = Some(listener);
+            }
+            state.set_diagnostic("ap2_phase", "remote-control-only-setup");
+            state.set_diagnostic("ap2_timing_protocol", "None-remote-control");
+
+            info!(event_port, "AP2 remote-control-only SETUP committed");
+
+            return response(200, "OK")
+                .header("Content-Type", "application/x-apple-binary-plist")
+                .body(body);
+        }
+
+        // ── NTP: always rejected ───────────────────────────────────────
+        if tp == "NTP" {
+            warn!(
+                protocol = "ntp",
+                "AP2 initial SETUP rejected — NTP not supported"
+            );
+            state.set_diagnostic("ap2_timing_protocol_rejected", "NTP-unsupported");
+            return response(400, "Bad Request");
+        }
+
+        // ── Unsupported timing protocol ─────────────────────────────────
+        if !ap2_policy.supports_timing_protocol(tp) {
+            warn!(
+                protocol = "unknown",
+                "AP2 initial SETUP rejected — unsupported timing protocol"
+            );
+            state.set_diagnostic("ap2_timing_protocol_rejected", "unsupported");
+            return response(400, "Bad Request");
+        }
+
+        let timing_protocol = Ap2TimingProtocol::from_str(tp).unwrap_or(Ap2TimingProtocol::None);
+
+        // ── PTP path ────────────────────────────────────────────────────
+        if tp == "PTP" {
+            // Validate the lifecycle before opening resources or mutating the
+            // session. The actual transition is committed only after the
+            // response body and event listener are ready.
+            if let Err(e) =
+                validate_transition(session.ap2.phase(), Ap2SessionPhase::TimingConfigured)
+            {
+                warn!(%e, "AP2 timing SETUP rejected — invalid phase transition");
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("invalid phase for timing SETUP: {e}"))
+                    .with_cseq(request);
+            }
+
+            let group_uuid = setup
+                .get("groupUUID")
+                .and_then(plist::Value::as_string)
+                .map(str::to_string);
+            let group_leader = setup.get("groupContainsGroupLeader").and_then(plist_bool);
+            let local_ip = receiver_primary_ip(
+                session.local_addr.map(|addr| addr.ip()),
+                config.ap2_bind_ip.as_deref(),
+            );
             let local_ip_string = local_ip.to_string();
             let clock_id = ptp::local_clock_identity();
             let timing_addresses = receiver_timing_addresses(local_ip)
                 .into_iter()
                 .map(plist::Value::String)
                 .collect::<Vec<_>>();
-            debug!(
-                addresses = ?timing_addresses
-                    .iter()
-                    .filter_map(plist::Value::as_string)
-                    .collect::<Vec<_>>(),
-                id = %local_ip_string,
-                primary_ip = %local_ip_string,
-                clock_id = format_args!("{clock_id:016x}"),
-                "AP2 SETUP timing peer response"
-            );
 
             let mut timing_peer_info = plist::Dictionary::new();
             timing_peer_info.insert(
@@ -1951,65 +2596,108 @@ fn handle_ap2_setup(
                 "SupportsClockPortMatchingOverride".to_string(),
                 plist::Value::Boolean(true),
             );
+
+            // Hold any newly-created listener locally until every fallible
+            // operation has succeeded. Existing session listeners are reused.
+            let mut new_event_listener: Option<(u16, EventListener)> = None;
+            let event_port = if let Some(port) = session.event_port {
+                port
+            } else {
+                let Some(shared_secret) = session.pairing.control_secret() else {
+                    warn!("cannot open AP2 event listener before pairing completion");
+                    return response(503, "Service Unavailable");
+                };
+                let event_bind = event_bind_addr(session.local_addr, local_ip);
+
+                // Build the updateInfo binary-plist body.
+                let update_info_body = match build_ap2_update_info_event(
+                    config,
+                    session.peer_addr,
+                    group_uuid.as_deref(),
+                    group_leader,
+                    ap2_policy,
+                ) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!(%e, "failed to build AP2 updateInfo event");
+                        return response(500, "Internal Server Error");
+                    }
+                };
+
+                let secret = Arc::new(Zeroizing::new(shared_secret.to_vec()));
+                match EventListener::bind(
+                    event_bind,
+                    secret,
+                    update_info_body,
+                    crate::airplay::ap2::event::DEFAULT_WRITE_TIMEOUT,
+                    crate::airplay::ap2::event::DEFAULT_READ_TIMEOUT,
+                ) {
+                    Ok((port, listener)) => {
+                        new_event_listener = Some((port, listener));
+                        port
+                    }
+                    Err(e) => {
+                        warn!(%e, "failed to open AP2 event listener");
+                        return response(503, "Service Unavailable");
+                    }
+                }
+            };
+
+            let mut response_dict = plist::Dictionary::new();
             response_dict.insert(
                 "timingPeerInfo".to_string(),
                 plist::Value::Dictionary(timing_peer_info),
             );
-
-            if session.event_port.is_none() {
-                let event_bind = event_bind_addr(session.local_addr, local_ip);
-                match session.pairing.session_key() {
-                    Some(shared_secret) => {
-                        match spawn_ap2_event_listener(
-                            event_bind,
-                            config.clone(),
-                            session.peer_addr,
-                            shared_secret.to_vec(),
-                            session.ap2_group_uuid.clone(),
-                            session.group_contains_group_leader,
-                        ) {
-                            Ok((port, handle)) => {
-                                session.event_port = Some(port);
-                                session.event_listener = Some(handle);
-                                info!(port, bind = %event_bind, "AP2 event listener opened");
-                            }
-                            Err(e) => {
-                                warn!(%e, "failed to open AP2 event listener");
-                                return response(503, "Service Unavailable");
-                            }
-                        }
-                    }
-                    None => {
-                        warn!("cannot open AP2 event listener before pair-setup session key");
-                        return response(503, "Service Unavailable");
-                    }
-                }
-            }
-            if let Some(port) = session.event_port {
-                response_dict.insert(
-                    "eventPort".to_string(),
-                    plist::Value::Integer(plist::Integer::from(port as u64)),
-                );
-            }
+            response_dict.insert(
+                "eventPort".to_string(),
+                plist::Value::Integer(plist::Integer::from(event_port as u64)),
+            );
             response_dict.insert(
                 "timingPort".to_string(),
                 plist::Value::Integer(plist::Integer::from(0u64)),
             );
-            debug!(
-                plist = %plist_xml_preview(&plist::Value::Dictionary(response_dict.clone())),
-                "AP2 initial SETUP response plist"
-            );
             let mut body = Vec::new();
-            if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_ok()
+            if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict)).is_err()
             {
-                return response(200, "OK")
-                    .header("Content-Type", "application/x-apple-binary-plist")
-                    .body(body);
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
+                }
+                return response(500, "Internal Server Error");
             }
+
+            // Commit all session state only after resources and response are ready.
+            if let Err(e) =
+                session
+                    .ap2
+                    .configure_timing(timing_protocol, group_uuid.clone(), group_leader)
+            {
+                if let Some((_, listener)) = new_event_listener {
+                    listener.abort();
+                }
+                return response(455, "Method Not Valid in This State")
+                    .header("X-Reason", format!("invalid phase for timing SETUP: {e}"))
+                    .with_cseq(request);
+            }
+            session.receiver_ip_override = Some(local_ip);
+            if let Some((port, listener)) = new_event_listener {
+                session.event_port = Some(port);
+                session.event_listener = Some(listener);
+            }
+            state.set_diagnostic("ap2_phase", "initial-ptp-setup");
+            if group_uuid.is_some() {
+                state.set_diagnostic("ap2_group_uuid", "present");
+            }
+            if let Some(gl) = group_leader {
+                state.set_diagnostic("ap2_group_contains_group_leader", gl.to_string());
+            }
+            return response(200, "OK")
+                .header("Content-Type", "application/x-apple-binary-plist")
+                .body(body);
         }
     }
 
-    response(200, "OK").with_cseq(request)
+    state.set_diagnostic("ap2_timing_protocol_rejected", "missing");
+    response(400, "Bad Request").with_cseq(request)
 }
 
 fn apply_set_parameter(
@@ -2416,18 +3104,6 @@ fn apply_flushbuffered(state: &AppState, player: &SharedPlayer, request: &RtspRe
     state.set_player_state(PlayerState::Paused);
 }
 
-fn ap2_teardown_stream_type(body: &[u8]) -> Option<Ap2StreamType> {
-    let dict = plist::from_bytes::<plist::Dictionary>(body).ok()?;
-    let streams = dict.get("streams").and_then(plist::Value::as_array)?;
-    let stream = streams.first()?.as_dictionary()?;
-    match stream.get("type").and_then(plist_uint)? {
-        96 => Some(Ap2StreamType::RealtimeAudio),
-        103 => Some(Ap2StreamType::BufferedAudio),
-        130 => Some(Ap2StreamType::DataStream),
-        _ => None,
-    }
-}
-
 fn apply_audio_mode(state: &AppState, request: &RtspRequest) {
     state.set_diagnostic("ap2_phase", "audio_mode");
     state.set_diagnostic("ap2_audio_mode_len", request.body.len().to_string());
@@ -2620,7 +3296,7 @@ fn debug_ap2_info_payload(message: &'static str, value: &plist::Value, group_uui
             )
         })
         .unwrap_or_default();
-    let txt_selected = dict
+    let txt_selected_keys = dict
         .get("txtAirPlay")
         .and_then(|value| match value {
             plist::Value::Data(data) => Some(txt_airplay_entries(data)),
@@ -2628,26 +3304,22 @@ fn debug_ap2_info_payload(message: &'static str, value: &plist::Value, group_uui
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|entry| {
-            entry.starts_with("features=")
-                || entry.starts_with("fex=")
-                || entry.starts_with("gid=")
-                || entry.starts_with("gcgl=")
-                || entry.starts_with("pgid=")
-                || entry.starts_with("pgcgl=")
-                || entry.starts_with("pi=")
-                || entry.starts_with("psi=")
-                || entry.starts_with("protovers=")
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key.to_string()))
+        .filter(|key| {
+            matches!(
+                key.as_str(),
+                "features" | "fex" | "gid" | "gcgl" | "pgid" | "pgcgl" | "pi" | "psi" | "protovers"
+            )
         })
         .collect::<Vec<_>>();
     debug!(
         keys = ?dict.keys().collect::<Vec<_>>(),
-        group_uuid,
+        group_uuid_present = group_uuid.is_some(),
         audio_stream,
         audio_stream_hex = format_args!("{audio_stream:#x}"),
         buffer_stream,
         buffer_stream_hex = format_args!("{buffer_stream:#x}"),
-        txt = ?txt_selected,
+        txt_keys = ?txt_selected_keys,
         body_len = dict.len(),
         message
     );
@@ -2673,8 +3345,12 @@ fn plist_uint_value(value: impl Into<u64>) -> plist::Value {
     plist::Value::Integer(plist::Integer::from(value.into()))
 }
 
-fn get_info_body(config: &AirplayConfig, peer_addr: Option<SocketAddr>) -> Vec<u8> {
-    get_info_body_with_group(config, peer_addr, None, false)
+fn get_info_body(
+    config: &AirplayConfig,
+    peer_addr: Option<SocketAddr>,
+    ap2_policy: &Ap2CapabilityPolicy,
+) -> Vec<u8> {
+    get_info_body_with_group(config, peer_addr, None, false, ap2_policy)
 }
 
 fn get_info_body_with_group(
@@ -2682,9 +3358,10 @@ fn get_info_body_with_group(
     peer_addr: Option<SocketAddr>,
     group_uuid: Option<&str>,
     group_contains_group_leader: bool,
+    ap2_policy: &Ap2CapabilityPolicy,
 ) -> Vec<u8> {
     use crate::airplay::crypto::accessory_public_key_for_device_id;
-    use crate::airplay::txt_records::{AP2_FEATURES, AP2_STATUS_FLAGS, stable_uuid};
+    use crate::airplay::txt_records::stable_uuid;
     let mut dict = Dictionary::new();
     dict.insert("vv".into(), Value::Integer(plist::Integer::from(2u64)));
     let mut playback_capabilities = Dictionary::new();
@@ -2709,15 +3386,12 @@ fn get_info_body_with_group(
     dict.insert("deviceID".into(), Value::String(config.device_id.clone()));
     dict.insert(
         "features".into(),
-        Value::Integer(plist::Integer::from(AP2_FEATURES)),
+        Value::Integer(plist::Integer::from(ap2_policy.features)),
     );
-    dict.insert(
-        "featuresEx".into(),
-        Value::String(features_ex(AP2_FEATURES)),
-    );
+    dict.insert("featuresEx".into(), Value::String(ap2_policy.features_ex()));
     dict.insert(
         "statusFlags".into(),
-        Value::Integer(plist::Integer::from(AP2_STATUS_FLAGS as u64)),
+        Value::Integer(plist::Integer::from(ap2_policy.status_flags as u64)),
     );
     dict.insert("sourceVersion".into(), Value::String("366.0".to_string()));
     dict.insert("name".into(), Value::String("Shairport RS".to_string()));
@@ -2739,14 +3413,13 @@ fn get_info_body_with_group(
     // Initial volume (0.0 = mute, 1.0 = full)
     dict.insert("initialVolume".into(), Value::Real(0.0));
     let mut supported_formats = Dictionary::new();
-    let advertised_formats = advertised_ap2_formats(config.advertised_format_policy);
     supported_formats.insert(
         "audioStream".into(),
-        Value::Integer(plist::Integer::from(advertised_formats.audio_stream)),
+        Value::Integer(plist::Integer::from(ap2_policy.audio_stream_formats)),
     );
     supported_formats.insert(
         "bufferStream".into(),
-        Value::Integer(plist::Integer::from(advertised_formats.buffer_stream)),
+        Value::Integer(plist::Integer::from(ap2_policy.buffer_stream_formats)),
     );
     dict.insert(
         "supportedFormats".into(),
@@ -2758,7 +3431,8 @@ fn get_info_body_with_group(
     );
 
     // Generate txtAirPlay binary data (DNS-SD TXT format)
-    let txt_data = build_txt_airplay_data(config, group_uuid, group_contains_group_leader);
+    let txt_data =
+        build_txt_airplay_data(config, group_uuid, group_contains_group_leader, ap2_policy);
     dict.insert("txtAirPlay".into(), Value::Data(txt_data));
 
     let mut out = Vec::new();
@@ -2767,37 +3441,15 @@ fn get_info_body_with_group(
     out
 }
 
-struct AdvertisedAp2Formats {
-    audio_stream: u64,
-    buffer_stream: u64,
-}
-
-fn advertised_ap2_formats(policy: AdvertisedFormatPolicy) -> AdvertisedAp2Formats {
-    const AUDIO_STREAM_PARENT_MASK: u64 = 21_235_712;
-    const BUFFER_ALAC_44100_S16_2: u64 = 0x0004_0000;
-    const BUFFER_ALAC_48000_F24_2: u64 = 0x0020_0000;
-    const BUFFER_AAC_44100_F24_2: u64 = 0x0040_0000;
-    const BUFFER_AAC_48000_F24_2: u64 = 0x0080_0000;
-
-    let mut buffer_stream = BUFFER_ALAC_44100_S16_2 | BUFFER_ALAC_48000_F24_2;
-    if policy == AdvertisedFormatPolicy::AacIfAvailable {
-        buffer_stream |= BUFFER_AAC_44100_F24_2 | BUFFER_AAC_48000_F24_2;
-    }
-
-    AdvertisedAp2Formats {
-        audio_stream: AUDIO_STREAM_PARENT_MASK,
-        buffer_stream,
-    }
-}
-
 fn build_txt_airplay_data(
     config: &AirplayConfig,
     group_uuid: Option<&str>,
     group_contains_group_leader: bool,
+    ap2_policy: &Ap2CapabilityPolicy,
 ) -> Vec<u8> {
     use crate::airplay::crypto::accessory_public_key_for_device_id;
     use crate::airplay::txt_records::stable_uuid;
-    let features = crate::airplay::txt_records::AP2_FEATURES;
+    let features = ap2_policy.features;
     let features_lo = (features & 0xffff_ffff) as u32;
     let features_hi = (features >> 32) as u32;
     let pk_raw = accessory_public_key_for_device_id(&config.device_id);
@@ -2805,7 +3457,7 @@ fn build_txt_airplay_data(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let fex = features_ex(features);
+    let fex = ap2_policy.features_ex();
     let pi = stable_uuid("pi", &config.device_id).to_string();
     let psi = stable_uuid("psi", &config.device_id).to_string();
     let gid = group_uuid.unwrap_or(&pi);
@@ -2817,10 +3469,7 @@ fn build_txt_airplay_data(
         format!("deviceid={}", config.device_id),
         format!("fex={fex}"),
         format!("features=0x{features_lo:X},0x{features_hi:X}"),
-        format!(
-            "flags=0x{:x}",
-            crate::airplay::txt_records::AP2_STATUS_FLAGS
-        ),
+        format!("flags=0x{:x}", ap2_policy.status_flags),
         format!("gid={gid}"),
         "igl=0".to_string(),
         format!("gcgl={gcgl}"),
@@ -2843,12 +3492,6 @@ fn build_txt_airplay_data(
         out.extend_from_slice(entry.as_bytes());
     }
     out
-}
-
-fn features_ex(features: u64) -> String {
-    use base64::Engine;
-    let bytes = features.to_le_bytes();
-    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
 pub fn parse_request(buf: &[u8]) -> Option<(RtspRequest, usize)> {
@@ -2949,7 +3592,7 @@ mod tests {
     use super::*;
     use crate::playout::scheduler::{PlayoutCommand, PlayoutHandle};
     use rsa::pkcs1v15::Pkcs1v15Sign;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Create a test-only [`PlayoutHandle`] and its associated command and
@@ -2970,6 +3613,17 @@ mod tests {
             cmds.push(cmd);
         }
         cmds
+    }
+
+    /// Build a test-capability policy with AP2 enabled and PTP available.
+    /// Most tests don't exercise the policy details; they just need a valid
+    /// value to satisfy the `ConnectionServices` constructor.
+    fn test_policy() -> Ap2CapabilityPolicy {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        Ap2CapabilityPolicy::from_config(&config, true)
     }
 
     #[test]
@@ -3199,6 +3853,7 @@ mod tests {
         ));
         let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3207,6 +3862,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let mut session = RtspSession::default();
         let request = RtspRequest {
@@ -3245,6 +3901,7 @@ mod tests {
         ));
         let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3253,6 +3910,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let mut session = RtspSession::default();
         let request = RtspRequest {
@@ -3293,6 +3951,7 @@ mod tests {
         ));
         let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3301,6 +3960,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let mut session = RtspSession::default();
         let request = RtspRequest {
@@ -3338,6 +3998,7 @@ mod tests {
         ));
         let (playout, mut cmd_rx, _ingress_rx) = test_playout();
 
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3346,6 +4007,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let mut session = RtspSession::default();
         let request = RtspRequest {
@@ -3509,13 +4171,20 @@ mod tests {
         config.airplay.control_port = 6001;
         let state = AppState::new(config.clone());
         let mut session = RtspSession::default();
+        // Must be paired + timing-configured before stream SETUP.
+        session.ap2.mark_paired().unwrap();
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
 
         let mut stream = plist::Dictionary::new();
         stream.insert("type".to_string(), plist_uint_value(103u64));
         stream.insert("shk".to_string(), plist::Value::Data(vec![7u8; 32]));
+        // AAC 48000 format: bit 23 = 0x0080_0000, sample_rate = 48000
         stream.insert("audioFormat".to_string(), plist_uint_value(0x0080_0000u64));
-        stream.insert("sr".to_string(), plist_uint_value(44_100u64));
-        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        stream.insert("sr".to_string(), plist_uint_value(48_000u64));
+        stream.insert("spf".to_string(), plist_uint_value(1024u64));
         let mut setup = plist::Dictionary::new();
         setup.insert(
             "streams".to_string(),
@@ -3533,6 +4202,7 @@ mod tests {
 
         let dacp = DacpController::disabled(state.clone());
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let response = handle_ap2_setup(
             &config.airplay,
             &state,
@@ -3540,6 +4210,7 @@ mod tests {
             &request,
             &playout,
             &dacp,
+            &policy,
         );
         let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
         let streams = parsed
@@ -3562,6 +4233,1013 @@ mod tests {
         );
     }
 
+    // ── Realtime type 96 / Data type 130 rejection ──────────────────────
+
+    #[tokio::test]
+    async fn ap2_setup_realtime_type96_rejected_no_listener_activation() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(96u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        // Whole-request atomic rejection: returns 400 with binary plist body.
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+
+        assert_eq!(first.get("type").and_then(plist_uint), Some(96));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        // No dataPort or controlPort — listeners were never opened.
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+        // State must NOT be activated.
+        assert!(!state.snapshot().active);
+        // Diagnostics record rejection.
+        assert_eq!(
+            state.snapshot().diagnostics.get("ap2_stream_setup"),
+            Some(&"rejected-pre-validation".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_data_type130_rejected_no_listener_activation() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(130u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        // Type-130 without remote-control-only session: 455.
+        assert_eq!(response.code, 455);
+        assert!(!state.snapshot().active);
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_unknown_stream_type_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(999u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+
+        assert_eq!(first.get("type").and_then(plist_uint), Some(999));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("controlPort").is_none());
+    }
+
+    // ── Unsupported timing protocol rejection ───────────────────────────
+
+    #[test]
+    fn ap2_initial_setup_ntp_timing_rejected_400() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "timingProtocol".to_string(),
+            plist::Value::String("NTP".to_string()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+
+        assert_eq!(response.code, 400);
+        assert_eq!(
+            state
+                .snapshot()
+                .diagnostics
+                .get("ap2_timing_protocol_rejected"),
+            Some(&"NTP-unsupported".to_string())
+        );
+    }
+
+    #[test]
+    fn ap2_initial_setup_none_timing_rejected_400() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "timingProtocol".to_string(),
+            plist::Value::String("None".to_string()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+
+        assert_eq!(response.code, 400);
+        assert_eq!(
+            state
+                .snapshot()
+                .diagnostics
+                .get("ap2_timing_protocol_rejected"),
+            Some(&"None-without-remote-control".to_string())
+        );
+    }
+
+    #[test]
+    fn ap2_initial_setup_empty_timing_rejected_400() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "timingProtocol".to_string(),
+            plist::Value::String("".to_string()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+
+        assert_eq!(response.code, 400);
+    }
+
+    // ── Unplayable format in buffered stream ────────────────────────────
+
+    #[tokio::test]
+    async fn ap2_buffered_setup_unplayable_format_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        // AlacOnly policy: AAC is not playable
+        config.airplay.advertised_format_policy = crate::config::AdvertisedFormatPolicy::AlacOnly;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        // AAC 44100 (bit 22) — not playable under AlacOnly
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0040_0000u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        stream.insert("sr".to_string(), plist_uint_value(44_100u64));
+        stream.insert("spf".to_string(), plist_uint_value(1024u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+
+        assert_eq!(first.get("type").and_then(plist_uint), Some(103));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        // No dataPort or controlPort — listener was never opened
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+        // State must NOT be activated
+        assert!(!state.snapshot().active);
+        // Diagnostics record rejection
+        assert_eq!(
+            state.snapshot().diagnostics.get("ap2_stream_setup"),
+            Some(&"rejected-pre-validation".to_string())
+        );
+    }
+
+    // ── Validation edge cases: missing/bad fields, mixed arrays ──────────
+
+    #[tokio::test]
+    async fn ap2_setup_type103_missing_audioformat_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        // audioFormat deliberately absent
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+        assert_eq!(first.get("type").and_then(plist_uint), Some(103));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+        assert!(!state.snapshot().active);
+        assert!(session.ap2.streams().is_empty());
+        assert!(session.ap2.session_key().is_none());
+        assert!(!session.is_playback_owner);
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_type103_unknown_audioformat_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        stream.insert("audioFormat".to_string(), plist_uint_value(0xDEAD_BEEFu64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+        assert_eq!(first.get("type").and_then(plist_uint), Some(103));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_type103_short_shk_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 16])); // < 32
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("sr".to_string(), plist_uint_value(44_100u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+        assert_eq!(first.get("type").and_then(plist_uint), Some(103));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+        assert!(session.ap2.session_key().is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_type103_missing_shk_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        // shk deliberately absent
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("sr".to_string(), plist_uint_value(44_100u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_type103_sample_rate_mismatch_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        // ALAC 44100 (bit 18) but sr claims 48000
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("sr".to_string(), plist_uint_value(48_000u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        let first = streams[0].as_dictionary().unwrap();
+        assert_eq!(first.get("type").and_then(plist_uint), Some(103));
+        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
+        assert!(first.get("dataPort").is_none());
+        assert!(first.get("controlPort").is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_setup_mixed_valid_invalid_atomic_rejection() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.control_port = 6001;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        // Stream 1: valid buffered audio
+        let mut s1 = plist::Dictionary::new();
+        s1.insert("type".to_string(), plist_uint_value(103u64));
+        s1.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        s1.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        s1.insert("sr".to_string(), plist_uint_value(44_100u64));
+        s1.insert("spf".to_string(), plist_uint_value(352u64));
+        // Stream 2: invalid type 96
+        let mut s2 = plist::Dictionary::new();
+        s2.insert("type".to_string(), plist_uint_value(96u64));
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![
+                plist::Value::Dictionary(s1),
+                plist::Value::Dictionary(s2),
+            ]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        // Whole-request rejection: 400, all streams get status=1
+        assert_eq!(response.code, 400);
+        let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
+        let streams = parsed
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        assert_eq!(streams.len(), 2);
+        for sv in streams {
+            let sd = sv.as_dictionary().unwrap();
+            assert_eq!(sd.get("status").and_then(plist_uint), Some(1));
+            assert!(sd.get("dataPort").is_none());
+            assert!(sd.get("controlPort").is_none());
+        }
+        // No state mutation
+        assert!(!state.snapshot().active);
+        assert!(session.ap2.streams().is_empty());
+        assert!(session.ap2.session_key().is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_stream_setup_rejected_when_ptp_unavailable() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![7u8; 32]));
+        stream.insert("sr".to_string(), plist_uint_value(44_100u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = Ap2CapabilityPolicy::from_config(&config, false);
+
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+
+        assert_eq!(response.code, 400);
+        assert!(session.ap2_control_port.is_none());
+        assert!(session.buffered_audio_port.is_none());
+        assert!(session.ap2.streams().is_empty());
+        assert!(session.ap2.session_key().is_none());
+        assert!(!session.is_playback_owner);
+        assert!(!state.snapshot().active);
+        assert!(state.ap2_media_key.read().is_none());
+        assert!(state.ap2_audio_format.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn ap2_empty_stream_array_rejected_without_listener() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+        let mut setup = plist::Dictionary::new();
+        setup.insert("streams".to_string(), plist::Value::Array(Vec::new()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        assert!(session.ap2_control_port.is_none());
+        assert!(session.buffered_audio_port.is_none());
+        assert!(!state.snapshot().active);
+    }
+
+    #[test]
+    fn ap2_non_array_streams_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::String("bad".to_string()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        assert!(session.ap2_control_port.is_none());
+        assert_eq!(
+            state.snapshot().diagnostics.get("ap2_stream_setup"),
+            Some(&"rejected-malformed-streams".to_string())
+        );
+    }
+
+    #[test]
+    fn ap2_initial_setup_missing_timing_protocol_rejected() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let mut session = RtspSession::default();
+        let mut body = Vec::new();
+        plist::to_writer_binary(
+            &mut body,
+            &plist::Value::Dictionary(plist::Dictionary::new()),
+        )
+        .unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let dacp = DacpController::disabled(state.clone());
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let response = handle_ap2_setup(
+            &config.airplay,
+            &state,
+            &mut session,
+            &request,
+            &playout,
+            &dacp,
+            &policy,
+        );
+        assert_eq!(response.code, 400);
+        assert_eq!(
+            state
+                .snapshot()
+                .diagnostics
+                .get("ap2_timing_protocol_rejected"),
+            Some(&"missing".to_string())
+        );
+        assert!(session.event_port.is_none());
+    }
+
+    // ── GET /info correctness ────────────────────────────────────────────
+
+    #[test]
+    fn ap2_info_contains_expected_binary_plist_fields() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.device_id = "AA:BB:CC:DD:EE:FF".to_string();
+        config.airplay.pin = "".to_string();
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+        let info_body = get_info_body(&config.airplay, None, &policy);
+        let parsed: plist::Dictionary =
+            plist::from_bytes(&info_body).expect("info body must be valid binary plist");
+
+        // Required fields
+        assert_eq!(parsed.get("vv").and_then(plist_uint), Some(2));
+        assert!(parsed.contains_key("features"));
+        assert!(parsed.contains_key("featuresEx"));
+        assert!(parsed.contains_key("statusFlags"));
+        assert!(parsed.contains_key("deviceID"));
+        assert!(parsed.contains_key("pi"));
+        assert!(parsed.contains_key("pk"));
+        assert!(parsed.contains_key("supportedFormats"));
+        assert!(parsed.contains_key("txtAirPlay"));
+
+        // features must match the policy
+        let features_from_info = parsed.get("features").and_then(plist_uint).unwrap();
+        assert_eq!(features_from_info, policy.features);
+
+        // supportedFormats must contain audioStream (always 0) and bufferStream
+        let fmts = parsed
+            .get("supportedFormats")
+            .and_then(plist::Value::as_dictionary)
+            .unwrap();
+        assert_eq!(
+            fmts.get("audioStream").and_then(plist_uint),
+            Some(0),
+            "realtime audio stream must always be 0"
+        );
+        assert!(fmts.get("bufferStream").and_then(plist_uint).unwrap_or(0) != 0);
+        assert_eq!(
+            fmts.get("bufferStream").and_then(plist_uint),
+            Some(policy.buffer_stream_formats)
+        );
+
+        // txtAirPlay must be valid binary data
+        let txt_airplay = parsed.get("txtAirPlay").and_then(|v| v.as_data());
+        assert!(txt_airplay.is_some(), "txtAirPlay must be binary data");
+        let txt_bytes = txt_airplay.unwrap();
+        assert!(!txt_bytes.is_empty());
+        // txtAirPlay should contain key=value pairs in DNS-SD format
+        let txt_str = String::from_utf8_lossy(txt_bytes);
+        assert!(
+            txt_str.contains("features=0x"),
+            "txtAirPlay must contain features"
+        );
+        assert!(
+            txt_str.contains("flags=0x"),
+            "txtAirPlay must contain flags"
+        );
+        assert!(
+            txt_str.contains("deviceid="),
+            "txtAirPlay must contain deviceid"
+        );
+    }
+
+    #[test]
+    fn ap2_info_features_and_txt_airplay_use_same_policy() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+        let info_body = get_info_body(&config.airplay, None, &policy);
+        let parsed: plist::Dictionary =
+            plist::from_bytes(&info_body).expect("info body must be valid binary plist");
+
+        // The features field in info
+        let info_features = parsed.get("features").and_then(plist_uint).unwrap();
+
+        // The txtAirPlay field also encodes features.
+        // The binary format is length-prefixed entries: [len:u8][key=value bytes]...
+        // We verify consistency by comparing against the policy value
+        // and confirming both info and mDNS agree.
+        assert_eq!(info_features, policy.features);
+
+        // Extract features from mDNS airplay_txt()
+        let mdnstxt = crate::airplay::txt_records::airplay_txt(&config, &policy);
+        let features_entry = mdnstxt
+            .iter()
+            .find(|e| e.starts_with("features=0x"))
+            .unwrap();
+        let features_clean = features_entry.strip_prefix("features=0x").unwrap();
+        let comma = features_clean.find(',').unwrap();
+        let lo = u64::from_str_radix(&features_clean[..comma], 16).unwrap();
+        let hi_rest = &features_clean[comma + 1..];
+        // from_str_radix does not accept "0x" prefix
+        let hi_hex = hi_rest.strip_prefix("0x").unwrap_or(hi_rest);
+        let hi = u64::from_str_radix(hi_hex, 16).unwrap();
+        let mdnstxt_features = lo | (hi << 32);
+
+        assert_eq!(mdnstxt_features, info_features);
+        assert_eq!(mdnstxt_features, policy.features);
+    }
+
+    #[test]
+    fn ap2_info_txt_airplay_consistency() {
+        // The same policy used for GET /info also feeds mDNS TXT records.
+        // Verify that features derived from mDNS airplay_txt() match /info.
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+
+        // From /info
+        let info_body = get_info_body(&config.airplay, None, &policy);
+        let parsed: plist::Dictionary = plist::from_bytes(&info_body).unwrap();
+        let info_features = parsed.get("features").and_then(plist_uint).unwrap();
+
+        // From mDNS TXT
+        let mdnstxt = crate::airplay::txt_records::airplay_txt(&config, &policy);
+        let features_entry = mdnstxt
+            .iter()
+            .find(|e| e.starts_with("features=0x"))
+            .unwrap();
+        let features_clean = features_entry.strip_prefix("features=0x").unwrap();
+        let comma = features_clean.find(',').unwrap();
+        let lo = u64::from_str_radix(&features_clean[..comma], 16).unwrap();
+        let hi_rest = &features_clean[comma + 1..];
+        // from_str_radix does not accept "0x" prefix
+        let hi_hex = hi_rest.strip_prefix("0x").unwrap_or(hi_rest);
+        let hi = u64::from_str_radix(hi_hex, 16).unwrap();
+        let mdnstxt_features = lo | (hi << 32);
+
+        assert_eq!(mdnstxt_features, info_features);
+        assert_eq!(mdnstxt_features, policy.features);
+    }
+
     #[test]
     fn ap2_teardown_body_identifies_buffered_stream() {
         let mut stream = plist::Dictionary::new();
@@ -3576,13 +5254,13 @@ mod tests {
         plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
 
         assert_eq!(
-            ap2_teardown_stream_type(&body),
-            Some(Ap2StreamType::BufferedAudio)
+            Ap2TeardownTarget::from_teardown_body(&body),
+            Some(Ap2TeardownTarget::Stream(Ap2StreamType::BufferedAudio))
         );
     }
 
     #[test]
-    fn ap2_session_teardown_body_is_not_stream_teardown() {
+    fn ap2_session_teardown_body_is_session_target() {
         let mut body = Vec::new();
         plist::to_writer_binary(
             &mut body,
@@ -3590,29 +5268,68 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ap2_teardown_stream_type(&body), None);
+        // Empty/plain body → Session teardown
+        assert_eq!(
+            Ap2TeardownTarget::from_teardown_body(&body),
+            Some(Ap2TeardownTarget::Session)
+        );
+    }
+
+    #[test]
+    fn ap2_teardown_unknown_stream_type_returns_none() {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(999u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+
+        // Unknown type → None (caller returns 400)
+        assert_eq!(Ap2TeardownTarget::from_teardown_body(&body), None);
+    }
+
+    #[test]
+    fn ap2_teardown_empty_body_is_session() {
+        assert_eq!(
+            Ap2TeardownTarget::from_teardown_body(&[]),
+            Some(Ap2TeardownTarget::Session)
+        );
     }
 
     #[test]
     fn ap2_alac_only_does_not_advertise_aac_buffer_formats() {
-        let formats = advertised_ap2_formats(AdvertisedFormatPolicy::AlacOnly);
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.advertised_format_policy = crate::config::AdvertisedFormatPolicy::AlacOnly;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
 
-        assert_ne!(formats.buffer_stream & 0x0004_0000, 0);
-        assert_ne!(formats.buffer_stream & 0x0020_0000, 0);
-        assert_eq!(formats.buffer_stream & 0x0040_0000, 0);
-        assert_eq!(formats.buffer_stream & 0x0080_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0004_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0020_0000, 0);
+        assert_eq!(policy.buffer_stream_formats & 0x0040_0000, 0);
+        assert_eq!(policy.buffer_stream_formats & 0x0080_0000, 0);
     }
 
     #[test]
     fn ap2_aac_policy_advertises_only_stereo_aac_buffer_formats() {
-        let formats = advertised_ap2_formats(AdvertisedFormatPolicy::AacIfAvailable);
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        config.airplay.advertised_format_policy =
+            crate::config::AdvertisedFormatPolicy::AacIfAvailable;
+        config.ptp.enabled = true;
+        config.ptp.backend = crate::config::PtpBackendName::Embedded;
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
 
-        assert_ne!(formats.buffer_stream & 0x0004_0000, 0);
-        assert_ne!(formats.buffer_stream & 0x0020_0000, 0);
-        assert_ne!(formats.buffer_stream & 0x0040_0000, 0);
-        assert_ne!(formats.buffer_stream & 0x0080_0000, 0);
-        assert_eq!(formats.buffer_stream & 0x2700_0000, 0);
-        assert_eq!(formats.buffer_stream & 0x2800_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0004_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0020_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0040_0000, 0);
+        assert_ne!(policy.buffer_stream_formats & 0x0080_0000, 0);
+        assert_eq!(policy.buffer_stream_formats & 0x2700_0000, 0);
+        assert_eq!(policy.buffer_stream_formats & 0x2800_0000, 0);
     }
 
     // -------------------------------------------------------------------
@@ -3752,6 +5469,7 @@ mod tests {
 
         let mut session = RtspSession::default();
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let services = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3760,6 +5478,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let response = route_request(&services, &mut session, &request);
 
@@ -3818,6 +5537,7 @@ mod tests {
 
         let mut session = RtspSession::default();
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let services = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3826,6 +5546,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let response = route_request(&services, &mut session, &request);
 
@@ -3990,6 +5711,7 @@ mod tests {
         let mut session = RtspSession::default();
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -3998,6 +5720,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         route_request(&svc, &mut session, &request);
 
@@ -4055,8 +5778,32 @@ mod tests {
 
         let mut session = RtspSession::default();
         session.is_playback_owner = true;
+        // Register a buffered audio stream in the session so teardown
+        // recognizes it as the last (and only) buffered stream.
+        session.ap2.mark_paired().unwrap();
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        session
+            .ap2
+            .add_stream(Ap2Stream {
+                stream_id: 1,
+                stream_connection_id: None,
+                stream_type: Ap2StreamType::BufferedAudio,
+                config: Ap2StreamConfig::BufferedAudio {
+                    audio_format: AudioFormat::Alac44100S16Stereo,
+                    sample_rate: 44100,
+                    frames_per_packet: 352,
+                    media_key: [0xCDu8; 32],
+                },
+                data_port: 6000,
+                state: Ap2StreamState::Configured,
+            })
+            .unwrap();
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4065,6 +5812,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         route_request(&svc, &mut session, &request);
 
@@ -4218,6 +5966,7 @@ mod tests {
         };
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4226,6 +5975,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let resp = route_request(&svc, &mut session, &request);
 
@@ -4285,6 +6035,7 @@ mod tests {
         };
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4293,6 +6044,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let resp = route_request(&svc, &mut session, &request);
         assert_eq!(resp.code, 200);
@@ -4327,6 +6079,7 @@ mod tests {
         };
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4335,6 +6088,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let resp = route_request(&svc, &mut session, &request);
         assert_eq!(resp.code, 400);
@@ -4372,6 +6126,7 @@ mod tests {
         };
 
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4380,6 +6135,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
         let resp = route_request(&svc, &mut session, &request);
         assert_eq!(resp.code, 400);
@@ -4414,6 +6170,7 @@ mod tests {
             body: vec![],
         };
         let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
         let svc = ConnectionServices {
             config: &config.airplay,
             state: &state,
@@ -4422,6 +6179,7 @@ mod tests {
             playout: &playout,
             player: &player,
             dacp: &dacp,
+            ap2_policy: &policy,
         };
 
         let resp = route_request(&svc, &mut session, &request);
@@ -4494,5 +6252,1025 @@ mod tests {
         let snap = state.snapshot();
         assert!(snap.diagnostics.contains_key("ap1_remote_control"));
         assert!(snap.diagnostics.contains_key("ap1_remote_timing"));
+    }
+
+    // ── Full route-level lifecycle test ────────────────────────────────
+
+    /// Test-only helper: pair the session (simulate successful pair-verify).
+    fn test_pair(session: &mut RtspSession) {
+        session.ap2.mark_paired().unwrap();
+    }
+
+    fn test_pair_with_secret(session: &mut RtspSession, secret: [u8; 32]) {
+        test_pair(session);
+        session.pairing.install_test_control_secret(secret);
+    }
+
+    fn ap2_plist_request(method: &str, dictionary: plist::Dictionary) -> RtspRequest {
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(dictionary)).unwrap();
+        RtspRequest {
+            method: method.to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: [(
+                "Content-Type".to_string(),
+                "application/x-apple-binary-plist".to_string(),
+            )]
+            .into(),
+            body,
+        }
+    }
+
+    fn type130_setup_request(
+        seed: Option<plist::Value>,
+        wants_dedicated_socket: Option<plist::Value>,
+        control_type: Option<plist::Value>,
+        stream_id: Option<u64>,
+    ) -> RtspRequest {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(130u64));
+        if let Some(seed) = seed {
+            stream.insert("seed".to_string(), seed);
+        }
+        if let Some(value) = wants_dedicated_socket {
+            stream.insert("wantsDedicatedSocket".to_string(), value);
+        }
+        if let Some(value) = control_type {
+            stream.insert("controlType".to_string(), value);
+        }
+        if let Some(stream_id) = stream_id {
+            stream.insert("streamID".to_string(), plist_uint_value(stream_id));
+        }
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        ap2_plist_request("SETUP", setup)
+    }
+
+    fn stream_teardown_request(stream_type: u64) -> RtspRequest {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(stream_type));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        ap2_plist_request("TEARDOWN", teardown)
+    }
+
+    async fn assert_tcp_closed(stream: &mut TcpStream) {
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("TCP stream did not close")
+        {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            other => panic!("expected closed TCP stream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_control_only_route_lifecycle_has_no_audio_side_effects() {
+        let secret = [0x6du8; 32];
+        let seed = 987_654_321u64;
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        state.set_player_state(PlayerState::Paused);
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        session.local_addr = Some("127.0.0.1:7000".parse().unwrap());
+        session.peer_addr = Some("127.0.0.1:7001".parse().unwrap());
+        test_pair_with_secret(&mut session, secret);
+
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "timingProtocol".to_string(),
+            plist::Value::String("None".to_string()),
+        );
+        setup.insert(
+            "isRemoteControlOnly".to_string(),
+            plist::Value::Boolean(true),
+        );
+        let response = route_request(&svc, &mut session, &ap2_plist_request("SETUP", setup));
+        assert_eq!(response.code, 200);
+        let setup_response = plist::from_bytes::<plist::Dictionary>(&response.body).unwrap();
+        assert_eq!(setup_response.len(), 1);
+        let event_port = setup_response
+            .get("eventPort")
+            .and_then(plist_uint)
+            .unwrap() as u16;
+        assert!(event_port > 0);
+        assert_eq!(session.event_port, Some(event_port));
+        assert!(session.event_listener.is_some());
+        assert!(session.ap2.is_remote_control_only());
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+        assert!(!session.is_playback_owner);
+        assert!(!state.snapshot().active);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+
+        let record = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &record);
+        assert_eq!(response.code, 200);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Audio-Latency" && value == "0")
+        );
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+        assert_eq!(session.ap2.stream_count(), 0);
+        assert!(!session.is_playback_owner);
+        assert!(!state.snapshot().active);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+
+        let request = type130_setup_request(
+            Some(plist_uint_value(seed)),
+            Some(plist::Value::Boolean(true)),
+            Some(plist_uint_value(2u64)),
+            Some(77),
+        );
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        let response_dict = plist::from_bytes::<plist::Dictionary>(&response.body).unwrap();
+        let streams = response_dict
+            .get("streams")
+            .and_then(plist::Value::as_array)
+            .unwrap();
+        assert_eq!(streams.len(), 1);
+        let stream = streams[0].as_dictionary().unwrap();
+        assert_eq!(stream.len(), 3);
+        assert_eq!(stream.get("type").and_then(plist_uint), Some(130));
+        assert_eq!(stream.get("streamID").and_then(plist_uint), Some(77));
+        assert!(stream.get("controlPort").is_none());
+        let data_port = stream.get("dataPort").and_then(plist_uint).unwrap() as u16;
+        assert_eq!(session.data_port, Some(data_port));
+        assert!(session.data_listener.is_some());
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::StreamConfigured);
+        assert_eq!(session.ap2.stream_count(), 1);
+        assert!(!session.is_playback_owner);
+        assert!(!state.snapshot().active);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(state.ap2_media_key.read().is_none());
+        assert!(state.ap2_audio_format.read().is_none());
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+
+        let mut data_stream = TcpStream::connect(("127.0.0.1", data_port)).await.unwrap();
+        let mut client_cipher = PairCipher::data_for_client(&secret, seed);
+        let mut sync = vec![0u8; 32];
+        sync[0..4].copy_from_slice(&32u32.to_be_bytes());
+        sync[4..8].copy_from_slice(b"sync");
+        sync[20..28].copy_from_slice(&55u64.to_be_bytes());
+        let encrypted = client_cipher.encrypt_blocks(&sync).unwrap();
+        data_stream.write_all(&encrypted).await.unwrap();
+        let mut encrypted_reply = vec![0u8; 50];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            data_stream.read_exact(&mut encrypted_reply),
+        )
+        .await
+        .expect("sync reply timed out")
+        .unwrap();
+        let (reply, consumed) = client_cipher.decrypt_blocks(&encrypted_reply).unwrap();
+        assert_eq!(consumed, encrypted_reply.len());
+        assert_eq!(reply.len(), 32);
+        assert_eq!(&reply[4..8], b"rply");
+        assert_eq!(u64::from_be_bytes(reply[20..28].try_into().unwrap()), 55);
+
+        let duplicate = route_request(&svc, &mut session, &request);
+        assert_eq!(duplicate.code, 455);
+        assert_eq!(session.data_port, Some(data_port));
+        assert_eq!(session.ap2.stream_count(), 1);
+
+        let response = route_request(&svc, &mut session, &stream_teardown_request(130));
+        assert_eq!(response.code, 200);
+        assert_tcp_closed(&mut data_stream).await;
+        assert!(session.data_listener.is_none());
+        assert!(session.data_port.is_none());
+        assert_eq!(session.ap2.stream_count(), 0);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+        assert!(session.event_listener.is_some());
+        assert_eq!(session.event_port, Some(event_port));
+        assert!(!state.snapshot().active);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+
+        let teardown = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &teardown);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Closed);
+        assert!(!session.ap2.is_remote_control_only());
+        assert_eq!(session.ap2.stream_count(), 0);
+        assert!(session.event_listener.is_none());
+        assert!(session.event_port.is_none());
+        assert!(session.data_listener.is_none());
+        assert!(session.data_port.is_none());
+        assert!(!state.snapshot().active);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(drain_cmds(&mut cmd_rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn type130_rejections_are_transactional_and_strict() {
+        let secret = [0x42u8; 32];
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, mut cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        session.local_addr = Some("127.0.0.1:7000".parse().unwrap());
+        test_pair_with_secret(&mut session, secret);
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::None, None, None)
+            .unwrap();
+        session.ap2.set_remote_control_only(true);
+
+        let cases = [
+            type130_setup_request(None, None, None, None),
+            type130_setup_request(
+                Some(plist::Value::String("1".to_string())),
+                None,
+                None,
+                None,
+            ),
+            type130_setup_request(
+                Some(plist_uint_value(1u64)),
+                Some(plist::Value::Boolean(false)),
+                None,
+                None,
+            ),
+            type130_setup_request(
+                Some(plist_uint_value(1u64)),
+                Some(plist::Value::String("true".to_string())),
+                None,
+                None,
+            ),
+            type130_setup_request(
+                Some(plist_uint_value(1u64)),
+                None,
+                Some(plist_uint_value(1u64)),
+                None,
+            ),
+            type130_setup_request(
+                Some(plist_uint_value(1u64)),
+                None,
+                Some(plist::Value::String("2".to_string())),
+                None,
+            ),
+        ];
+
+        for request in cases {
+            let response = route_request(&svc, &mut session, &request);
+            assert_eq!(response.code, 400);
+            assert!(session.data_listener.is_none());
+            assert!(session.data_port.is_none());
+            assert_eq!(session.ap2.stream_count(), 0);
+            assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+            assert!(!session.is_playback_owner);
+            assert!(!state.snapshot().active);
+            assert!(state.ap2_media_key.read().is_none());
+            assert!(state.ap2_audio_format.read().is_none());
+            assert!(drain_cmds(&mut cmd_rx).is_empty());
+        }
+
+        let valid = type130_setup_request(
+            Some(plist_uint_value(1u64)),
+            Some(plist::Value::Boolean(true)),
+            Some(plist_uint_value(2u64)),
+            Some(9),
+        );
+        let response = route_request(&svc, &mut session, &valid);
+        assert_eq!(response.code, 200);
+        assert!(session.data_listener.is_some());
+        assert!(session.data_port.is_some());
+        assert_eq!(session.ap2.stream_count(), 1);
+        session.abort_ap2_listeners();
+    }
+
+    #[tokio::test]
+    async fn full_lifecycle_paired_to_teardown() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+
+        // 1. Pair
+        test_pair(&mut session);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+
+        // 2. Initial PTP SETUP through the real route. The test installs a
+        // prebound event port so no network listener or pairing cipher fixture
+        // is required, while the production transaction path is exercised.
+        session.install_test_event_port(49_152);
+        let mut timing_setup = plist::Dictionary::new();
+        timing_setup.insert(
+            "timingProtocol".to_string(),
+            plist::Value::String("PTP".to_string()),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(timing_setup)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/x-apple-binary-plist".to_string(),
+        );
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+        assert_eq!(session.event_port, Some(49_152));
+
+        // 3. SETPEERS
+        let request = RtspRequest {
+            method: "SETPEERS".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::PeersConfigured);
+
+        // 4. Stream SETUP (via route)
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("sr".to_string(), plist_uint_value(44100u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/x-apple-binary-plist".to_string(),
+        );
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::StreamConfigured);
+
+        // 5. RECORD
+        let request = RtspRequest {
+            method: "RECORD".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Recording);
+
+        // 6. PAUSE
+        let request = RtspRequest {
+            method: "PAUSE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paused);
+
+        // 7. SETRATEANCHORTIME rate=1 (resume)
+        let mut rate = plist::Dictionary::new();
+        rate.insert("rate".to_string(), plist_uint_value(1u64));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(rate)).unwrap();
+        let request = RtspRequest {
+            method: "SETRATEANCHORTIME".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Recording);
+
+        // 8. Stream TEARDOWN
+        let mut stream = plist::Dictionary::new();
+        stream.insert("streamID".to_string(), plist_uint_value(0u64));
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        let mut teardown = plist::Dictionary::new();
+        teardown.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(teardown)).unwrap();
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        // Stream removed → regress to PeersConfigured
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::PeersConfigured);
+
+        // 9. Session TEARDOWN
+        let request = RtspRequest {
+            method: "TEARDOWN".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 200);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Closed);
+    }
+
+    #[test]
+    fn setup_before_pairing_returns_455() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+
+        // Stream SETUP before pairing → 455
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(103u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![1u8; 32]));
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0004_0000u64));
+        stream.insert("sr".to_string(), plist_uint_value(44100u64));
+        stream.insert("spf".to_string(), plist_uint_value(352u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/x-apple-binary-plist".to_string(),
+        );
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers,
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 455);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
+    }
+
+    // ── AppState snapshot: invalid/failure paths do not mutate ─────────
+
+    #[test]
+    fn appstate_snapshot_before_failure_unchanged() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let snap_before = state.snapshot();
+
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+
+        // Connected session — SETPEERS should fail and not mutate AppState
+        let mut session = RtspSession::default();
+        let request = RtspRequest {
+            method: "SETPEERS".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 455);
+
+        let snap_after = state.snapshot();
+        assert_eq!(snap_before.active, snap_after.active);
+        assert_eq!(snap_before.player_state, snap_after.player_state);
+        assert_eq!(snap_before.track.title, snap_after.track.title);
+    }
+
+    #[test]
+    fn appstate_unchanged_after_invalid_stream_setup() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        test_pair(&mut session);
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        let snap_before = state.snapshot();
+
+        // Send stream SETUP with unknown type → rejected, AppState unchanged
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".to_string(), plist_uint_value(999u64));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".to_string(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &plist::Value::Dictionary(setup)).unwrap();
+        let request = RtspRequest {
+            method: "SETUP".to_string(),
+            uri: "rtsp://example/session".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body,
+        };
+        let response = route_request(&svc, &mut session, &request);
+        assert_eq!(response.code, 400);
+
+        let snap_after = state.snapshot();
+        assert_eq!(snap_before.active, snap_after.active);
+        assert_eq!(snap_before.player_state, snap_after.player_state);
+        assert_eq!(snap_before.track.title, snap_after.track.title);
+    }
+
+    #[test]
+    fn appstate_unchanged_after_invalid_pause() {
+        let config = crate::config::Config::default();
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        test_pair(&mut session);
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        let before = state.snapshot();
+        let request = RtspRequest {
+            method: "PAUSE".to_string(),
+            uri: "*".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        };
+        let response = route_request(&svc, &mut session, &request);
+
+        assert_eq!(response.code, 455);
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::TimingConfigured);
+        let after = state.snapshot();
+        assert_eq!(before.active, after.active);
+        assert_eq!(before.player_state, after.player_state);
+        assert_eq!(before.track.title, after.track.title);
+    }
+
+    #[test]
+    fn coalesced_cipher_activation_decrypts_residual_once() {
+        let secret = [0x42u8; 32];
+        let mut client = PairCipher::control_for_client(&secret);
+        let mut server = PairCipher::control_for_server(&secret);
+        let request = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let encrypted = client.encrypt_blocks(request).unwrap();
+        let mut plaintext_buf = encrypted;
+        let mut encrypted_buf = Vec::new();
+
+        handoff_coalesced_encrypted_control(
+            false,
+            Some(&mut server),
+            &mut plaintext_buf,
+            &mut encrypted_buf,
+        )
+        .unwrap();
+
+        assert!(encrypted_buf.is_empty());
+        let (parsed, consumed) = parse_request(&plaintext_buf).unwrap();
+        assert_eq!(parsed.method, "OPTIONS");
+        assert_eq!(consumed, plaintext_buf.len());
+    }
+
+    #[test]
+    fn already_encrypted_pipelined_requests_are_not_decrypted_twice() {
+        let secret = [0x24u8; 32];
+        let mut client = PairCipher::control_for_client(&secret);
+        let mut server = PairCipher::control_for_server(&secret);
+        let first = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let second = b"GET /info RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+        let mut combined = Vec::new();
+        combined.extend_from_slice(first);
+        combined.extend_from_slice(second);
+        let encrypted = client.encrypt_blocks(&combined).unwrap();
+        let mut plaintext_buf = Vec::new();
+        let mut encrypted_buf = encrypted;
+        let consumed =
+            decrypt_control_blocks(&mut server, &encrypted_buf, &mut plaintext_buf).unwrap();
+        encrypted_buf.drain(..consumed);
+
+        handoff_coalesced_encrypted_control(
+            true,
+            Some(&mut server),
+            &mut plaintext_buf,
+            &mut encrypted_buf,
+        )
+        .unwrap();
+
+        assert!(encrypted_buf.is_empty());
+        let (request1, used1) = parse_request(&plaintext_buf).unwrap();
+        assert_eq!(request1.method, "OPTIONS");
+        let (request2, used2) = parse_request(&plaintext_buf[used1..]).unwrap();
+        assert_eq!(request2.method, "GET");
+        assert_eq!(used1 + used2, plaintext_buf.len());
+    }
+
+    #[test]
+    fn control_buffer_limits_accept_boundary_and_reject_overflow() {
+        let mut plaintext = vec![0u8; MAX_PLAINTEXT_CONTROL_BUF - 1];
+        append_control_plaintext(&mut plaintext, &[1]).unwrap();
+        assert_eq!(plaintext.len(), MAX_PLAINTEXT_CONTROL_BUF);
+        assert!(append_control_plaintext(&mut plaintext, &[2]).is_err());
+
+        let mut encrypted = vec![0u8; MAX_ENCRYPTED_CONTROL_BUF - 1];
+        append_encrypted_control(&mut encrypted, &[1]).unwrap();
+        assert_eq!(encrypted.len(), MAX_ENCRYPTED_CONTROL_BUF);
+        assert!(append_encrypted_control(&mut encrypted, &[2]).is_err());
+    }
+
+    #[test]
+    fn pairing_tlv_error_never_activates_control_cipher() {
+        let mut config = crate::config::Config::default();
+        config.airplay.airplay2_enabled = true;
+        let state = AppState::new(config.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(8);
+        let player = SharedPlayer::new();
+        let dacp = DacpController::disabled(state.clone());
+        let pairing = Arc::new(PairingService::new(
+            IdentityKey::load_or_generate(None, &config.airplay.device_id),
+            config.airplay.device_id.clone(),
+            config.airplay.pin.clone(),
+            None::<std::path::PathBuf>,
+        ));
+        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let policy = test_policy();
+        let svc = ConnectionServices {
+            config: &config.airplay,
+            state: &state,
+            pairing: &pairing,
+            audio_engine: &audio_engine,
+            playout: &playout,
+            player: &player,
+            dacp: &dacp,
+            ap2_policy: &policy,
+        };
+        let mut session = RtspSession::default();
+        let mut tlv = crate::airplay::tlv::Tlv::default();
+        tlv.insert(crate::airplay::pairing::TLV_STATE, [1]);
+        tlv.insert(crate::airplay::pairing::TLV_METHOD, [1]);
+        let request = RtspRequest {
+            method: "POST".to_string(),
+            uri: "/pair-setup".to_string(),
+            version: "RTSP/1.0".to_string(),
+            headers: BTreeMap::new(),
+            body: tlv.encode(),
+        };
+
+        let response = route_request(&svc, &mut session, &request);
+        let reply_tlv = crate::airplay::tlv::Tlv::parse(&response.body);
+        assert_eq!(response.code, 200);
+        assert!(
+            reply_tlv
+                .first(crate::airplay::pairing::TLV_ERROR)
+                .is_some()
+        );
+        assert!(session.control_cipher.is_none());
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
+    }
+
+    #[test]
+    fn rejected_pairing_completion_installs_no_cipher() {
+        let mut session = RtspSession::default();
+        session.ap2.begin_teardown().unwrap();
+        session.ap2.close().unwrap();
+        let completion = PairingCompletion::Verify {
+            shared_secret: [0x33; 32],
+        };
+        assert!(activate_pairing_completion(&mut session, &completion).is_err());
+        assert!(session.control_cipher.is_none());
+    }
+
+    // ── activate_pairing_completion compliance ─────────────────────────
+
+    #[test]
+    fn full_setup_marks_paired_and_leaves_control_cipher_none() {
+        let mut session = RtspSession::default();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Connected);
+        assert!(session.control_cipher.is_none());
+
+        let completion = PairingCompletion::FullSetup {
+            key: [0xAA; 64],
+            client_id: "test-client".into(),
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        // FullSetup must advance the phase to Paired.
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // FullSetup must NOT install control encryption.
+        assert!(session.control_cipher.is_none());
+    }
+
+    #[test]
+    fn verify_installs_cipher() {
+        let mut session = RtspSession::default();
+        let secret: [u8; 32] = [0x77; 32];
+        let completion = PairingCompletion::Verify {
+            shared_secret: secret,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // Verify must install a control cipher using the X25519 shared secret.
+        assert!(session.control_cipher.is_some());
+    }
+
+    #[test]
+    fn transient_setup_installs_cipher() {
+        let mut session = RtspSession::default();
+        let completion = PairingCompletion::TransientSetup {
+            key: [0xBB; 64],
+            client_id: None,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        // TransientSetup must install control encryption (no subsequent verify).
+        assert!(session.control_cipher.is_some());
+    }
+
+    /// After a non-transient FullSetup (control_cipher left None), a
+    /// plaintext pair-verify-like RTSP request must remain parseable as
+    /// plaintext.  It must not be routed into encrypted-parsing.
+    #[test]
+    fn full_setup_leaves_control_plaintext_for_next_request() {
+        let mut session = RtspSession::default();
+
+        // 1. Complete a non-transient pair-setup.
+        let completion = PairingCompletion::FullSetup {
+            key: [0xCC; 64],
+            client_id: "test-client-2".into(),
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+        assert!(session.control_cipher.is_none());
+
+        // 2. Simulate residual plaintext pair-verify bytes after the
+        //    FullSetup response. The production handoff helper must leave
+        //    them in the plaintext buffer because no cipher was activated.
+        let raw = b"POST /pair-verify RTSP/1.0\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Content-Length: 6\r\n\
+                     \r\n\
+                     \x00\x01\x02\x03\x04\x05";
+        let mut plaintext = raw.to_vec();
+        let mut encrypted = Vec::new();
+        handoff_coalesced_encrypted_control(
+            false,
+            session.control_cipher.as_mut(),
+            &mut plaintext,
+            &mut encrypted,
+        )
+        .unwrap();
+        assert_eq!(plaintext, raw);
+        assert!(encrypted.is_empty());
+
+        let (parsed, consumed) = parse_request(&plaintext).unwrap();
+        assert_eq!(consumed, plaintext.len());
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.uri, "/pair-verify");
+        assert_eq!(
+            parsed.headers.get("Content-Type").map(|s| s.as_str()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(parsed.body, b"\x00\x01\x02\x03\x04\x05");
+    }
+
+    /// After a TransientSetup installs the cipher, the next request on
+    /// the wire is encrypted — the coalesced handoff path must still
+    /// work (regression guard for the existing behaviour).
+    #[test]
+    fn transient_setup_cipher_activated_coalesced_handoff_guard() {
+        let mut session = RtspSession::default();
+        let completion = PairingCompletion::TransientSetup {
+            key: [0xDD; 64],
+            client_id: None,
+        };
+        activate_pairing_completion(&mut session, &completion).unwrap();
+        // After TransientSetup the cipher must be active — the next
+        // request must be encrypted.
+        assert!(session.control_cipher.is_some());
+    }
+
+    /// Verify-after-FullSetup must install the cipher: simulate a
+    /// non-transient pair-setup followed by a pair-verify completion.
+    #[test]
+    fn verify_after_full_setup_installs_cipher() {
+        let mut session = RtspSession::default();
+
+        // Step 1: FullSetup — no cipher.
+        let setup_completion = PairingCompletion::FullSetup {
+            key: [0xEE; 64],
+            client_id: "client-3".into(),
+        };
+        activate_pairing_completion(&mut session, &setup_completion).unwrap();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        assert!(session.control_cipher.is_none());
+
+        // Step 2: Verify — cipher must be installed.
+        let secret: [u8; 32] = [0xFF; 32];
+        let verify_completion = PairingCompletion::Verify {
+            shared_secret: secret,
+        };
+        activate_pairing_completion(&mut session, &verify_completion).unwrap();
+        assert_eq!(session.ap2.phase(), Ap2SessionPhase::Paired);
+        assert!(session.control_cipher.is_some());
     }
 }

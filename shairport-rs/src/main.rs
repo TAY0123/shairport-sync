@@ -23,7 +23,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::{
-    airplay::playout_decoder::AirPlayPacketDecoder,
+    airplay::{ap2::capability::Ap2CapabilityPolicy, playout_decoder::AirPlayPacketDecoder},
     api::ApiContext,
     config::{Config, PtpBackendName},
     mdns::{MdnsAdvertiser, MdnsBackend},
@@ -115,29 +115,47 @@ async fn main() -> anyhow::Result<()> {
     let (playout_handle, playout_task) =
         playout::scheduler::spawn_playout_service(scheduler_config, decoder, audio_engine.clone());
 
-    let ptp_handle =
-        if config.airplay.enabled && config.airplay.airplay2_enabled && config.ptp.enabled {
-            match config.ptp.backend {
-                PtpBackendName::Embedded => {
-                    match ptp::spawn_ptp_service(config.ptp.clone(), app_state.clone()).await {
-                        Ok(handle) => Some(handle),
-                        Err(err) => {
-                            warn!(%err, "embedded PTP service not started");
-                            app_state.set_diagnostic("ptp_error", err.to_string());
-                            None
-                        }
+    let mut ptp_running = false;
+    let ptp_handle = if config.airplay.enabled
+        && config.airplay.airplay2_enabled
+        && config.ptp.enabled
+    {
+        match config.ptp.backend {
+            PtpBackendName::Embedded => {
+                match ptp::spawn_ptp_service(config.ptp.clone(), app_state.clone()).await {
+                    Ok(handle) => {
+                        ptp_running = true;
+                        Some(handle)
+                    }
+                    Err(err) => {
+                        warn!(%err, "embedded PTP service not started");
+                        app_state.set_diagnostic("ptp_error", err.to_string());
+                        None
                     }
                 }
-                PtpBackendName::Nqptp => {
-                    info!("external nqptp configured; embedded PTP socket bind skipped");
-                    app_state.set_diagnostic("ptp_backend", "nqptp".to_string());
-                    None
-                }
-                PtpBackendName::Off => None,
             }
-        } else {
-            None
-        };
+            PtpBackendName::Nqptp => {
+                info!("external nqptp configured; no shared-memory clock adapter implemented yet");
+                app_state.set_diagnostic("ptp_backend", "nqptp".to_string());
+                app_state.set_diagnostic(
+                    "ap2_unavailable_reason",
+                    "nqptp-adapter-not-implemented".to_string(),
+                );
+                // nqptp requires a shared-memory clock adapter that is not
+                // yet implemented.  Until it exists, PTP is not available,
+                // which means _airplay._tcp will be suppressed and AP2
+                // stream/timing requests will be rejected.
+                ptp_running = false;
+                None
+            }
+            PtpBackendName::Off => None,
+        }
+    } else {
+        None
+    };
+
+    // Build the capability policy once so mDNS and RTSP /info agree.
+    let ap2_policy = Ap2CapabilityPolicy::from_config(&config, ptp_running);
 
     let rtsp_handle = if config.airplay.enabled {
         Some(
@@ -148,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 player.clone(),
                 dacp.clone(),
                 playout_handle.clone(),
+                ap2_policy,
             )
             .await?,
         )
@@ -173,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mdns_backend = MdnsBackend::from_config(&config.mdns);
     let mdns_advertiser = MdnsAdvertiser::new(mdns_backend, config.mdns.clone());
-    let services = airplay::txt_records::airplay_services(&config);
+    let services = airplay::txt_records::airplay_services(&config, ptp_running);
     let service_types: Vec<String> = services
         .iter()
         .map(|s| s.service_type.trim_end_matches(".local.").to_string())
