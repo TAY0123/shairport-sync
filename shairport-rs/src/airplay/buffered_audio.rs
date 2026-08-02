@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -13,6 +13,7 @@ use tokio::{
     time,
 };
 use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::{
     codec,
@@ -31,19 +32,83 @@ const SSRC_ALAC_44100_S16_2: u32 = 0x0000_FACE;
 const SSRC_ALAC_48000_S24_2: u32 = 0x1500_0000;
 const SSRC_AAC_44100_F24_2: u32 = 0x1600_0000;
 const SSRC_AAC_48000_F24_2: u32 = 0x1700_0000;
+pub const MAX_BUFFERED_BLOCK_BYTES: usize = u16::MAX as usize;
+
+pub fn advertised_audio_buffer_size(packet_capacity: usize) -> u32 {
+    packet_capacity
+        .saturating_mul(MAX_BUFFERED_BLOCK_BYTES)
+        .min(u32::MAX as usize) as u32
+}
+
+/// Immutable, per-stream runtime shared by the owning AP2 session and its
+/// buffered TCP listener. Secret material is zeroed when the final reference
+/// is dropped.
+pub struct BufferedStreamContext {
+    media_key: Zeroizing<[u8; 32]>,
+    pub audio_format: codec::AudioFormat,
+    pub sample_rate: u32,
+    pub frames_per_packet: u32,
+    pub stream_id: u32,
+    pub stream_connection_id: Option<u64>,
+}
+
+impl BufferedStreamContext {
+    pub fn new(
+        media_key: [u8; 32],
+        audio_format: codec::AudioFormat,
+        sample_rate: u32,
+        frames_per_packet: u32,
+        stream_id: u32,
+        stream_connection_id: Option<u64>,
+    ) -> Self {
+        Self {
+            media_key: Zeroizing::new(media_key),
+            audio_format,
+            sample_rate,
+            frames_per_packet,
+            stream_id,
+            stream_connection_id,
+        }
+    }
+
+    pub fn media_key(&self) -> &[u8; 32] {
+        &self.media_key
+    }
+
+    #[cfg(test)]
+    pub(crate) fn media_key_mut(&mut self) -> &mut [u8; 32] {
+        &mut self.media_key
+    }
+}
+
+impl std::fmt::Debug for BufferedStreamContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferedStreamContext")
+            .field("media_key", &"[REDACTED]")
+            .field("audio_format", &self.audio_format)
+            .field("sample_rate", &self.sample_rate)
+            .field("frames_per_packet", &self.frames_per_packet)
+            .field("stream_id", &self.stream_id)
+            .field("stream_connection_id", &self.stream_connection_id)
+            .finish()
+    }
+}
 
 /// Spawn a TCP listener for AP2 buffered audio on the configured audio port.
 pub async fn spawn_buffered_audio_receiver(
     config: AirplayConfig,
     state: AppState,
     playout: PlayoutHandle,
+    context: Arc<BufferedStreamContext>,
 ) -> anyhow::Result<JoinHandle<()>> {
     let bind = SocketAddr::from(([0, 0, 0, 0], config.audio_port));
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind buffered audio TCP on {bind}"))?;
     info!(port = config.audio_port, "AP2 buffered audio TCP listener");
-    Ok(spawn_buffered_accept_loop(listener, state, playout))
+    Ok(spawn_buffered_accept_loop(
+        listener, state, playout, context,
+    ))
 }
 
 /// Spawn an accept loop for buffered audio on an already-bound TcpListener.
@@ -51,6 +116,7 @@ pub fn spawn_buffered_accept_loop(
     listener: TcpListener,
     state: AppState,
     playout: PlayoutHandle,
+    context: Arc<BufferedStreamContext>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -58,8 +124,11 @@ pub fn spawn_buffered_accept_loop(
                 Ok((stream, peer)) => {
                     let state = state.clone();
                     let playout = playout.clone();
+                    let context = context.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_buffered_stream(stream, peer, state, playout).await {
+                        if let Err(e) =
+                            handle_buffered_stream(stream, peer, state, playout, context).await
+                        {
                             warn!(%peer, %e, "buffered audio stream error");
                         }
                     });
@@ -139,28 +208,34 @@ async fn submit_ap2_packet(
 /// [`TimedPacket`]s to the single shared playout service via awaited AP2 send.
 /// Decoder state and PCM production are owned exclusively by that service.
 pub async fn handle_buffered_stream(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: AppState,
+    playout: PlayoutHandle,
+    context: Arc<BufferedStreamContext>,
+) -> anyhow::Result<()> {
+    handle_buffered_stream_with_idle_poll(
+        stream,
+        peer,
+        state,
+        playout,
+        context,
+        time::Duration::from_secs(5),
+    )
+    .await
+}
+
+async fn handle_buffered_stream_with_idle_poll(
     mut stream: TcpStream,
     peer: SocketAddr,
     state: AppState,
     playout: PlayoutHandle,
+    context: Arc<BufferedStreamContext>,
+    idle_poll: time::Duration,
 ) -> anyhow::Result<()> {
     info!(%peer, "buffered audio connection opened");
 
-    // Wait until a session key is available (poll without holding guard across await)
-    info!("buffered audio: waiting for session key...");
-    let session_key = loop {
-        {
-            let key = state.ap2_media_key.read();
-            if let Some(k) = *key {
-                info!("buffered audio: session key obtained");
-                break k;
-            }
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    };
-
-    // Derive the data stream cipher
-    let mut cipher = BufferedCipher::new(&session_key);
+    let mut cipher = BufferedCipher::new(context.media_key());
     info!("buffered audio: cipher initialized, reading first block");
 
     // ── TCP read loop: frame, decrypt, extend, submit ──────────────
@@ -169,32 +244,67 @@ pub async fn handle_buffered_stream(
     let mut block_count: u64 = 0;
     let mut first_block_logged = false;
     let mut current_epoch = state.track_transition_epoch();
+    let mut length_prefix = [0u8; 2];
+    let mut prefix_bytes = 0usize;
 
-    loop {
-        // Read block length prefix (2 bytes, big-endian)
-        let len_raw = match time::timeout(time::Duration::from_secs(5), stream.read_u16()).await {
-            Ok(Ok(len)) => {
-                if !first_block_logged {
-                    info!(
-                        block_len = len,
-                        "buffered audio: first block length received, reading header..."
-                    );
-                    first_block_logged = true;
+    'blocks: loop {
+        // Poll readiness without consuming bytes. A quiet socket is normal at
+        // a track boundary, so it must not terminate the AP2 stream. Using
+        // readiness plus non-blocking reads also preserves a partially
+        // received two-byte prefix across idle polls without corrupting
+        // framing.
+        while prefix_bytes < length_prefix.len() {
+            match time::timeout(idle_poll, stream.readable()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    info!(%e, "buffered audio readiness failed, blocks_processed={}", block_count);
+                    break 'blocks;
                 }
-                len
+                Err(_) if state.snapshot().player_state == crate::state::PlayerState::Stopped => {
+                    debug!(
+                        blocks_processed = block_count,
+                        "buffered audio idle after playback stopped"
+                    );
+                    break 'blocks;
+                }
+                Err(_) => {
+                    debug!(
+                        blocks_processed = block_count,
+                        "buffered audio connection idle; waiting for next track"
+                    );
+                    continue;
+                }
             }
-            Ok(Err(e)) => {
-                info!(%e, "buffered audio stream closed by client, blocks_processed={}", block_count);
-                break;
+
+            match stream.try_read(&mut length_prefix[prefix_bytes..]) {
+                Ok(0) => {
+                    info!(
+                        "buffered audio stream closed by client, blocks_processed={}",
+                        block_count
+                    );
+                    break 'blocks;
+                }
+                Ok(read) => prefix_bytes += read,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    info!(%e, "buffered audio stream closed by client, blocks_processed={}", block_count);
+                    break 'blocks;
+                }
             }
-            Err(_) => {
-                info!("buffered audio: read timeout (5s), stream may be idle");
-                break;
-            }
-        };
+        }
+
+        let len_raw = u16::from_be_bytes(length_prefix);
+        prefix_bytes = 0;
+        if !first_block_logged {
+            info!(
+                block_len = len_raw,
+                "buffered audio: first block length received, reading header..."
+            );
+            first_block_logged = true;
+        }
         let block_len = len_raw as usize;
         let body_len = block_len.saturating_sub(2);
-        if body_len < 12 || block_len > 65535 {
+        if body_len < 12 {
             warn!(
                 block_len,
                 blocks_processed = block_count,
@@ -254,13 +364,13 @@ pub async fn handle_buffered_stream(
         let plaintext = match cipher.decrypt_block(&payload, &aad_buf) {
             Ok(p) => {
                 if block_count <= 3 {
-                    let hex_first16: String = payload
-                        .iter()
-                        .take(16)
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    info!(seq = seq_23, ssrc, blocks_processed = block_count, plaintext_len = p.len(), payload_first16 = %hex_first16, "buffered audio: block decrypted successfully");
+                    info!(
+                        seq = seq_23,
+                        ssrc,
+                        blocks_processed = block_count,
+                        plaintext_len = p.len(),
+                        "buffered audio: block decrypted successfully"
+                    );
                 }
                 p
             }
@@ -278,18 +388,19 @@ pub async fn handle_buffered_stream(
             "buffered audio block"
         );
 
-        let format =
-            match codec::AudioFormat::from_ssrc(ssrc).or_else(|| *state.ap2_audio_format.read()) {
-                Some(f) => f,
-                None => {
-                    warn!(
-                        ssrc,
-                        ssrc_hex = format_args!("{ssrc:#010x}"),
-                        "unknown AP2 audio format"
-                    );
-                    continue;
-                }
-            };
+        let format = match codec::AudioFormat::from_ssrc(ssrc) {
+            Some(format) if format != context.audio_format => {
+                warn!(
+                    ssrc,
+                    negotiated = context.audio_format.description(),
+                    received = format.description(),
+                    "buffered packet format does not match stream SETUP"
+                );
+                continue;
+            }
+            Some(format) => format,
+            None => context.audio_format,
+        };
 
         if !format.is_playable() {
             warn!(
@@ -315,8 +426,8 @@ pub async fn handle_buffered_stream(
         );
 
         // Awaited send applies TCP backpressure through the shared bounded
-        // ingress. Waiting-for-title does not discard AP2 packets here; RTSP
-        // metadata remains responsible for starting the scheduler.
+        // ingress. AP2 playback is controlled by RECORD and the PTP timeline;
+        // title metadata never gates buffered audio.
         match submit_ap2_packet(&state, &playout, pkt).await {
             Ap2SubmitResult::Accepted | Ap2SubmitResult::StaleEpoch => {}
             Ap2SubmitResult::Full => {
@@ -337,12 +448,14 @@ pub async fn handle_buffered_stream(
 
 /// Chacha20-Poly1305 cipher for buffered audio decryption.
 struct BufferedCipher {
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl BufferedCipher {
     fn new(session_key: &[u8; 32]) -> Self {
-        Self { key: *session_key }
+        Self {
+            key: Zeroizing::new(*session_key),
+        }
     }
 
     fn decrypt_block(&mut self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, &'static str> {
@@ -357,7 +470,7 @@ impl BufferedCipher {
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(nonce_raw);
 
-        let key = chacha20poly1305::Key::from_slice(&self.key);
+        let key = chacha20poly1305::Key::from_slice(self.key.as_ref());
         let cipher = ChaCha20Poly1305::new(key);
 
         let payload = Payload {
@@ -376,6 +489,7 @@ mod tests {
     use super::*;
     use crate::codec::AudioFormat;
     use crate::playout::scheduler::PlayoutHandle;
+    use tokio::io::AsyncWriteExt;
 
     fn ap2_packet(seq: u64, epoch: u64, format: AudioFormat) -> TimedPacket {
         TimedPacket::new(
@@ -400,6 +514,26 @@ mod tests {
     }
 
     #[test]
+    fn stream_context_redacts_key_and_buffer_size_tracks_capacity() {
+        let context = BufferedStreamContext::new(
+            [0xAB; 32],
+            AudioFormat::Alac44100S16Stereo,
+            44_100,
+            352,
+            7,
+            Some(9),
+        );
+        let rendered = format!("{context:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.to_ascii_lowercase().contains("abab"));
+        assert_eq!(
+            advertised_audio_buffer_size(768),
+            (768usize * MAX_BUFFERED_BLOCK_BYTES) as u32
+        );
+        assert_eq!(advertised_audio_buffer_size(usize::MAX), u32::MAX);
+    }
+
+    #[test]
     fn ssrc_values_match_known_formats() {
         assert_eq!(SSRC_ALAC_44100_S16_2, 0x0000_FACE);
         assert_eq!(SSRC_ALAC_48000_S24_2, 0x1500_0000);
@@ -412,6 +546,117 @@ mod tests {
         let key = [0u8; 32];
         let mut cipher = BufferedCipher::new(&key);
         assert!(cipher.decrypt_block(&[0u8; 10], &[0u8; 8]).is_err());
+    }
+
+    #[tokio::test]
+    async fn upstream_buffered_wire_layout_decrypts_and_reaches_ingress() {
+        // Independently generated ChaCha20-Poly1305 fixture:
+        // key=00..1f, nonce=00000000||0102030405060708,
+        // AAD=timestamp||SSRC, plaintext="ap2-buffered-fixture".
+        const CIPHERTEXT_AND_TAG: [u8; 36] = [
+            0x8e, 0x96, 0x97, 0xd5, 0xc7, 0xf9, 0xce, 0xfa, 0x75, 0xcd, 0x8d, 0xb2, 0xa7, 0x8a,
+            0x4e, 0x26, 0xe1, 0xf9, 0x16, 0x34, 0x4d, 0xbc, 0xfa, 0xc4, 0x3b, 0x9b, 0x7b, 0xa8,
+            0x3f, 0x4e, 0x55, 0xa3, 0x05, 0x42, 0x8e, 0x7e,
+        ];
+        const NONCE_SUFFIX: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        const SEQUENCE: u32 = 0x007f_fffe;
+        const TIMESTAMP: u32 = 0x0102_0304;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = AppState::new(crate::config::Config::default());
+        let (playout, _cmd_rx, mut ingress_rx) = PlayoutHandle::command_channel_for_tests(8);
+        let context = Arc::new(BufferedStreamContext::new(
+            std::array::from_fn(|index| index as u8),
+            AudioFormat::Alac48000S24Stereo,
+            48_000,
+            1_024,
+            17,
+            Some(23),
+        ));
+        let server_state = state.clone();
+        let server_playout = playout.clone();
+        let server_context = context.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_buffered_stream(stream, peer, server_state, server_playout, server_context)
+                .await
+                .unwrap();
+        });
+
+        let mut wire = Vec::new();
+        let payload_len = CIPHERTEXT_AND_TAG.len() + NONCE_SUFFIX.len();
+        let block_len = 2 + 12 + payload_len;
+        wire.extend_from_slice(&(block_len as u16).to_be_bytes());
+        wire.extend_from_slice(&SEQUENCE.to_be_bytes());
+        wire.extend_from_slice(&TIMESTAMP.to_be_bytes());
+        wire.extend_from_slice(&SSRC_ALAC_48000_S24_2.to_be_bytes());
+        wire.extend_from_slice(&CIPHERTEXT_AND_TAG);
+        wire.extend_from_slice(&NONCE_SUFFIX);
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&wire).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let packet = time::timeout(time::Duration::from_secs(1), ingress_rx.recv())
+            .await
+            .expect("decrypted packet did not reach ingress")
+            .expect("ingress closed");
+        assert_eq!(packet.raw_sequence, SEQUENCE);
+        assert_eq!(packet.extended_sequence, SEQUENCE as u64);
+        assert_eq!(packet.rtp_timestamp, TIMESTAMP);
+        assert_eq!(packet.ssrc, SSRC_ALAC_48000_S24_2);
+        assert_eq!(packet.format, Some(AudioFormat::Alac48000S24Stereo));
+        assert_eq!(packet.payload.as_ref(), b"ap2-buffered-fixture");
+        time::timeout(time::Duration::from_secs(1), server)
+            .await
+            .expect("buffered stream task did not close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_buffered_stream_survives_idle_track_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = AppState::new(crate::config::Config::default());
+        state.set_player_state(crate::state::PlayerState::Playing);
+        let (playout, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(8);
+        let context = Arc::new(BufferedStreamContext::new(
+            [0u8; 32],
+            AudioFormat::Alac44100S16Stereo,
+            44_100,
+            352,
+            1,
+            None,
+        ));
+
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_buffered_stream_with_idle_poll(
+                stream,
+                peer,
+                server_state,
+                playout,
+                context,
+                time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap();
+        });
+        let _client = TcpStream::connect(address).await.unwrap();
+
+        time::sleep(time::Duration::from_millis(75)).await;
+        assert!(
+            !server.is_finished(),
+            "an active AP2 stream must remain open while waiting for the next track"
+        );
+
+        state.set_player_state(crate::state::PlayerState::Stopped);
+        time::timeout(time::Duration::from_millis(100), server)
+            .await
+            .expect("idle stream did not exit after playback stopped")
+            .unwrap();
     }
 
     #[test]

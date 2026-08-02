@@ -10,4 +10,5 @@ pub mod rtsp;
 pub mod sdp;
 pub mod session_crypto;
 pub mod tlv;
+pub mod transcript;
 pub mod txt_records;

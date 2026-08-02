@@ -24,13 +24,218 @@
 //!                                                                 or TearingDown
 //! ```
 
-use std::fmt;
+use std::{fmt, net::IpAddr, sync::Arc};
 
 use crate::airplay::ap2::contract::{Ap2StreamType, Ap2TimingProtocol};
+use crate::airplay::buffered_audio::BufferedStreamContext;
 use crate::codec::AudioFormat;
 
 /// Maximum number of concurrent AP2 streams per session.
 pub const MAX_AP2_STREAMS: usize = 8;
+
+/// Validated fields received through POST /configure. UUID values are not
+/// retained here; only their presence is needed for session policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Ap2Configuration {
+    pub timing_protocol: Option<Ap2TimingProtocol>,
+    pub group_uuid_present: bool,
+    pub stream_category: Option<String>,
+    pub enable_hk_access_control: Option<bool>,
+    pub access_control_level: Option<u32>,
+}
+pub const MAX_TIMING_PEERS: usize = 64;
+pub const MAX_TIMING_ADDRESSES: usize = 32;
+
+// ---------------------------------------------------------------------------
+// PTP timing peers
+// ---------------------------------------------------------------------------
+
+/// A sender-advertised PTP peer. `clock_id == 0` is used only for the legacy
+/// SETPEERS format, which contains addresses but no clock identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimingPeer {
+    pub clock_id: u64,
+    pub addresses: Vec<IpAddr>,
+    pub device_type: Option<u64>,
+    pub priority: Option<u64>,
+    pub clock_port_override: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimingPeerListFormat {
+    Legacy,
+    Extended,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimingPeerParseError(pub &'static str);
+
+impl fmt::Display for TimingPeerParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// Parse `timingPeerInfo` from the initial PTP SETUP.
+///
+/// Some senders omit `ClockID` at this stage, so zero is retained as
+/// "identity not supplied"; SETPEERSX identities are validated strictly.
+pub fn parse_initial_timing_peer(value: &plist::Value) -> Result<TimingPeer, TimingPeerParseError> {
+    let dict = value
+        .as_dictionary()
+        .ok_or(TimingPeerParseError("timingPeerInfo must be a dictionary"))?;
+    parse_timing_peer_dictionary(dict, false, None)
+}
+
+/// Parse a SETPEERS or SETPEERSX body without mutating session state.
+///
+/// Legacy SETPEERS is a top-level array of IP address strings. SETPEERSX is a
+/// top-level array of peer dictionaries. `receiver_id` selects this receiver's
+/// entry from the optional `ClockPorts` map.
+pub fn parse_timing_peer_list(
+    body: &[u8],
+    format: TimingPeerListFormat,
+    receiver_id: Option<&str>,
+) -> Result<Vec<TimingPeer>, TimingPeerParseError> {
+    if body.is_empty() {
+        return Err(TimingPeerParseError("timing peer body is empty"));
+    }
+    let root = plist::from_bytes::<plist::Value>(body)
+        .map_err(|_| TimingPeerParseError("timing peer body is not a plist"))?;
+    let values = root
+        .as_array()
+        .ok_or(TimingPeerParseError("timing peer body must be an array"))?;
+    if values.is_empty() || values.len() > MAX_TIMING_PEERS {
+        return Err(TimingPeerParseError("invalid timing peer count"));
+    }
+
+    match format {
+        TimingPeerListFormat::Legacy => {
+            let addresses = parse_addresses(values)?;
+            Ok(vec![TimingPeer {
+                clock_id: 0,
+                addresses,
+                device_type: None,
+                priority: None,
+                clock_port_override: None,
+            }])
+        }
+        TimingPeerListFormat::Extended => values
+            .iter()
+            .map(|value| {
+                let dict = value.as_dictionary().ok_or(TimingPeerParseError(
+                    "extended timing peer must be a dictionary",
+                ))?;
+                parse_timing_peer_dictionary(dict, true, receiver_id)
+            })
+            .collect(),
+    }
+}
+
+fn parse_timing_peer_dictionary(
+    dict: &plist::Dictionary,
+    require_clock_id: bool,
+    receiver_id: Option<&str>,
+) -> Result<TimingPeer, TimingPeerParseError> {
+    let addresses = dict
+        .get("Addresses")
+        .and_then(plist::Value::as_array)
+        .ok_or(TimingPeerParseError(
+            "timing peer Addresses must be an array",
+        ))
+        .and_then(|values| parse_addresses(values))?;
+    let clock_id = match dict
+        .get("ClockID")
+        .and_then(plist::Value::as_unsigned_integer)
+    {
+        Some(0) if require_clock_id => {
+            return Err(TimingPeerParseError(
+                "extended timing peer ClockID must be nonzero",
+            ));
+        }
+        Some(value) => value,
+        None if require_clock_id => {
+            return Err(TimingPeerParseError(
+                "extended timing peer is missing ClockID",
+            ));
+        }
+        None => 0,
+    };
+
+    Ok(TimingPeer {
+        clock_id,
+        addresses,
+        device_type: optional_u64(dict, "DeviceType")?,
+        priority: optional_u64(dict, "Priority")?,
+        clock_port_override: parse_clock_port_override(dict, receiver_id)?,
+    })
+}
+
+fn parse_addresses(values: &[plist::Value]) -> Result<Vec<IpAddr>, TimingPeerParseError> {
+    if values.is_empty() || values.len() > MAX_TIMING_ADDRESSES {
+        return Err(TimingPeerParseError("invalid timing peer address count"));
+    }
+    let mut addresses = Vec::with_capacity(values.len());
+    for value in values {
+        let text = value
+            .as_string()
+            .ok_or(TimingPeerParseError("timing peer address must be a string"))?;
+        let address = text
+            .parse::<IpAddr>()
+            .map_err(|_| TimingPeerParseError("invalid timing peer IP address"))?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        return Err(TimingPeerParseError("timing peer has no addresses"));
+    }
+    Ok(addresses)
+}
+
+fn optional_u64(dict: &plist::Dictionary, key: &str) -> Result<Option<u64>, TimingPeerParseError> {
+    match dict.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_unsigned_integer()
+            .map(Some)
+            .ok_or(TimingPeerParseError(
+                "timing peer numeric field has the wrong type",
+            )),
+    }
+}
+
+fn parse_clock_port_override(
+    dict: &plist::Dictionary,
+    receiver_id: Option<&str>,
+) -> Result<Option<u16>, TimingPeerParseError> {
+    for key in ["ClockPort", "ClockPortOverride"] {
+        if let Some(value) = dict.get(key) {
+            return parse_port(value).map(Some);
+        }
+    }
+    let Some(value) = dict.get("ClockPorts") else {
+        return Ok(None);
+    };
+    let ports = value
+        .as_dictionary()
+        .ok_or(TimingPeerParseError("ClockPorts must be a dictionary"))?;
+    for value in ports.values() {
+        parse_port(value)?;
+    }
+    let selected = receiver_id
+        .and_then(|id| ports.get(id))
+        .or_else(|| (ports.len() == 1).then(|| ports.values().next()).flatten());
+    selected.map(parse_port).transpose()
+}
+
+fn parse_port(value: &plist::Value) -> Result<u16, TimingPeerParseError> {
+    value
+        .as_unsigned_integer()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+        .ok_or(TimingPeerParseError("invalid timing peer clock port"))
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle phases
@@ -299,14 +504,8 @@ pub enum Ap2StreamState {
 pub enum Ap2StreamConfig {
     /// Buffered audio stream (type 103).
     BufferedAudio {
-        /// Negotiated audio format.
-        audio_format: AudioFormat,
-        /// Sample rate in Hz.
-        sample_rate: u32,
-        /// Frames per packet.
-        frames_per_packet: u32,
-        /// Per-stream media key (shared secret for this stream).
-        media_key: [u8; 32],
+        /// Immutable runtime shared with the stream listener.
+        runtime: Arc<BufferedStreamContext>,
     },
     /// Data stream (type 130, remote-control-only).
     Data {
@@ -330,7 +529,10 @@ pub enum Ap2StreamConfig {
 impl Drop for Ap2StreamConfig {
     fn drop(&mut self) {
         match self {
-            Self::BufferedAudio { media_key, .. } | Self::RealtimeAudio { media_key, .. } => {
+            Self::BufferedAudio { .. } => {
+                // BufferedStreamContext zeroizes on final Arc drop.
+            }
+            Self::RealtimeAudio { media_key, .. } => {
                 media_key.fill(0);
             }
             Self::Data { .. } => {
@@ -343,16 +545,11 @@ impl Drop for Ap2StreamConfig {
 impl std::fmt::Debug for Ap2StreamConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BufferedAudio {
-                audio_format,
-                sample_rate,
-                frames_per_packet,
-                ..
-            } => f
+            Self::BufferedAudio { runtime } => f
                 .debug_struct("BufferedAudio")
-                .field("audio_format", audio_format)
-                .field("sample_rate", sample_rate)
-                .field("frames_per_packet", frames_per_packet)
+                .field("audio_format", &runtime.audio_format)
+                .field("sample_rate", &runtime.sample_rate)
+                .field("frames_per_packet", &runtime.frames_per_packet)
                 .field("media_key", &"[REDACTED]")
                 .finish(),
             Self::Data { .. } => f.debug_struct("Data").finish_non_exhaustive(),
@@ -412,8 +609,8 @@ impl Ap2Stream {
     /// Convenience: return the audio format if this is a buffered audio stream.
     pub fn audio_format(&self) -> Option<AudioFormat> {
         match &self.config {
-            Ap2StreamConfig::BufferedAudio { audio_format, .. }
-            | Ap2StreamConfig::RealtimeAudio { audio_format, .. } => Some(*audio_format),
+            Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.audio_format),
+            Ap2StreamConfig::RealtimeAudio { audio_format, .. } => Some(*audio_format),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -421,8 +618,8 @@ impl Ap2Stream {
     /// Convenience: return the sample rate if this is an audio stream.
     pub fn sample_rate(&self) -> Option<u32> {
         match &self.config {
-            Ap2StreamConfig::BufferedAudio { sample_rate, .. }
-            | Ap2StreamConfig::RealtimeAudio { sample_rate, .. } => Some(*sample_rate),
+            Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.sample_rate),
+            Ap2StreamConfig::RealtimeAudio { sample_rate, .. } => Some(*sample_rate),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -430,10 +627,8 @@ impl Ap2Stream {
     /// Convenience: return the frames per packet if this is an audio stream.
     pub fn frames_per_packet(&self) -> Option<u32> {
         match &self.config {
-            Ap2StreamConfig::BufferedAudio {
-                frames_per_packet, ..
-            }
-            | Ap2StreamConfig::RealtimeAudio {
+            Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.frames_per_packet),
+            Ap2StreamConfig::RealtimeAudio {
                 frames_per_packet, ..
             } => Some(*frames_per_packet),
             Ap2StreamConfig::Data { .. } => None,
@@ -443,8 +638,8 @@ impl Ap2Stream {
     /// Access the media key (audio streams only). Returns `None` for data streams.
     pub fn media_key(&self) -> Option<&[u8; 32]> {
         match &self.config {
-            Ap2StreamConfig::BufferedAudio { media_key, .. }
-            | Ap2StreamConfig::RealtimeAudio { media_key, .. } => Some(media_key),
+            Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.media_key()),
+            Ap2StreamConfig::RealtimeAudio { media_key, .. } => Some(media_key),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -460,7 +655,7 @@ impl Ap2Stream {
 /// directly in [`RtspSession`].  Listeners, ports, and playback-owner
 /// tracking remain on `RtspSession` because AP1 also uses them.
 ///
-/// Sensitive data (session key, stream media keys) is explicitly zeroed on
+/// Sensitive data is held only by stream contexts and explicitly zeroed on
 /// [`clear_sensitive`](Ap2SessionState::clear_sensitive) and on [`Drop`].
 ///
 /// This type is intentionally **not** [`Clone`] to avoid copying secret
@@ -473,6 +668,9 @@ pub struct Ap2SessionState {
     group_contains_group_leader: Option<bool>,
     active_remote: Option<String>,
     dacp_id: Option<String>,
+    initial_timing_peer: Option<TimingPeer>,
+    timing_peers: Vec<TimingPeer>,
+    selected_master_clock_id: Option<u64>,
     /// Whether SETPEERS / SETPEERSX has been successfully processed.
     /// Used to determine the correct phase to return to when the last
     /// stream is removed.
@@ -481,7 +679,13 @@ pub struct Ap2SessionState {
     /// timingProtocol=None with isRemoteControlOnly=true. Such sessions
     /// do not require PTP and may only carry data streams (type 130).
     remote_control_only: bool,
-    session_key: Option<[u8; 32]>,
+    /// A sender may issue RECORD after timing SETUP but before stream SETUP.
+    /// This records that ready intent without claiming audio is playing.
+    record_requested: bool,
+    /// Selected mode from POST /audioMode. Retained as session policy; mode-
+    /// specific output changes are applied only when backed by sender evidence.
+    audio_mode: Option<String>,
+    configuration: Ap2Configuration,
     streams: Vec<Ap2Stream>,
 }
 
@@ -494,9 +698,14 @@ impl Default for Ap2SessionState {
             group_contains_group_leader: None,
             active_remote: None,
             dacp_id: None,
+            initial_timing_peer: None,
+            timing_peers: Vec::new(),
+            selected_master_clock_id: None,
             peers_configured: false,
             remote_control_only: false,
-            session_key: None,
+            record_requested: false,
+            audio_mode: None,
+            configuration: Ap2Configuration::default(),
             streams: Vec::with_capacity(MAX_AP2_STREAMS),
         }
     }
@@ -535,9 +744,32 @@ impl Ap2SessionState {
         self.dacp_id.as_deref()
     }
 
-    /// Session media key (raw 32-byte array reference).
-    pub fn session_key(&self) -> Option<&[u8; 32]> {
-        self.session_key.as_ref()
+    pub fn initial_timing_peer(&self) -> Option<&TimingPeer> {
+        self.initial_timing_peer.as_ref()
+    }
+
+    pub fn configuration(&self) -> &Ap2Configuration {
+        &self.configuration
+    }
+
+    pub fn audio_mode(&self) -> Option<&str> {
+        self.audio_mode.as_deref()
+    }
+
+    pub fn set_audio_mode(&mut self, audio_mode: String) {
+        self.audio_mode = Some(audio_mode);
+    }
+
+    pub fn replace_configuration(&mut self, configuration: Ap2Configuration) {
+        self.configuration = configuration;
+    }
+
+    pub fn timing_peers(&self) -> &[TimingPeer] {
+        &self.timing_peers
+    }
+
+    pub fn selected_master_clock_id(&self) -> Option<u64> {
+        self.selected_master_clock_id
     }
 
     /// Configured streams (immutable view).
@@ -608,6 +840,13 @@ impl Ap2SessionState {
         self.group_uuid = group_uuid;
         self.group_contains_group_leader = group_contains_group_leader;
         Ok(())
+    }
+
+    /// Store the sender's `timingPeerInfo` after initial SETUP commits.
+    pub fn set_initial_timing_peer(&mut self, peer: TimingPeer, sender_ip: Option<IpAddr>) {
+        self.selected_master_clock_id =
+            select_master_clock(std::slice::from_ref(&peer), sender_ip, None);
+        self.initial_timing_peer = Some(peer);
     }
 
     /// Record that SETPEERS / SETPEERSX has been processed.
@@ -751,7 +990,59 @@ impl Ap2SessionState {
                 reason: "no streams configured",
             });
         }
-        self.apply_transition(Ap2SessionPhase::Recording)
+        self.apply_transition(Ap2SessionPhase::Recording)?;
+        self.record_requested = true;
+        Ok(())
+    }
+
+    /// Transactionally replace the sender's timing peer set and select the
+    /// active master. Invalid lifecycle transitions leave the old set intact.
+    pub fn replace_timing_peers(
+        &mut self,
+        peers: Vec<TimingPeer>,
+        sender_ip: Option<IpAddr>,
+    ) -> Result<(), TransitionError> {
+        let target = Ap2SessionPhase::PeersConfigured;
+        if self.phase != target {
+            validate_transition(self.phase, target)?;
+        }
+        let fallback = self
+            .initial_timing_peer
+            .as_ref()
+            .filter(|peer| peer.clock_id != 0);
+        let selected = select_master_clock(&peers, sender_ip, fallback);
+
+        self.phase = target;
+        self.peers_configured = true;
+        self.timing_peers = peers;
+        self.selected_master_clock_id = selected;
+        Ok(())
+    }
+
+    /// Accept RECORD after timing/peer setup, before the sender configures
+    /// its first audio stream. The phase remains timing/peer-configured and
+    /// no output is opened; later stream and anchor requests complete the
+    /// transition.
+    pub fn prepare_recording(&mut self) -> Result<(), TransitionError> {
+        if !self.streams.is_empty() {
+            return self.begin_recording();
+        }
+        if !matches!(
+            self.phase,
+            Ap2SessionPhase::TimingConfigured | Ap2SessionPhase::PeersConfigured
+        ) {
+            return Err(TransitionError {
+                from: self.phase,
+                to: Ap2SessionPhase::Recording,
+                reason: "timing must be configured before pre-stream RECORD",
+            });
+        }
+        self.record_requested = true;
+        Ok(())
+    }
+
+    pub fn record_requested(&self) -> bool {
+        self.record_requested
     }
 
     /// Pause playback.
@@ -800,8 +1091,8 @@ impl Ap2SessionState {
     ///
     /// Only valid from [`TearingDown`](Ap2SessionPhase::TearingDown)
     /// or already [`Closed`](Ap2SessionPhase::Closed) (idempotent).
-    /// Clears all connection data: session key, streams, group,
-    /// remote, DACP, and timing fields.
+    /// Clears all connection data: streams, group, remote, DACP, and timing
+    /// fields.
     pub fn close(&mut self) -> Result<(), TransitionError> {
         if self.phase == Ap2SessionPhase::Closed {
             return Ok(());
@@ -811,23 +1102,18 @@ impl Ap2SessionState {
         Ok(())
     }
 
-    /// Clear all sensitive data (session key, stream media keys) and
+    /// Clear all sensitive data (stream media keys) and
     /// logical connection data (group, remote, DACP, timing, flags).
     ///
     /// Zeroizes audio stream media keys individually, drops all streams,
     /// and resets logical fields to defaults including the
     /// `remote_control_only` flag.
     pub fn clear_sensitive(&mut self) {
-        if let Some(ref mut key) = self.session_key {
-            key.fill(0);
-        }
-        self.session_key = None;
-
         // Zeroize only audio stream media keys; data streams carry no secrets.
         for stream in &mut self.streams {
             match &mut stream.config {
-                Ap2StreamConfig::BufferedAudio { media_key, .. }
-                | Ap2StreamConfig::RealtimeAudio { media_key, .. } => {
+                Ap2StreamConfig::BufferedAudio { .. } => {}
+                Ap2StreamConfig::RealtimeAudio { media_key, .. } => {
                     media_key.fill(0);
                 }
                 Ap2StreamConfig::Data { .. } => {}
@@ -840,9 +1126,15 @@ impl Ap2SessionState {
         self.group_contains_group_leader = None;
         self.active_remote = None;
         self.dacp_id = None;
+        self.initial_timing_peer = None;
+        self.timing_peers.clear();
+        self.selected_master_clock_id = None;
         self.timing_protocol = Ap2TimingProtocol::None;
         self.peers_configured = false;
         self.remote_control_only = false;
+        self.record_requested = false;
+        self.audio_mode = None;
+        self.configuration = Ap2Configuration::default();
     }
 
     // ── Mutators for fields set during protocol handling ───────────────
@@ -857,29 +1149,35 @@ impl Ap2SessionState {
         self.dacp_id = Some(id);
     }
 
-    /// Set the session media key from a 32-byte array.
-    ///
-    /// Any previous key value is zeroed before being replaced.
-    pub fn set_session_key(&mut self, key: [u8; 32]) {
-        if let Some(ref mut old) = self.session_key {
-            old.fill(0);
-        }
-        self.session_key = Some(key);
-    }
-
-    /// Zero and clear the session key without touching other fields.
-    pub fn zero_session_key(&mut self) {
-        if let Some(ref mut key) = self.session_key {
-            key.fill(0);
-        }
-        self.session_key = None;
-    }
-
     /// Set the active remote and DACP ID together.
     pub fn set_remote_and_dacp(&mut self, remote: Option<String>, dacp: Option<String>) {
         self.active_remote = remote;
         self.dacp_id = dacp;
     }
+}
+
+fn select_master_clock(
+    peers: &[TimingPeer],
+    sender_ip: Option<IpAddr>,
+    fallback: Option<&TimingPeer>,
+) -> Option<u64> {
+    let valid = || peers.iter().filter(|peer| peer.clock_id != 0);
+    sender_ip
+        .and_then(|sender| {
+            valid()
+                .find(|peer| peer.addresses.contains(&sender))
+                .map(|peer| peer.clock_id)
+        })
+        .or_else(|| {
+            valid()
+                .min_by_key(|peer| peer.priority.unwrap_or(u64::MAX))
+                .map(|peer| peer.clock_id)
+        })
+        .or_else(|| {
+            fallback
+                .filter(|peer| sender_ip.is_none_or(|sender| peer.addresses.contains(&sender)))
+                .map(|peer| peer.clock_id)
+        })
 }
 
 impl Drop for Ap2SessionState {
@@ -1263,6 +1561,21 @@ mod tests {
     }
 
     #[test]
+    fn pre_stream_record_after_timing_is_accepted_but_not_playing() {
+        let mut state = Ap2SessionState::default();
+        state.mark_paired().unwrap();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+
+        state.prepare_recording().unwrap();
+
+        assert_eq!(state.phase(), Ap2SessionPhase::TimingConfigured);
+        assert!(state.record_requested());
+        assert!(!state.has_streams());
+    }
+
+    #[test]
     fn pause_before_record_allowed() {
         // FLUSHBUFFERED can transition StreamConfigured → Paused
         let mut state = Ap2SessionState::default();
@@ -1329,16 +1642,6 @@ mod tests {
     // ── Sensitive data tests ───────────────────────────────────────────
 
     #[test]
-    fn clear_sensitive_zeros_keys() {
-        let mut state = Ap2SessionState::default();
-        state.set_session_key([0xAAu8; 32]);
-        assert!(state.session_key().is_some());
-
-        state.clear_sensitive();
-        assert!(state.session_key().is_none());
-    }
-
-    #[test]
     fn clear_sensitive_zeros_stream_keys() {
         let mut state = Ap2SessionState::default();
         state.mark_paired().unwrap();
@@ -1347,8 +1650,8 @@ mod tests {
             .unwrap();
 
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
-            *media_key = [0x42u8; 32];
+        if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream.config {
+            *Arc::get_mut(runtime).unwrap().media_key_mut() = [0x42u8; 32];
         }
         state.add_stream(stream).unwrap();
         assert_eq!(state.stream_count(), 1);
@@ -1358,17 +1661,12 @@ mod tests {
         assert_eq!(state.stream_count(), 0);
     }
 
-    /// A test-only helper that zeroes the session key without dropping
-    /// the stream, so we can verify the media key was cleared.
+    /// A test-only helper that zeroes stream keys without dropping streams.
     #[cfg(test)]
     fn clear_key_for_test(state: &mut Ap2SessionState) {
-        if let Some(ref mut key) = state.session_key {
-            key.fill(0);
-        }
-        state.session_key = None;
         for stream in &mut state.streams {
-            if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
-                media_key.fill(0);
+            if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream.config {
+                Arc::get_mut(runtime).unwrap().media_key_mut().fill(0);
             }
         }
     }
@@ -1382,36 +1680,34 @@ mod tests {
             .unwrap();
 
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
-            *media_key = [0x42u8; 32];
+        if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream.config {
+            *Arc::get_mut(runtime).unwrap().media_key_mut() = [0x42u8; 32];
         }
         state.add_stream(stream).unwrap();
 
         clear_key_for_test(&mut state);
         let s = state.find_stream(1).unwrap();
         assert_eq!(s.media_key(), Some(&[0u8; 32]));
-        assert!(state.session_key().is_none());
     }
 
     #[test]
     fn drop_clears_sensitive() {
         let mut state = Ap2SessionState::default();
-        state.set_session_key([0xBBu8; 32]);
-
         // Create a stream with non-zero key
         state.mark_paired().unwrap();
         state
             .configure_timing(Ap2TimingProtocol::Ptp, None, None)
             .unwrap();
         let mut stream = test_stream(1, Ap2StreamType::BufferedAudio);
-        if let Ap2StreamConfig::BufferedAudio { media_key, .. } = &mut stream.config {
-            *media_key = [0xCCu8; 32];
+        if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream.config {
+            *Arc::get_mut(runtime).unwrap().media_key_mut() = [0xCCu8; 32];
         }
         state.add_stream(stream).unwrap();
 
-        // Verify session key is set before drop
-        let key_before = state.session_key().copied();
-        assert_eq!(key_before, Some([0xBBu8; 32]));
+        assert_eq!(
+            state.find_stream(1).unwrap().media_key(),
+            Some(&[0xCCu8; 32])
+        );
 
         drop(state);
         // After drop, state is consumed — the Drop impl zeroes secrets.
@@ -1468,16 +1764,29 @@ mod tests {
     fn two_sessions_independent_keys() {
         let mut s1 = Ap2SessionState::default();
         let mut s2 = Ap2SessionState::default();
+        for state in [&mut s1, &mut s2] {
+            state.mark_paired().unwrap();
+            state
+                .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+                .unwrap();
+        }
+        let mut stream1 = test_stream(1, Ap2StreamType::BufferedAudio);
+        let mut stream2 = test_stream(2, Ap2StreamType::BufferedAudio);
+        if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream1.config {
+            *Arc::get_mut(runtime).unwrap().media_key_mut() = [0x01u8; 32];
+        }
+        if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream2.config {
+            *Arc::get_mut(runtime).unwrap().media_key_mut() = [0x02u8; 32];
+        }
+        s1.add_stream(stream1).unwrap();
+        s2.add_stream(stream2).unwrap();
 
-        s1.set_session_key([0x01u8; 32]);
-        s2.set_session_key([0x02u8; 32]);
-
-        assert_eq!(s1.session_key().unwrap(), &[0x01u8; 32]);
-        assert_eq!(s2.session_key().unwrap(), &[0x02u8; 32]);
+        assert_eq!(s1.find_stream(1).unwrap().media_key(), Some(&[0x01u8; 32]));
+        assert_eq!(s2.find_stream(2).unwrap().media_key(), Some(&[0x02u8; 32]));
 
         s1.clear_sensitive();
-        assert!(s1.session_key().is_none());
-        assert!(s2.session_key().is_some());
+        assert!(s1.find_stream(1).is_none());
+        assert_eq!(s2.find_stream(2).unwrap().media_key(), Some(&[0x02u8; 32]));
     }
 
     // ── Failure rollback tests ─────────────────────────────────────────
@@ -1580,17 +1889,6 @@ mod tests {
     }
 
     #[test]
-    fn set_session_key_replaces_old() {
-        let mut state = Ap2SessionState::default();
-        state.set_session_key([0xAAu8; 32]);
-        assert_eq!(state.session_key().copied(), Some([0xAAu8; 32]));
-
-        // Replace — old key must be zeroed, new key stored.
-        state.set_session_key([0x55u8; 32]);
-        assert_eq!(state.session_key().copied(), Some([0x55u8; 32]));
-    }
-
-    #[test]
     fn find_stream_by_type() {
         let mut audio = Ap2SessionState::default();
         audio.mark_paired().unwrap();
@@ -1651,13 +1949,10 @@ mod tests {
             .unwrap();
         state.set_active_remote("r1".into());
         state.set_dacp_id("d1".into());
-        state.set_session_key([0x42u8; 32]);
-
         state.begin_teardown().unwrap();
         state.close().unwrap();
 
         assert_eq!(state.phase(), Ap2SessionPhase::Closed);
-        assert!(state.session_key().is_none());
         assert_eq!(state.stream_count(), 0);
         assert_eq!(state.group_uuid(), None);
         assert_eq!(state.active_remote(), None);
@@ -1674,10 +1969,7 @@ mod tests {
             .unwrap();
         state.set_active_remote("r1".into());
         state.set_dacp_id("d1".into());
-        state.set_session_key([0x42u8; 32]);
-
         state.clear_sensitive();
-        assert!(state.session_key().is_none());
         assert_eq!(state.stream_count(), 0);
         assert_eq!(state.group_uuid(), None);
         assert_eq!(state.active_remote(), None);
@@ -1692,14 +1984,10 @@ mod tests {
         state
             .configure_timing(Ap2TimingProtocol::Ptp, None, None)
             .unwrap();
-        state.set_session_key([0x42u8; 32]);
-
         // First cleanup
         state.clear_sensitive();
         // Second cleanup — must not panic
         state.clear_sensitive();
-        assert!(state.session_key().is_none());
-
         // close after begin_teardown (re-Setup on fresh state)
         let mut state2 = Ap2SessionState::default();
         state2.mark_paired().unwrap();
@@ -1921,14 +2209,153 @@ mod tests {
 
     // ── Helper ─────────────────────────────────────────────────────────
 
+    #[test]
+    fn parses_legacy_setpeers_address_array() {
+        let value = plist::Value::Array(vec![
+            plist::Value::String("192.0.2.10".into()),
+            plist::Value::String("2001:db8::10".into()),
+        ]);
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &value).unwrap();
+
+        let peers = parse_timing_peer_list(&body, TimingPeerListFormat::Legacy, None).unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].clock_id, 0);
+        assert_eq!(
+            peers[0].addresses,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "2001:db8::10".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_extended_peers_and_receiver_clock_port() {
+        let mut clock_ports = plist::Dictionary::new();
+        clock_ports.insert("receiver-id".into(), plist::Value::Integer(319u64.into()));
+        clock_ports.insert("other-id".into(), plist::Value::Integer(8319u64.into()));
+        let mut peer = plist::Dictionary::new();
+        peer.insert(
+            "Addresses".into(),
+            plist::Value::Array(vec![plist::Value::String("192.0.2.20".into())]),
+        );
+        peer.insert(
+            "ClockID".into(),
+            plist::Value::Integer(0x1122_3344_5566_7788u64.into()),
+        );
+        peer.insert("DeviceType".into(), plist::Value::Integer(7u64.into()));
+        peer.insert("Priority".into(), plist::Value::Integer(10u64.into()));
+        peer.insert("ClockPorts".into(), plist::Value::Dictionary(clock_ports));
+        let mut body = Vec::new();
+        plist::to_writer_binary(
+            &mut body,
+            &plist::Value::Array(vec![plist::Value::Dictionary(peer)]),
+        )
+        .unwrap();
+
+        let peers =
+            parse_timing_peer_list(&body, TimingPeerListFormat::Extended, Some("receiver-id"))
+                .unwrap();
+
+        assert_eq!(
+            peers,
+            vec![TimingPeer {
+                clock_id: 0x1122_3344_5566_7788,
+                addresses: vec!["192.0.2.20".parse().unwrap()],
+                device_type: Some(7),
+                priority: Some(10),
+                clock_port_override: Some(319),
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_peer_replacement_is_transactional() {
+        let mut state = paired_state();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        let sender = "192.0.2.30".parse::<IpAddr>().unwrap();
+        state
+            .replace_timing_peers(
+                vec![TimingPeer {
+                    clock_id: 42,
+                    addresses: vec![sender],
+                    device_type: None,
+                    priority: None,
+                    clock_port_override: None,
+                }],
+                Some(sender),
+            )
+            .unwrap();
+
+        let mut malformed = plist::Dictionary::new();
+        malformed.insert(
+            "Addresses".into(),
+            plist::Value::Array(vec![plist::Value::String("not-an-ip".into())]),
+        );
+        malformed.insert("ClockID".into(), plist::Value::Integer(43u64.into()));
+        let mut body = Vec::new();
+        plist::to_writer_binary(
+            &mut body,
+            &plist::Value::Array(vec![plist::Value::Dictionary(malformed)]),
+        )
+        .unwrap();
+        assert!(parse_timing_peer_list(&body, TimingPeerListFormat::Extended, None).is_err());
+        assert_eq!(state.selected_master_clock_id(), Some(42));
+        assert_eq!(state.timing_peers()[0].clock_id, 42);
+    }
+
+    #[test]
+    fn selects_sender_address_before_peer_priority_and_clears_on_close() {
+        let mut state = paired_state();
+        state
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
+        let sender = "192.0.2.40".parse::<IpAddr>().unwrap();
+        state
+            .replace_timing_peers(
+                vec![
+                    TimingPeer {
+                        clock_id: 1,
+                        addresses: vec!["192.0.2.41".parse().unwrap()],
+                        device_type: None,
+                        priority: Some(0),
+                        clock_port_override: None,
+                    },
+                    TimingPeer {
+                        clock_id: 2,
+                        addresses: vec![sender],
+                        device_type: None,
+                        priority: Some(100),
+                        clock_port_override: None,
+                    },
+                ],
+                Some(sender),
+            )
+            .unwrap();
+        assert_eq!(state.selected_master_clock_id(), Some(2));
+
+        state.begin_teardown().unwrap();
+        state.close().unwrap();
+        assert!(state.timing_peers().is_empty());
+        assert_eq!(state.selected_master_clock_id(), None);
+    }
+
     fn test_stream(id: u32, st: Ap2StreamType) -> Ap2Stream {
         use crate::codec::AudioFormat;
         let config = match st {
             Ap2StreamType::BufferedAudio => Ap2StreamConfig::BufferedAudio {
-                audio_format: AudioFormat::Alac44100S16Stereo,
-                sample_rate: 44100,
-                frames_per_packet: 352,
-                media_key: [0u8; 32],
+                runtime: Arc::new(BufferedStreamContext::new(
+                    [0u8; 32],
+                    AudioFormat::Alac44100S16Stereo,
+                    44100,
+                    352,
+                    id,
+                    None,
+                )),
             },
             Ap2StreamType::RealtimeAudio => Ap2StreamConfig::RealtimeAudio {
                 audio_format: AudioFormat::Alac44100S16Stereo,

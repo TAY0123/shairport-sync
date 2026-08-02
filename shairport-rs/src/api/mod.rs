@@ -15,6 +15,7 @@ use crate::{
     airplay::dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
     audio::{AudioEngine, AudioEngineStatus, AudioManager, SelectAudioDeviceRequest},
     mdns::MdnsAdvertiser,
+    playout::scheduler::{PlayoutHandle, PlayoutState},
     state::{AppState, PlayerState, RemoteControlState, StateSnapshot, TrackInfo, VolumeState},
 };
 
@@ -25,6 +26,7 @@ pub struct ApiContext {
     audio_engine: AudioEngine,
     mdns: MdnsAdvertiser,
     dacp: DacpController,
+    playout: Option<PlayoutHandle>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,26 @@ struct ArtworkResponse {
     artwork_url: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct PlayoutStatusResponse {
+    available: bool,
+    state: Option<&'static str>,
+    queued_ms: Option<u64>,
+    expected_sequence: Option<u64>,
+    drift: Option<DriftStatusResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct DriftStatusResponse {
+    enabled: bool,
+    correction_ppm: f64,
+    fifo_error_ms: f64,
+    timing_error_ns: f64,
+    saturated: bool,
+    saturation_count: u64,
+    hard_resync_count: u64,
+}
+
 impl ApiContext {
     pub fn new(
         state: AppState,
@@ -75,7 +97,13 @@ impl ApiContext {
             audio_engine,
             mdns,
             dacp,
+            playout: None,
         }
+    }
+
+    pub fn with_playout(mut self, playout: PlayoutHandle) -> Self {
+        self.playout = Some(playout);
+        self
     }
 }
 
@@ -87,6 +115,7 @@ pub fn router(context: ApiContext) -> Router {
         .route("/api/v1/artwork", get(get_artwork))
         .route("/api/v1/audio/devices", get(get_audio_devices))
         .route("/api/v1/audio/status", get(get_audio_status))
+        .route("/api/v1/playout/status", get(get_playout_status))
         .route("/api/v1/audio/device", post(select_audio_device))
         .route("/api/v1/mdns/status", get(get_mdns_status))
         .route("/api/v1/volume", post(set_volume))
@@ -98,6 +127,40 @@ pub fn router(context: ApiContext) -> Router {
 
 async fn get_audio_status(State(context): State<ApiContext>) -> Json<AudioEngineStatus> {
     Json(context.audio_engine.status())
+}
+
+async fn get_playout_status(State(context): State<ApiContext>) -> Json<PlayoutStatusResponse> {
+    let Some(playout) = context.playout else {
+        return Json(PlayoutStatusResponse {
+            available: false,
+            state: None,
+            queued_ms: None,
+            expected_sequence: None,
+            drift: None,
+        });
+    };
+    let status = playout.status();
+    Json(PlayoutStatusResponse {
+        available: true,
+        state: Some(match status.state {
+            PlayoutState::Stopped => "stopped",
+            PlayoutState::Priming => "priming",
+            PlayoutState::Playing => "playing",
+            PlayoutState::Rebuffering => "rebuffering",
+            PlayoutState::Paused => "paused",
+        }),
+        queued_ms: Some(status.queued_ms),
+        expected_sequence: Some(status.expected_sequence),
+        drift: status.drift.map(|drift| DriftStatusResponse {
+            enabled: drift.enabled,
+            correction_ppm: drift.correction_ppm,
+            fifo_error_ms: drift.fifo_error_ms,
+            timing_error_ns: drift.timing_error_ns,
+            saturated: drift.saturated,
+            saturation_count: drift.saturation_count,
+            hard_resync_count: drift.hard_resync_count,
+        }),
+    })
 }
 
 async fn get_state(State(context): State<ApiContext>) -> Json<StateSnapshot> {
@@ -398,6 +461,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn playout_status_reports_unavailable_without_scheduler_handle() {
+        let config = Config::default();
+        let state = AppState::new(config.clone());
+        let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
+        let app = router(ApiContext::new(
+            state,
+            AudioManager::new(config.audio.clone()),
+            audio_engine,
+            MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
+            dacp,
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/playout/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["available"], false);
+        assert!(json["state"].is_null());
+        assert!(json["drift"].is_null());
     }
 
     #[tokio::test]

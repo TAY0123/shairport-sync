@@ -59,19 +59,19 @@ explained in the inline comments there.
 | 4 | POST              | /pair-add    | Pairing     | Implemented |
 | 5 | POST              | /pair-remove | Pairing     | Implemented |
 | 6 | POST              | /pair-list   | Pairing     | Implemented |
-| 7 | POST              | /fp-setup    | FairPlay    | Stub        |
-| 8 | POST              | /configure   | Config      | Stub        |
-| 9 | POST              | /audioMode   | Audio       | Partial     |
+| 7 | POST              | /fp-setup    | FairPlay    | Partial     |
+| 8 | POST              | /configure   | Config      | Partial     |
+| 9 | POST              | /audioMode   | Audio       | Implemented |
 |10 | POST              | /command     | Control     | Partial     |
-|11 | POST              | /feedback    | Feedback    | Partial     |
+|11 | POST              | /feedback    | Feedback    | Implemented |
 |12 | SETUP             | * (initial)  | Stream      | Partial     |
 |13 | SETUP             | * (stream)   | Stream add  | Partial     |
-|14 | SETPEERS          | *            | Peers       | Stub        |
-|15 | SETPEERSX         | *            | Peers ext.  | Stub        |
+|14 | SETPEERS          | *            | Peers       | Implemented |
+|15 | SETPEERSX         | *            | Peers ext.  | Implemented |
 |16 | RECORD            | *            | Playback    | Partial     |
 |17 | SETRATEANCHORTIME | *            | Timing      | Partial     |
 |18 | PAUSE             | *            | Playback    | Implemented |
-|19 | FLUSHBUFFERED     | *            | Playback    | Partial     |
+|19 | FLUSHBUFFERED     | *            | Playback    | Implemented |
 |20 | TEARDOWN          | * (stream)   | Teardown    | Implemented |
 |21 | TEARDOWN          | * (session)  | Teardown    | Implemented |
 
@@ -141,15 +141,17 @@ are always idempotent.
 | TimingConfigured  | Initial PTP SETUP succeeded; event listener open.             |
 | PeersConfigured   | SETPEERS / SETPEERSX processed.                               |
 | StreamConfigured  | At least one stream SETUP processed; audio ports bound.       |
-| Recording         | RECORD or SETRATEANCHORTIME (rate=1) — audio playing.         |
+| Recording         | RECORD accepted; scheduler priming while timing gate may remain closed. |
 | Paused            | PAUSE, FLUSHBUFFERED, or SETRATEANCHORTIME (rate=0).          |
 | TearingDown       | TEARDOWN in progress — closing listeners.                     |
 | Closed            | Fully closed; no further operations permitted.                |
 
 ### Stream management
 
-`Ap2Stream` records track per-stream metadata (stream ID, type,
-audio format, sample rate, frames-per-packet, media key, data port).
+`Ap2Stream` owns an immutable buffered-audio context (stream and connection
+IDs, audio format, sample rate, frames-per-packet, zeroizing media key) plus
+its data port. Buffered workers receive this context directly and do not read
+media keys or formats from global application state.
 Up to `MAX_AP2_STREAMS` (8) concurrent streams are supported.
 `add_stream` and `remove_stream` are explicit methods that preserve
 the current phase when adding/removing streams from `Recording` or
@@ -197,7 +199,7 @@ clears its own AP2 secrets.
 
 | Protocol | Setup   | Data-path | Notes                                      |
 |----------|---------|-----------|--------------------------------------------|
-| PTP      | ✅      | Partial   | Embedded PTP service runs; scheduler anchor/deadline integration is pending. |
+| PTP      | ✅      | Partial   | Selected-master servo drives anchor deadlines. AP2-only bounded PI drift correction adjusts the resampler from timeline-tail and PCM FIFO error, with master/lock/reset handling and hard resync. Runtime correction, error, saturation, and hard-resync counters are exposed at `/api/v1/playout/status`; long-duration real-device validation remains pending. |
 | NTP      | ❌ (400) | —        | Explicitly rejected in initial SETUP.      |
 | None     | ❌ (400) | —        | Explicitly rejected in initial SETUP.      |
 
@@ -319,9 +321,10 @@ and artwork bodies; exceeding either limit drops the connection.
 1. **Realtime audio (type 96).**  The SETUP handler returns `status=1`
    without opening any listener.  No runtime resources are consumed.
 
-2. **NTP / None timing.**  The initial SETUP returns `400 Bad Request`.
-   Only `"PTP"` is accepted and wired through to the embedded
-   PTP service. Timeline anchors are not yet applied to scheduler deadlines.
+2. **NTP / None timing.**  The initial audio SETUP returns `400 Bad Request`.
+   Only `"PTP"` is accepted for audio. Complete rate anchors are converted
+   to local monotonic deadlines through the selected-master servo; output
+   remains gated until lock, watermark, and presentation time all agree.
 
 3. **Data stream MediaRemote decoding.**  The encrypted data stream
    (type 130) transport and sync reply protocol are implemented.
@@ -330,22 +333,37 @@ and artwork bodies; exceeding either limit drops the connection.
    or dispatched.  The channel is fully operational as a transport;
    only the MRP-level message handling is missing.
 
-4. **FairPlay (`/fp-setup`).**  The handler echoes the request body
-   back.  No license acquisition, content-key derivation, or SCP
-   handshake is implemented.  FairPlay-protected content will not
-   play.
+4. **FairPlay (`/fp-setup`).** The observed two-stage exchange is validated
+   strictly by version, message type, mode, declared length, and sequence,
+   then answered with the upstream mode-specific constants. State is owned by
+   the RTSP session and reset on teardown or connection failure. The upstream
+   receiver treats the 32-byte type-103 `shk` as the direct
+   ChaCha20-Poly1305 media key; the Rust buffered-wire regression verifies the
+   upstream packet layout (`timestamp || SSRC` AAD, ciphertext/tag, trailing
+   eight-byte nonce). Authentication with a packet captured from a real sender
+   remains the interoperability exit criterion.
 
-5. **`/configure`.**  The body is ignored; no `timingProtocol`,
-   `groupUUID`, or `streamCategory` fields are consumed.  The
-   response is always `200 OK` with no payload.
+5. **`/configure`.** Binary-plist shape and known timing protocol,
+   group-UUID presence, stream category, and nested HomeKit access-control
+   fields are validated transactionally and stored per session. Enabling
+   HomeKit access control returns the receiver identifier and public key.
+   Unknown sender-specific configuration fields remain capture-driven.
 
 6. **`/command`.**  Encrypted plist commands are decrypted and
    parsed for playback control (play/pause/stop/toggle), volume,
    and metadata updates.  Screen mirroring, Siri, and advanced
    MediaRemote commands are not handled.
 
-7. **`/feedback`.**  The body is acknowledged but not inspected.
-   Event-driven status push via the event channel now sends
+7. **`/feedback` and `/audioMode`.** The captured sender sends `/feedback`
+   without a body. While the owning session is recording a buffered stream,
+   the response matches upstream with a binary plist containing
+   `streams[0].type` and the negotiated sample rate in `streams[0].sr`.
+   Before recording it returns an empty 200 response. `/audioMode` requires
+   a bounded nonempty string and retains it in session-owned state;
+   malformed updates are rejected transactionally. No mode-specific output
+   change is invented without sender evidence.
+
+   Event-driven status push via the event channel sends
    `updateInfo` on each accepted connection and validates the
    encrypted 2xx acknowledgement.  No speculative live state
    pushes are generated yet — only the `updateInfo` command is
@@ -381,8 +399,11 @@ and artwork bodies; exceeding either limit drops the connection.
      connection, reconnect after failure, parent abort terminates
      worker, no payload log patterns.
 
-8. **SETPEERS / SETPEERSX.**  Body lengths are recorded as
-   diagnostics but the peer information is not stored or acted on.
+8. **SETPEERS / SETPEERSX.** Legacy address arrays and extended peer
+   dictionaries are parsed with strict bounds and lifecycle checks. Peer
+   replacement is transactional. The sender-address match is preferred as
+   PTP master, then peer priority; switching masters resets servo lock and
+   stale timing samples. Connection cleanup clears owner-scoped selection.
 
 ## Test coverage
 
@@ -412,7 +433,13 @@ The `capability.rs` module adds **~20 additional tests** verifying:
 - Format playability checks
 
 The `rtsp.rs` AP2 SETUP tests cover:
-- Buffered type 103 happy-path (ports + session key + audio format)
+- Buffered type 103 happy-path (ports + immutable session stream context)
+- Privacy-safe real-sender prefix ordering, including RECORD before stream
+  SETUP and omission of `sr`
+- Route-to-TCP-ingress authentication of an independently generated
+  encrypted packet using the exact `shk` supplied in stream SETUP
+- Actual ingress/jitter-capacity-derived `audioBufferSize`
+- Single buffered-stream enforcement and transactional listener rollback
 - Realtime type 96 rejection (status=1, no listener, no activation)
 - Data type 130 rejection without remote-control-only session (455)
 - Remote-control-only None timing + isRemoteControlOnly SETUP

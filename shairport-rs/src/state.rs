@@ -12,9 +12,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::{
-    airplay::session_crypto::SessionCrypto, audio::AudioDevice, codec::AudioFormat, config::Config,
-};
+use crate::{airplay::session_crypto::SessionCrypto, audio::AudioDevice, config::Config};
 
 /// Runtime-only AP1 remote transport endpoints (control + timing).
 /// Not serialized — reconstructed from SETUP Transport header at runtime.
@@ -30,14 +28,14 @@ pub struct AppState {
     events: broadcast::Sender<StateSnapshot>,
     /// Classic AirPlay per-session AES key + IV (from SDP ANNOUNCE).
     pub session_crypto: Arc<RwLock<Option<SessionCrypto>>>,
-    pub ap2_media_key: Arc<RwLock<Option<[u8; 32]>>>,
-    pub ap2_audio_format: Arc<RwLock<Option<AudioFormat>>>,
     pub alac_magic_cookie: Arc<RwLock<Option<Vec<u8>>>>,
     pub alac_sample_rate: Arc<RwLock<Option<u32>>>,
     pub alac_sample_size: Arc<RwLock<Option<u32>>>,
     pub alac_channels: Arc<RwLock<Option<u16>>>,
     pub frames_per_packet: Arc<RwLock<Option<u32>>>,
     pub track_transition_epoch: Arc<AtomicU64>,
+    pub ptp_servo: crate::ptp::PtpServo,
+    ptp_selection_owner: Arc<RwLock<Option<u64>>>,
     /// AP1 remote transport endpoints (control + timing UDP), set during
     /// classic SETUP and cleared on owner teardown / connection cleanup.
     pub ap1_remote_endpoints: Arc<RwLock<Option<Ap1RemoteEndpoints>>>,
@@ -194,14 +192,14 @@ impl AppState {
             inner: Arc::new(RwLock::new(snapshot)),
             events,
             session_crypto: Arc::new(RwLock::new(None)),
-            ap2_media_key: Arc::new(RwLock::new(None)),
-            ap2_audio_format: Arc::new(RwLock::new(None)),
             alac_magic_cookie: Arc::new(RwLock::new(None)),
             alac_sample_rate: Arc::new(RwLock::new(None)),
             alac_sample_size: Arc::new(RwLock::new(None)),
             alac_channels: Arc::new(RwLock::new(None)),
             frames_per_packet: Arc::new(RwLock::new(None)),
             track_transition_epoch: Arc::new(AtomicU64::new(0)),
+            ptp_servo: crate::ptp::PtpServo::new(),
+            ptp_selection_owner: Arc::new(RwLock::new(None)),
             ap1_remote_endpoints: Arc::new(RwLock::new(None)),
         }
     }
@@ -227,6 +225,9 @@ impl AppState {
     }
 
     pub fn set_volume(&self, local_db: f64) {
+        if !local_db.is_finite() {
+            return;
+        }
         self.mutate(|state| {
             state.volume.local_db = local_db.clamp(-144.0, 0.0);
             state.volume.muted = state.volume.local_db <= -144.0;
@@ -234,6 +235,9 @@ impl AppState {
     }
 
     pub fn set_airplay_volume(&self, airplay_db: f64) {
+        if !airplay_db.is_finite() {
+            return;
+        }
         self.mutate(|state| {
             state.volume.airplay_db = airplay_db.clamp(-144.0, 0.0);
             state.volume.muted = state.volume.airplay_db <= -144.0;
@@ -321,7 +325,6 @@ impl AppState {
     }
 
     fn reset_stream_format_for_transition(&self) {
-        *self.ap2_audio_format.write() = None;
         *self.alac_magic_cookie.write() = None;
         *self.alac_sample_rate.write() = None;
         *self.alac_sample_size.write() = None;
@@ -375,14 +378,68 @@ impl AppState {
         });
     }
 
+    /// Select the PTP master for one AP2 connection. Changing the selected
+    /// clock resets servo lock and offset estimates before new samples enter.
+    pub fn select_ptp_master(&self, owner: u64, master_clock_id: u64) {
+        *self.ptp_selection_owner.write() = Some(owner);
+        let changed = self.ptp_servo.select_master(Some(master_clock_id));
+        self.mutate(|state| {
+            state.ptp.master_clock_id = Some(format!("{master_clock_id:016x}"));
+            if changed {
+                state.ptp.offset_ns = None;
+                state.ptp.sync_quality = SyncQuality::Searching;
+            }
+            state.diagnostics.insert(
+                "ap2_selected_ptp_master".into(),
+                format!("{master_clock_id:016x}"),
+            );
+        });
+    }
+
+    /// Clear PTP selection only when the requesting AP2 connection owns it.
+    pub fn clear_ptp_master_if_owner(&self, owner: u64) -> bool {
+        let mut selection_owner = self.ptp_selection_owner.write();
+        if *selection_owner != Some(owner) {
+            return false;
+        }
+        *selection_owner = None;
+        self.ptp_servo.select_master(None);
+        self.mutate(|state| {
+            state.ptp.master_clock_id = None;
+            state.ptp.offset_ns = None;
+            state.ptp.sync_quality = SyncQuality::Searching;
+            state.diagnostics.remove("ap2_selected_ptp_master");
+            state.diagnostics.remove("ap2_timing_peer_count");
+        });
+        true
+    }
+
     pub fn record_ptp_packet(&self, message: crate::ptp::PtpMessage) {
         self.mutate(|state| {
             state.ptp.running = true;
             state.ptp.packets_seen += 1;
             state.ptp.last_message_at = Some(SystemTime::now());
             state.ptp.master_clock_id = Some(format!("{:016x}", message.clock_identity));
-            state.ptp.offset_ns = message.estimated_offset_ns;
-            state.ptp.sync_quality = SyncQuality::Locked;
+            if let Some(offset) = message.estimated_offset_ns {
+                state.ptp.offset_ns = Some(offset);
+            }
+        });
+    }
+
+    pub fn update_ptp_servo_status(
+        &self,
+        master_clock_id: Option<u64>,
+        offset_ns: i64,
+        locked: bool,
+    ) {
+        self.mutate(|state| {
+            state.ptp.master_clock_id = master_clock_id.map(|id| format!("{id:016x}"));
+            state.ptp.offset_ns = master_clock_id.map(|_| offset_ns);
+            state.ptp.sync_quality = if locked {
+                SyncQuality::Locked
+            } else {
+                SyncQuality::Searching
+            };
         });
     }
 
@@ -513,6 +570,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn volume_state_ignores_non_finite_values() {
+        let state = AppState::new(crate::config::Config::default());
+        state.set_volume(-12.0);
+        state.set_airplay_volume(-18.0);
+
+        state.set_volume(f64::NAN);
+        state.set_airplay_volume(f64::INFINITY);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.volume.local_db, -12.0);
+        assert_eq!(snapshot.volume.airplay_db, -18.0);
+    }
+
+    #[test]
     fn ap1_remote_endpoints_default_none() {
         let state = AppState::new(crate::config::Config::default());
         assert!(state.ap1_remote_endpoints().is_none());
@@ -574,5 +645,22 @@ mod tests {
                 .map(String::as_str),
             Some("[fd00::1]:7000")
         );
+    }
+
+    #[test]
+    fn ptp_master_selection_is_owner_scoped() {
+        let state = AppState::new(crate::config::Config::default());
+        state.select_ptp_master(10, 0x42);
+        assert!(state.ptp_servo.accepts_master(0x42));
+        assert!(!state.ptp_servo.accepts_master(0x43));
+
+        assert!(!state.clear_ptp_master_if_owner(11));
+        assert!(state.ptp_servo.accepts_master(0x42));
+        assert!(!state.ptp_servo.accepts_master(0x43));
+
+        assert!(state.clear_ptp_master_if_owner(10));
+        assert!(state.ptp_servo.accepts_master(0x42));
+        assert!(state.ptp_servo.accepts_master(0x43));
+        assert_eq!(state.snapshot().ptp.master_clock_id, None);
     }
 }

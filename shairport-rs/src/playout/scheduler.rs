@@ -17,12 +17,71 @@
 //! [`JitterBuffer`]: super::jitter::JitterBuffer
 
 use crate::audio::AudioEngine;
+use crate::audio::drift::{DriftController, DriftDiagnostics};
 use crate::config::AudioConfig;
 use anyhow;
 use std::time::Instant;
 
 use super::jitter::{InsertResult, JitterBuffer, JitterDiagnostics, TakeExpectedResult};
 use super::packet::TimedPacket;
+use tracing::{debug, info, warn};
+
+/// Playback rate carried by AP2 timing control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackRate {
+    Paused,
+    Normal,
+}
+
+/// Mapping between an AP2 RTP timeline and the sender's PTP network clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ap2TimelineAnchor {
+    pub timeline_id: u64,
+    pub network_time_ns: u64,
+    pub rtp_timestamp: u32,
+    pub sample_rate: u32,
+    pub rate: PlaybackRate,
+}
+
+/// Temporary local presentation timeline installed after a hard drift
+/// discontinuity. A later sender SETRATEANCHORTIME replaces it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ap2RecoveryAnchor {
+    local_time_ns: u64,
+    rtp_timestamp: u32,
+    sample_rate: u32,
+}
+
+/// Clock interface used by the scheduler. Local nanoseconds and values
+/// returned by `network_to_local_ns` must use the same monotonic epoch.
+pub trait NetworkClock: Send + Sync {
+    fn is_locked(&self) -> bool;
+    fn master_clock_id(&self) -> Option<u64>;
+    fn network_to_local_ns(&self, network_ns: u64) -> Option<u64>;
+    fn local_now_ns(&self) -> u64;
+    fn uncertainty_ns(&self) -> u64;
+}
+
+/// Immutable, non-secret stream parameters required by the AP2 scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ap2StreamRuntime {
+    pub stream_id: u32,
+    pub stream_connection_id: Option<u64>,
+    pub audio_format: crate::codec::AudioFormat,
+    pub sample_rate: u32,
+    pub frames_per_packet: u32,
+}
+
+/// A half-open AP2 buffered-audio flush range. Sequence numbers are the
+/// 23-bit values carried on the wire; `from_* == None` denotes an immediate
+/// flush from the current playout position. The `until_*` packet is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ap2FlushRange {
+    pub from_sequence: Option<u32>,
+    pub from_rtp_timestamp: Option<u32>,
+    pub until_sequence: u32,
+    pub until_rtp_timestamp: u32,
+}
 
 // ── Playout state ──────────────────────────────────────────────────────
 
@@ -259,9 +318,19 @@ impl WatermarkController {
     /// [`Stopped`]: PlayoutState::Stopped
     /// [`Paused`]: PlayoutState::Paused
     pub fn observe_fifo(&mut self, queued_ms: u64) -> Option<WatermarkAction> {
+        self.observe_fifo_with_release(queued_ms, true)
+    }
+
+    /// Observe FIFO state while allowing an external timing authority to
+    /// prevent Priming/Rebuffering from opening the output gate.
+    pub fn observe_fifo_with_release(
+        &mut self,
+        queued_ms: u64,
+        release_allowed: bool,
+    ) -> Option<WatermarkAction> {
         match self.state {
             PlayoutState::Priming => {
-                if queued_ms >= self.config.start_watermark_ms as u64 {
+                if release_allowed && queued_ms >= self.config.start_watermark_ms as u64 {
                     self.state = PlayoutState::Playing;
                     Some(WatermarkAction::Gate(true))
                 } else {
@@ -277,7 +346,7 @@ impl WatermarkController {
                 }
             }
             PlayoutState::Rebuffering => {
-                if queued_ms >= self.config.start_watermark_ms as u64 {
+                if release_allowed && queued_ms >= self.config.start_watermark_ms as u64 {
                     self.state = PlayoutState::Playing;
                     Some(WatermarkAction::Gate(true))
                 } else {
@@ -286,6 +355,12 @@ impl WatermarkController {
             }
             PlayoutState::Stopped | PlayoutState::Paused => None,
         }
+    }
+
+    /// Return to Priming and close the gate without discarding buffered data.
+    pub fn reprime(&mut self) -> Vec<WatermarkAction> {
+        self.state = PlayoutState::Priming;
+        vec![WatermarkAction::Gate(false)]
     }
 }
 
@@ -381,11 +456,35 @@ pub trait PcmSink {
     /// Current queued duration in milliseconds.
     fn queued_ms(&self) -> u64;
 
+    /// Exact queued duration in nanoseconds when the sink can provide it.
+    ///
+    /// Test and legacy sinks may use the millisecond fallback. Production
+    /// sinks should derive this from their actual queued frame count.
+    fn queued_duration_ns(&self) -> u64 {
+        self.queued_ms().saturating_mul(1_000_000)
+    }
+
+    /// Whether a previously requested flush still awaits callback
+    /// acknowledgement.
+    fn flush_pending(&self) -> bool {
+        false
+    }
+
     /// Enable or disable the output gate (mute without flushing).
     fn set_output_gate(&mut self, enabled: bool);
 
     /// Request the sink to flush all currently buffered samples.
     fn request_flush(&mut self);
+
+    /// Apply a drift correction ratio in parts per million.
+    ///
+    /// A positive value speeds up the output to compensate for a DAC
+    /// that is consuming faster than the sender (FIFO draining).
+    /// A negative value slows it down (FIFO filling).
+    ///
+    /// The default implementation is a no-op — only sinks that support
+    /// drift correction override this method.
+    fn set_drift_correction_ppm(&mut self, _ppm: f64) {}
 
     /// Enqueue a decoded audio block.
     ///
@@ -412,12 +511,25 @@ pub trait PcmSink {
 /// [`AudioEngine::convert_interleaved_for_output`].
 pub struct AudioEngineSink {
     engine: AudioEngine,
+    pending_conversion: Option<PreparedConversion>,
+}
+
+struct PreparedConversion {
+    source_ptr: usize,
+    source_len: usize,
+    sample_rate: u32,
+    channels: u16,
+    source_frames: usize,
+    samples: Vec<f32>,
 }
 
 impl AudioEngineSink {
     /// Create a new sink wrapping the given [`AudioEngine`].
     pub fn new(engine: AudioEngine) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            pending_conversion: None,
+        }
     }
 
     /// Return a reference to the inner [`AudioEngine`].
@@ -431,12 +543,30 @@ impl PcmSink for AudioEngineSink {
         self.engine.status().queued_ms
     }
 
+    fn queued_duration_ns(&self) -> u64 {
+        let status = self.engine.status();
+        (status.queued_frames as u128)
+            .saturating_mul(1_000_000_000)
+            .checked_div(status.output_sample_rate.max(1) as u128)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn flush_pending(&self) -> bool {
+        self.engine.is_flush_pending()
+    }
+
     fn set_output_gate(&mut self, enabled: bool) {
         self.engine.set_output_gate(enabled);
     }
 
     fn request_flush(&mut self) {
+        self.pending_conversion = None;
         self.engine.request_flush();
+    }
+
+    fn set_drift_correction_ppm(&mut self, ppm: f64) {
+        self.engine.set_drift_correction_ppm(ppm);
     }
 
     fn enqueue(&mut self, decoded: &DecodedAudio, unchecked: bool) -> PcmWriteResult {
@@ -445,23 +575,37 @@ impl PcmSink for AudioEngineSink {
             return PcmWriteResult::all_accepted(0);
         }
 
-        // Convert to the output format first.
-        let converted = self.engine.convert_interleaved_for_output(
-            &decoded.samples,
-            decoded.sample_rate,
-            decoded.channels,
-        );
+        let source_ptr = decoded.samples.as_ptr() as usize;
+        let prepared = self.pending_conversion.take().filter(|prepared| {
+            prepared.source_ptr == source_ptr
+                && prepared.source_len == decoded.samples.len()
+                && prepared.sample_rate == decoded.sample_rate
+                && prepared.channels == decoded.channels
+        });
+        let prepared = prepared.unwrap_or_else(|| PreparedConversion {
+            source_ptr,
+            source_len: decoded.samples.len(),
+            sample_rate: decoded.sample_rate,
+            channels: decoded.channels,
+            source_frames: requested_frames,
+            samples: self.engine.convert_interleaved_for_output(
+                &decoded.samples,
+                decoded.sample_rate,
+                decoded.channels,
+            ),
+        });
 
         // Atomic all-or-nothing enqueue under a single producer-lock
         // interval.  Capacity rejection is scheduler backpressure and
         // does not increment overflow/loss counters.
         let (_requested, accepted) = self
             .engine
-            .try_enqueue_output_frames_all_or_nothing(&converted, unchecked);
+            .try_enqueue_output_frames_all_or_nothing(&prepared.samples, unchecked);
 
         if accepted == _requested {
-            PcmWriteResult::all_accepted(requested_frames)
+            PcmWriteResult::all_accepted(prepared.source_frames)
         } else {
+            self.pending_conversion = Some(prepared);
             PcmWriteResult::all_rejected(requested_frames)
         }
     }
@@ -498,6 +642,16 @@ pub struct SchedulerDiagnostics {
     /// watermark observation, active resync).  Idempotent same-state
     /// calls do not increment.
     pub state_transitions: u64,
+    /// AP2 packets discarded because their presentation deadline passed.
+    pub late_packet_drops: u64,
+    /// Discontinuous late-packet runs recovered with one PCM flush/re-prime.
+    pub late_catchup_events: u64,
+    /// Ticks where a primed AP2 pipeline remained gated by timing.
+    pub timing_gate_holds: u64,
+    /// PTP lock-loss events that forced playback back to Priming.
+    pub clock_lock_losses: u64,
+    /// Buffered AP2 packets discarded by FLUSHBUFFERED ranges.
+    pub buffered_flush_drops: u64,
 }
 
 /// Runtime status snapshot of the scheduler.
@@ -518,6 +672,8 @@ pub struct SchedulerStatus {
     pub pending_block_frames: usize,
     /// Next expected sequence number.
     pub expected_sequence: u64,
+    /// Drift correction diagnostics (None when not active).
+    pub drift: Option<DriftDiagnostics>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -548,6 +704,55 @@ pub struct SchedulerCore<D: PacketDecoder, S: PcmSink> {
     pending_sequence: Option<u64>,
     /// The most recently successfully decoded packet (not concealed).
     last_decoded_packet: Option<TimedPacket>,
+    /// Active AP2 stream parameters. This contains no key material.
+    ap2_stream: Option<Ap2StreamRuntime>,
+    ap2_recording: bool,
+    playback_rate: PlaybackRate,
+    timeline: Option<Ap2TimelineAnchor>,
+    recovery_anchor: Option<Ap2RecoveryAnchor>,
+    pending_hard_reanchor: bool,
+    network_clock: Option<Arc<dyn NetworkClock>>,
+    first_buffered_rtp_timestamp: Option<u32>,
+    pending_rtp_timestamp: Option<u32>,
+    /// RTP timestamp and sender-timeline frame span of the last AP2 packet
+    /// accepted by the sink. The span comes from stream negotiation rather
+    /// than decoder/resampler output shape.
+    last_enqueued_ap2: Option<(u32, usize)>,
+    /// After a paused AP2 stream receives a fresh resume anchor, discard
+    /// already-buffered packets older than this RTP timestamp before seeding
+    /// a new jitter window.
+    resume_rtp_floor: Option<u32>,
+    ap2_flush_ranges: Vec<Ap2FlushRange>,
+    /// True while stale AP2 packets are being discarded up to the first
+    /// packet whose presentation deadline is still viable.
+    late_catchup_active: bool,
+    late_catchup_dropped: u64,
+
+    /// Bounded PI controller for AP2 clock drift correction.
+    /// Only active during AP2 buffered playback with PTP lock.
+    drift_controller: DriftController,
+    /// Cached diagnostics from the drift controller (updated on each tick).
+    drift_diag: Option<DriftDiagnostics>,
+    /// Smoothed commanded ppm value sent to the sink/resampler.
+    /// Low-pass filtered to avoid audible transients.
+    smoothed_ppm: f64,
+    /// Last correction actually applied to the sink. Kept separately from
+    /// the smoothed controller output so insignificant changes do not restart
+    /// the resampler's ratio ramp for every scheduler event.
+    applied_drift_ppm: f64,
+    /// Last observed PTP master clock ID — used to detect master changes
+    /// and reset the drift controller.
+    last_ptp_master_id: Option<u64>,
+    /// Timestamp of the last drift controller update (for time-based integral).
+    last_drift_update: Option<std::time::Instant>,
+
+    /// Cooldown timers for rate-limited diagnostics logging (seconds
+    /// between repeated messages of each category).
+    last_timing_gate_warn: Option<std::time::Instant>,
+    last_clock_loss_warn: Option<std::time::Instant>,
+    last_resync_warn: Option<std::time::Instant>,
+    last_late_drop_warn: Option<std::time::Instant>,
+    last_drift_resync_warn: Option<std::time::Instant>,
 
     diag: SchedulerDiagnostics,
 }
@@ -559,6 +764,7 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
     pub fn new(config: SchedulerConfig, decoder: D, sink: S) -> Self {
         let jitter = JitterBuffer::new(config.jitter_capacity_packets);
         let watermark = WatermarkController::new(config.clone());
+        let drift_controller = DriftController::new(config.target_watermark_ms as u64);
         Self {
             config,
             watermark,
@@ -568,8 +774,180 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
             pending: None,
             pending_sequence: None,
             last_decoded_packet: None,
+            ap2_stream: None,
+            ap2_recording: false,
+            playback_rate: PlaybackRate::Paused,
+            timeline: None,
+            recovery_anchor: None,
+            pending_hard_reanchor: false,
+            network_clock: None,
+            first_buffered_rtp_timestamp: None,
+            pending_rtp_timestamp: None,
+            last_enqueued_ap2: None,
+            resume_rtp_floor: None,
+            ap2_flush_ranges: Vec::new(),
+            late_catchup_active: false,
+            late_catchup_dropped: 0,
+            drift_controller,
+            drift_diag: None,
+            smoothed_ppm: 0.0,
+            applied_drift_ppm: 0.0,
+            last_ptp_master_id: None,
+            last_drift_update: None,
+            last_timing_gate_warn: None,
+            last_clock_loss_warn: None,
+            last_resync_warn: None,
+            last_late_drop_warn: None,
+            last_drift_resync_warn: None,
             diag: SchedulerDiagnostics::default(),
         }
+    }
+
+    /// Attach the network clock used for AP2 deadline scheduling.
+    pub fn set_network_clock(&mut self, clock: Arc<dyn NetworkClock>) {
+        self.network_clock = Some(clock);
+    }
+
+    fn reset_drift_state(&mut self, disable: bool) {
+        if disable {
+            self.drift_controller.disable();
+        } else {
+            self.drift_controller.reset();
+        }
+        self.smoothed_ppm = 0.0;
+        self.applied_drift_ppm = 0.0;
+        self.last_drift_update = None;
+        self.last_enqueued_ap2 = None;
+        self.sink.set_drift_correction_ppm(0.0);
+        self.drift_diag = self
+            .ap2_stream
+            .is_some()
+            .then(|| self.drift_controller.diagnostics());
+    }
+
+    /// Install AP2 stream parameters without starting transport or opening
+    /// the output gate.
+    pub fn configure_ap2_stream(&mut self, runtime: Ap2StreamRuntime) {
+        if self.ap2_stream != Some(runtime) {
+            self.stop();
+            self.ap2_stream = Some(runtime);
+            self.ap2_recording = false;
+            self.timeline = None;
+            self.recovery_anchor = None;
+            self.pending_hard_reanchor = false;
+            self.playback_rate = PlaybackRate::Paused;
+            self.reset_drift_state(true);
+        }
+    }
+
+    /// Make RECORD authoritative for AP2 pipeline preparation. This resets
+    /// stale compressed, decoder, pending PCM, and sink state and enters
+    /// Priming with output gated.
+    pub fn record_ap2(&mut self) {
+        if self.ap2_stream.is_some() {
+            self.start();
+            self.ap2_recording = true;
+            self.timeline = None;
+            self.playback_rate = PlaybackRate::Paused;
+            self.reset_drift_state(true);
+        }
+    }
+
+    /// Remove the AP2 stream configuration and all associated pipeline state.
+    pub fn clear_ap2_stream(&mut self) {
+        self.stop();
+        self.ap2_stream = None;
+        self.ap2_recording = false;
+        self.timeline = None;
+        self.playback_rate = PlaybackRate::Paused;
+        self.ap2_flush_ranges.clear();
+        self.reset_drift_state(true);
+    }
+
+    /// Install an AP2 timeline. Replacing an existing timeline ID gates and
+    /// flushes stale compressed/decoded/PCM data before re-priming.
+    pub fn set_timeline(&mut self, anchor: Ap2TimelineAnchor) {
+        let resuming_from_pause =
+            self.playback_rate == PlaybackRate::Paused && anchor.rate == PlaybackRate::Normal;
+        if self
+            .timeline
+            .is_some_and(|current| current.timeline_id != anchor.timeline_id)
+        {
+            self.start();
+        }
+        self.timeline = Some(anchor);
+        self.recovery_anchor = None;
+        self.pending_hard_reanchor = false;
+
+        // A complete rate=1 anchor after a pause defines a fresh presentation
+        // point. The sender may have advanced by hundreds of milliseconds
+        // while our gated PCM FIFO and jitter window still contain pre-pause
+        // audio. Comparing that stale tail with the new anchor produces a
+        // false drift discontinuity and makes resume fail. Flush the stale
+        // pipeline and ignore queued ingress packets older than the anchor;
+        // the first packet at/after the floor seeds a clean jitter window.
+        if resuming_from_pause {
+            self.sink.request_flush();
+            self.jitter.reset();
+            self.decoder.reset();
+            self.pending = None;
+            self.pending_sequence = None;
+            self.pending_rtp_timestamp = None;
+            self.last_decoded_packet = None;
+            self.first_buffered_rtp_timestamp = None;
+            self.last_enqueued_ap2 = None;
+            self.resume_rtp_floor = Some(anchor.rtp_timestamp);
+            self.late_catchup_active = false;
+            self.late_catchup_dropped = 0;
+        }
+
+        self.reset_drift_state(false);
+        self.set_playback_rate(anchor.rate);
+    }
+
+    pub fn set_playback_rate(&mut self, rate: PlaybackRate) {
+        self.playback_rate = rate;
+        match rate {
+            PlaybackRate::Paused => self.pause(),
+            PlaybackRate::Normal if self.ap2_recording => {
+                let old_state = self.watermark.state();
+                let actions = self.watermark.reprime();
+                self.record_state_transition(old_state);
+                self.apply_actions(&actions);
+            }
+            PlaybackRate::Normal => {}
+        }
+    }
+
+    pub fn clear_timeline(&mut self) {
+        self.timeline = None;
+        self.recovery_anchor = None;
+        self.pending_hard_reanchor = false;
+        self.playback_rate = PlaybackRate::Paused;
+        self.first_buffered_rtp_timestamp = None;
+        let old_state = self.watermark.state();
+        let actions = self.watermark.reprime();
+        self.record_state_transition(old_state);
+        self.apply_actions(&actions);
+        self.reset_drift_state(true);
+    }
+
+    /// Register a scheduler-owned FLUSHBUFFERED range. Immediate flushes
+    /// discard already-decoded PCM and pending decoder output; deferred
+    /// ranges preserve current output and are enforced as packets reach the
+    /// head of the jitter buffer.
+    pub fn flush_buffered(&mut self, range: Ap2FlushRange) {
+        self.set_playback_rate(PlaybackRate::Paused);
+        self.reset_drift_state(false);
+        if range.from_sequence.is_none() {
+            self.sink.request_flush();
+            self.pending = None;
+            self.pending_sequence = None;
+            self.pending_rtp_timestamp = None;
+            self.last_decoded_packet = None;
+            self.first_buffered_rtp_timestamp = None;
+        }
+        self.ap2_flush_ranges.push(range);
     }
 
     /// Start the transport.  Resets stream state and decoder, gates
@@ -583,7 +961,17 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
         self.jitter.reset();
         self.pending = None;
         self.pending_sequence = None;
+        self.pending_rtp_timestamp = None;
         self.last_decoded_packet = None;
+        self.first_buffered_rtp_timestamp = None;
+        self.last_enqueued_ap2 = None;
+        self.recovery_anchor = None;
+        self.pending_hard_reanchor = false;
+        self.resume_rtp_floor = None;
+        self.ap2_flush_ranges.clear();
+        self.late_catchup_active = false;
+        self.late_catchup_dropped = 0;
+        self.reset_drift_state(true);
     }
 
     /// Pause the transport.  The output gate is closed but the jitter
@@ -616,7 +1004,17 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
         self.jitter.reset();
         self.pending = None;
         self.pending_sequence = None;
+        self.pending_rtp_timestamp = None;
         self.last_decoded_packet = None;
+        self.first_buffered_rtp_timestamp = None;
+        self.last_enqueued_ap2 = None;
+        self.recovery_anchor = None;
+        self.pending_hard_reanchor = false;
+        self.resume_rtp_floor = None;
+        self.ap2_flush_ranges.clear();
+        self.late_catchup_active = false;
+        self.late_catchup_dropped = 0;
+        self.reset_drift_state(true);
     }
 
     /// Flush the audio FIFO and reset jitter+decoder+pending state.
@@ -630,7 +1028,13 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
         self.decoder.reset();
         self.pending = None;
         self.pending_sequence = None;
+        self.pending_rtp_timestamp = None;
         self.last_decoded_packet = None;
+        self.first_buffered_rtp_timestamp = None;
+        self.last_enqueued_ap2 = None;
+        self.late_catchup_active = false;
+        self.late_catchup_dropped = 0;
+        self.reset_drift_state(false);
     }
 
     /// Insert a packet into the jitter buffer.
@@ -645,6 +1049,22 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
     ///
     /// [`Accepted`]: InsertResult::Accepted
     pub fn insert_packet(&mut self, packet: TimedPacket) -> InsertResult {
+        if packet.protocol == super::packet::StreamProtocol::AirPlay2Buffered {
+            self.maybe_install_hard_recovery_anchor(packet.rtp_timestamp);
+        }
+
+        if packet.protocol == super::packet::StreamProtocol::AirPlay2Buffered
+            && let Some(floor) = self.resume_rtp_floor
+        {
+            let relative = packet.rtp_timestamp.wrapping_sub(floor) as i32;
+            if relative < 0 {
+                self.diag.buffered_flush_drops = self.diag.buffered_flush_drops.saturating_add(1);
+                self.diag.insert_too_old = self.diag.insert_too_old.saturating_add(1);
+                return InsertResult::TooOld;
+            }
+            self.resume_rtp_floor = None;
+        }
+
         // Clone the packet so we can re-insert it if a resync is needed
         // (the jitter buffer drops the packet on ResyncRequired).
         let pkt_clone = packet.clone();
@@ -672,8 +1092,19 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                 self.decoder.reset();
                 self.pending = None;
                 self.pending_sequence = None;
+                self.pending_rtp_timestamp = None;
                 self.last_decoded_packet = None;
+                self.first_buffered_rtp_timestamp = None;
+                self.last_enqueued_ap2 = None;
+                self.reset_drift_state(false);
                 self.diag.resync_count += 1;
+                if self.cooldown_warn("resync", 5) {
+                    warn!(
+                        resyncs = self.diag.resync_count,
+                        state = ?self.watermark.state(),
+                        "playout resync triggered — jitter window overflow"
+                    );
+                }
 
                 // Apply resync through the watermark controller.
                 // For active states, WatermarkController::flush()
@@ -725,12 +1156,29 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
         }
 
         // ── Retry pending block first ──
+        if let Some(rtp_timestamp) = self.pending_rtp_timestamp {
+            self.maybe_install_hard_recovery_anchor(rtp_timestamp);
+        }
         if let Some(ref decoded) = self.pending {
             let unchecked = matches!(state, PlayoutState::Priming | PlayoutState::Rebuffering);
             let result = self.sink.enqueue(decoded, unchecked);
             if result.is_accepted() {
+                let accepted_frames = decoded.frames();
+                let accepted_rtp = self.pending_rtp_timestamp;
+                if self.first_buffered_rtp_timestamp.is_none() {
+                    self.first_buffered_rtp_timestamp = accepted_rtp;
+                }
+                if let Some(rtp) = accepted_rtp {
+                    let timeline_frames = self
+                        .ap2_stream
+                        .map(|stream| stream.frames_per_packet as usize)
+                        .unwrap_or(accepted_frames);
+                    self.last_enqueued_ap2 = Some((rtp, timeline_frames));
+                    self.finish_late_catchup(rtp);
+                }
                 self.pending = None;
                 self.pending_sequence = None;
+                self.pending_rtp_timestamp = None;
                 // After successful enqueue, observe watermark.
                 self.observe_and_apply();
                 return 1;
@@ -749,6 +1197,43 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                     // Clone the packet data so we can consume the slot.
                     let pkt_clone = pkt.clone();
                     let seq = pkt_clone.extended_sequence;
+                    let packet_rtp = pkt_clone.rtp_timestamp;
+                    let packet_is_ap2 =
+                        pkt_clone.protocol == super::packet::StreamProtocol::AirPlay2Buffered;
+                    if packet_is_ap2 {
+                        self.maybe_install_hard_recovery_anchor(packet_rtp);
+                    }
+
+                    if packet_is_ap2 && self.packet_is_in_flush_range(&pkt_clone) {
+                        match self.jitter.take_expected() {
+                            TakeExpectedResult::Packet(_) => {}
+                            _ => unreachable!("peek gave Packet but take did not"),
+                        }
+                        self.diag.buffered_flush_drops += 1;
+                        continue;
+                    }
+
+                    if packet_is_ap2 && self.packet_is_too_late(packet_rtp) {
+                        let catchup_started = !self.late_catchup_active;
+                        if catchup_started {
+                            self.begin_late_catchup();
+                        }
+                        match self.jitter.take_expected() {
+                            TakeExpectedResult::Packet(_) => {}
+                            _ => unreachable!("peek gave Packet but take did not"),
+                        }
+                        self.diag.late_packet_drops += 1;
+                        self.late_catchup_dropped = self.late_catchup_dropped.saturating_add(1);
+                        if catchup_started && self.cooldown_warn("late_drop", 5) {
+                            warn!(
+                                drops = self.diag.late_packet_drops,
+                                raw_sequence = pkt_clone.raw_sequence,
+                                rtp_timestamp = packet_rtp,
+                                "AP2 late-packet catch-up started — stale PCM flushed once"
+                            );
+                        }
+                        continue;
+                    }
 
                     // Take (consume) the slot.
                     match self.jitter.take_expected() {
@@ -762,11 +1247,24 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                             self.diag.decoded_blocks += 1;
                             self.last_decoded_packet = Some(pkt_clone);
 
-                            let unchecked =
-                                matches!(state, PlayoutState::Priming | PlayoutState::Rebuffering);
+                            let unchecked = matches!(
+                                self.watermark.state(),
+                                PlayoutState::Priming | PlayoutState::Rebuffering
+                            );
                             let frames = decoded.frames();
                             let result = self.sink.enqueue(&decoded, unchecked);
                             if result.is_accepted() {
+                                if packet_is_ap2 && self.first_buffered_rtp_timestamp.is_none() {
+                                    self.first_buffered_rtp_timestamp = Some(packet_rtp);
+                                }
+                                if packet_is_ap2 {
+                                    let timeline_frames = self
+                                        .ap2_stream
+                                        .map(|stream| stream.frames_per_packet as usize)
+                                        .unwrap_or(frames);
+                                    self.last_enqueued_ap2 = Some((packet_rtp, timeline_frames));
+                                    self.finish_late_catchup(packet_rtp);
+                                }
                                 // Enqueue succeeded — observe watermark.
                                 self.observe_and_apply();
                                 return 1;
@@ -776,6 +1274,7 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                             self.diag.fifo_backpressure_frames += frames as u64;
                             self.pending = Some(decoded);
                             self.pending_sequence = Some(seq);
+                            self.pending_rtp_timestamp = packet_is_ap2.then_some(packet_rtp);
                             return 0;
                         }
                         Err(_) => {
@@ -813,8 +1312,10 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                         Ok(decoded) => {
                             self.diag.concealed_missing += 1;
 
-                            let unchecked =
-                                matches!(state, PlayoutState::Priming | PlayoutState::Rebuffering);
+                            let unchecked = matches!(
+                                self.watermark.state(),
+                                PlayoutState::Priming | PlayoutState::Rebuffering
+                            );
                             let frames = decoded.frames();
                             let result = self.sink.enqueue(&decoded, unchecked);
                             if result.is_accepted() {
@@ -826,6 +1327,7 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                             self.diag.fifo_backpressure_frames += frames as u64;
                             self.pending = Some(decoded);
                             self.pending_sequence = Some(seq);
+                            self.pending_rtp_timestamp = None;
                             return 0;
                         }
                         Err(_) => {
@@ -860,6 +1362,7 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
             has_pending_block: self.pending.is_some(),
             pending_block_frames: self.pending.as_ref().map(|d| d.frames()).unwrap_or(0),
             expected_sequence: self.jitter.expected_sequence(),
+            drift: self.drift_diag,
         }
     }
 
@@ -911,7 +1414,72 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
         let new = self.watermark.state();
         if old != new {
             self.diag.state_transitions += 1;
+            info!(
+                ?old,
+                ?new,
+                transitions = self.diag.state_transitions,
+                "playout state transition"
+            );
         }
+    }
+
+    /// Enter one discontinuous catch-up epoch. Stale compressed packets stay
+    /// in the jitter buffer so they can be discarded in sequence, but stale
+    /// PCM and decoder history are cleared exactly once. This prevents the
+    /// first current packet from being appended behind old queued audio.
+    fn begin_late_catchup(&mut self) {
+        let old_state = self.watermark.state();
+        let actions = self.watermark.flush();
+        self.apply_actions(&actions);
+        self.record_state_transition(old_state);
+        self.decoder.reset();
+        self.pending = None;
+        self.pending_sequence = None;
+        self.pending_rtp_timestamp = None;
+        self.last_decoded_packet = None;
+        self.first_buffered_rtp_timestamp = None;
+        self.last_enqueued_ap2 = None;
+        self.reset_drift_state(false);
+        self.late_catchup_active = true;
+        self.late_catchup_dropped = 0;
+        self.diag.late_catchup_events = self.diag.late_catchup_events.saturating_add(1);
+    }
+
+    fn finish_late_catchup(&mut self, viable_rtp_timestamp: u32) {
+        if !self.late_catchup_active {
+            return;
+        }
+        info!(
+            event = self.diag.late_catchup_events,
+            dropped = self.late_catchup_dropped,
+            viable_rtp_timestamp,
+            "AP2 late-packet catch-up completed; pipeline re-priming"
+        );
+        self.late_catchup_active = false;
+        self.late_catchup_dropped = 0;
+    }
+
+    /// Returns `true` if a category-throttled warning should be emitted
+    /// (at most once per `cooldown_secs`).  The category string selects
+    /// the cooldown timer field.
+    fn cooldown_warn(&mut self, category: &str, cooldown_secs: u64) -> bool {
+        let cooldown = std::time::Duration::from_secs(cooldown_secs);
+        let now = std::time::Instant::now();
+        let timer = match category {
+            "timing_gate" => &mut self.last_timing_gate_warn,
+            "clock_loss" => &mut self.last_clock_loss_warn,
+            "resync" => &mut self.last_resync_warn,
+            "late_drop" => &mut self.last_late_drop_warn,
+            "drift_resync" => &mut self.last_drift_resync_warn,
+            _ => return true,
+        };
+        let should_log = timer
+            .map(|t| now.saturating_duration_since(t) >= cooldown)
+            .unwrap_or(true);
+        if should_log {
+            *timer = Some(now);
+        }
+        should_log
     }
 
     /// Apply watermark actions to the sink and handle resync if needed.
@@ -929,10 +1497,305 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
     fn observe_and_apply(&mut self) {
         let old_state = self.watermark.state();
         let queued_ms = self.sink.queued_ms();
-        if let Some(action) = self.watermark.observe_fifo(queued_ms) {
+        let timing_release_allowed = if self.ap2_stream.is_some() && self.ap2_recording {
+            self.ap2_timing_release_allowed()
+        } else {
+            true
+        };
+        let release_allowed = timing_release_allowed && !self.sink.flush_pending();
+
+        if old_state == PlayoutState::Playing
+            && self.ap2_stream.is_some()
+            && self.ap2_recording
+            && !timing_release_allowed
+        {
+            let actions = self.watermark.reprime();
+            self.apply_actions(&actions);
+            self.diag.clock_lock_losses += 1;
+            if self.cooldown_warn("clock_loss", 5) {
+                warn!(
+                    losses = self.diag.clock_lock_losses,
+                    "AP2 clock lock lost — playback re-primed"
+                );
+            }
+        } else if let Some(action) = self
+            .watermark
+            .observe_fifo_with_release(queued_ms, release_allowed)
+        {
             self.apply_actions(&[action]);
+        } else if matches!(
+            self.watermark.state(),
+            PlayoutState::Priming | PlayoutState::Rebuffering
+        ) && queued_ms >= self.config.start_watermark_ms as u64
+            && !timing_release_allowed
+        {
+            self.diag.timing_gate_holds += 1;
+            if self.cooldown_warn("timing_gate", 5) {
+                warn!(
+                    holds = self.diag.timing_gate_holds,
+                    queued_ms, "AP2 timing gate holding — network/RTP anchor not yet eligible"
+                );
+            }
         }
         self.record_state_transition(old_state);
+    }
+
+    fn ap2_timing_release_allowed(&self) -> bool {
+        if self.playback_rate != PlaybackRate::Normal {
+            return false;
+        }
+        let Some(clock) = &self.network_clock else {
+            return false;
+        };
+        if !clock.is_locked() || clock.master_clock_id().is_none() {
+            return false;
+        }
+        let Some(first_rtp) = self.first_buffered_rtp_timestamp else {
+            return false;
+        };
+        let Some(deadline) = self.packet_deadline_ns(first_rtp) else {
+            return false;
+        };
+        clock.local_now_ns() >= deadline
+    }
+
+    fn packet_is_too_late(&self, rtp_timestamp: u32) -> bool {
+        let Some(clock) = &self.network_clock else {
+            return false;
+        };
+        if !clock.is_locked() {
+            return false;
+        }
+        let Some(deadline) = self.packet_deadline_ns(rtp_timestamp) else {
+            return false;
+        };
+        let tolerance = clock.uncertainty_ns().saturating_add(20_000_000);
+        clock.local_now_ns() > deadline.saturating_add(tolerance)
+    }
+
+    fn packet_is_in_flush_range(&mut self, packet: &TimedPacket) -> bool {
+        const AP2_SEQUENCE_MASK: u32 = 0x7f_ffff;
+        const AP2_SEQUENCE_HALF: u32 = 0x40_0000;
+
+        fn compare_23(a: u32, b: u32) -> i32 {
+            let delta = a.wrapping_sub(b) & AP2_SEQUENCE_MASK;
+            if delta >= AP2_SEQUENCE_HALF {
+                delta as i32 - 0x80_0000
+            } else {
+                delta as i32
+            }
+        }
+
+        let sequence = packet.raw_sequence & AP2_SEQUENCE_MASK;
+        let mut discard = false;
+        self.ap2_flush_ranges.retain(|range| {
+            let until = range.until_sequence & AP2_SEQUENCE_MASK;
+            let at_or_after_until = compare_23(sequence, until) >= 0;
+            if at_or_after_until {
+                return false;
+            }
+            let at_or_after_from = range
+                .from_sequence
+                .is_none_or(|from| compare_23(sequence, from & AP2_SEQUENCE_MASK) >= 0);
+            if at_or_after_from {
+                discard = true;
+            }
+            true
+        });
+        discard
+    }
+
+    /// Update the AP2 drift controller and apply the commanded correction
+    /// to the sink.
+    ///
+    /// Should be called once per scheduler tick during active AP2 playback.
+    fn update_drift(&mut self) {
+        const DRIFT_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        const DRIFT_APPLY_DEADBAND_PPM: f64 = 0.5;
+
+        let Some(clock) = self.network_clock.as_ref().cloned() else {
+            self.reset_drift_state(true);
+            return;
+        };
+        let master_id = clock.master_clock_id();
+        let master_changed = self
+            .last_ptp_master_id
+            .is_some_and(|previous| Some(previous) != master_id);
+        self.last_ptp_master_id = master_id;
+
+        if master_changed {
+            self.reset_drift_state(true);
+            if self.watermark.state() == PlayoutState::Playing {
+                let old_state = self.watermark.state();
+                let actions = self.watermark.reprime();
+                self.apply_actions(&actions);
+                self.record_state_transition(old_state);
+            }
+            self.drift_diag = Some(self.drift_controller.diagnostics());
+            return;
+        }
+
+        let active = self.ap2_stream.is_some()
+            && self.ap2_recording
+            && self.playback_rate == PlaybackRate::Normal
+            && self.timeline.is_some()
+            && self.watermark.state() == PlayoutState::Playing
+            && clock.is_locked()
+            && master_id.is_some();
+        if !active {
+            self.reset_drift_state(true);
+            return;
+        }
+
+        let (tail_rtp, tail_frames) = match self.last_enqueued_ap2 {
+            Some(value) => value,
+            None => {
+                self.reset_drift_state(true);
+                return;
+            }
+        };
+        let stream = self.ap2_stream.expect("active AP2 stream checked");
+        let Some(tail_start_ns) = self.packet_deadline_ns(tail_rtp) else {
+            self.reset_drift_state(true);
+            return;
+        };
+
+        if !self.drift_controller.is_enabled() {
+            self.drift_controller.enable();
+        }
+        let now = std::time::Instant::now();
+        let elapsed = self
+            .last_drift_update
+            .map(|last| now.saturating_duration_since(last).as_secs_f64())
+            .unwrap_or(0.0);
+        if self.last_drift_update.is_some() && elapsed < DRIFT_UPDATE_INTERVAL.as_secs_f64() {
+            return;
+        }
+        self.last_drift_update = Some(now);
+
+        let fifo_queued_ms = self.sink.queued_ms();
+        let tail_duration_ns = (tail_frames as u128)
+            .saturating_mul(1_000_000_000)
+            .checked_div(stream.sample_rate.max(1) as u128)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64;
+        let scheduled_tail_ns = tail_start_ns.saturating_add(tail_duration_ns);
+        let fifo_queued_duration_ns = self.sink.queued_duration_ns();
+        let predicted_tail_ns = clock.local_now_ns().saturating_add(fifo_queued_duration_ns);
+        let timing_error_ns = (scheduled_tail_ns as i128 - predicted_tail_ns as i128)
+            .clamp(-(u64::MAX as i128), u64::MAX as i128) as f64;
+        debug!(
+            tail_rtp,
+            timeline_frames = tail_frames,
+            fifo_queued_ms,
+            fifo_queued_duration_ns,
+            scheduled_tail_ns,
+            predicted_tail_ns,
+            timing_error_ns,
+            "AP2 drift timeline sample"
+        );
+
+        match self
+            .drift_controller
+            .update(fifo_queued_ms, timing_error_ns, true, elapsed)
+        {
+            Some(raw_ppm) => {
+                const SMOOTH_TIME_CONSTANT_SECONDS: f64 = 1.0;
+                let alpha = 1.0 - (-elapsed / SMOOTH_TIME_CONSTANT_SECONDS).exp();
+                self.smoothed_ppm += (raw_ppm - self.smoothed_ppm) * alpha;
+                if (self.smoothed_ppm - self.applied_drift_ppm).abs() >= DRIFT_APPLY_DEADBAND_PPM {
+                    self.applied_drift_ppm = self.smoothed_ppm;
+                    self.sink.set_drift_correction_ppm(self.applied_drift_ppm);
+                }
+            }
+            None => {
+                let hard_resyncs = self.drift_controller.diagnostics().hard_resync_count;
+                if self.cooldown_warn("drift_resync", 5) {
+                    warn!(
+                        hard_resyncs,
+                        fifo_queued_ms,
+                        timing_error_ns,
+                        "AP2 drift discontinuity triggered a hard playout resync"
+                    );
+                }
+                let old_state = self.watermark.state();
+                let actions = self.watermark.flush();
+                self.apply_actions(&actions);
+                self.record_state_transition(old_state);
+                self.sink.set_drift_correction_ppm(0.0);
+                self.smoothed_ppm = 0.0;
+                self.applied_drift_ppm = 0.0;
+                self.decoder.reset();
+                self.jitter.reset();
+                self.pending = None;
+                self.pending_sequence = None;
+                self.pending_rtp_timestamp = None;
+                self.last_decoded_packet = None;
+                self.first_buffered_rtp_timestamp = None;
+                self.last_enqueued_ap2 = None;
+                self.diag.resync_count += 1;
+                self.recovery_anchor = None;
+                self.pending_hard_reanchor = true;
+            }
+        }
+
+        let mut diagnostics = self.drift_controller.diagnostics();
+        diagnostics.correction_ppm = self.applied_drift_ppm;
+        self.drift_diag = Some(diagnostics);
+    }
+
+    fn packet_deadline_ns(&self, rtp_timestamp: u32) -> Option<u64> {
+        if let Some(anchor) = self.recovery_anchor {
+            let frame_delta = rtp_timestamp.wrapping_sub(anchor.rtp_timestamp) as i32 as i64;
+            let offset_ns =
+                (frame_delta as i128 * 1_000_000_000i128) / anchor.sample_rate.max(1) as i128;
+            return (anchor.local_time_ns as i128)
+                .checked_add(offset_ns)?
+                .try_into()
+                .ok();
+        }
+
+        let anchor = self.timeline?;
+        let clock = self.network_clock.as_ref()?;
+        let frame_delta = rtp_timestamp.wrapping_sub(anchor.rtp_timestamp) as i32 as i64;
+        let offset_ns =
+            (frame_delta as i128 * 1_000_000_000i128) / anchor.sample_rate.max(1) as i128;
+        let network_ns: u64 = (anchor.network_time_ns as i128)
+            .checked_add(offset_ns)?
+            .try_into()
+            .ok()?;
+        clock.network_to_local_ns(network_ns)
+    }
+
+    fn maybe_install_hard_recovery_anchor(&mut self, rtp_timestamp: u32) {
+        if !self.pending_hard_reanchor {
+            return;
+        }
+        let Some(clock) = &self.network_clock else {
+            return;
+        };
+        if !clock.is_locked() || clock.master_clock_id().is_none() {
+            return;
+        }
+        let sample_rate = self
+            .ap2_stream
+            .map(|stream| stream.sample_rate)
+            .unwrap_or(44_100)
+            .max(1);
+        let start_delay_ns = (self.config.start_watermark_ms as u64).saturating_mul(1_000_000);
+        let local_time_ns = clock.local_now_ns().saturating_add(start_delay_ns);
+        self.recovery_anchor = Some(Ap2RecoveryAnchor {
+            local_time_ns,
+            rtp_timestamp,
+            sample_rate,
+        });
+        self.pending_hard_reanchor = false;
+        info!(
+            rtp_timestamp,
+            sample_rate,
+            start_delay_ms = self.config.start_watermark_ms,
+            "AP2 hard-resync recovery anchor installed"
+        );
     }
 }
 
@@ -952,6 +1815,20 @@ use super::ingress::{IngressReceiver, IngressSender, packet_ingress};
 /// Commands sent to the playout service task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlayoutCommand {
+    /// Configure immutable AP2 stream parameters without starting output.
+    ConfigureStream(Ap2StreamRuntime),
+    /// Prepare the configured AP2 stream for playback, gated in Priming.
+    Record,
+    /// Clear the configured AP2 stream and all buffered state.
+    ClearStream,
+    /// Install or replace the AP2 network/RTP timeline.
+    SetTimeline(Ap2TimelineAnchor),
+    /// Change AP2 playback rate without discarding the configured stream.
+    SetPlaybackRate(PlaybackRate),
+    /// Remove the active AP2 timeline and close the output gate.
+    ClearTimeline,
+    /// Apply a bounded AP2 buffered-audio flush.
+    FlushBuffered(Ap2FlushRange),
     /// Start the transport (enters Priming, gates off, flushes).
     Start,
     /// Pause the transport (gates off, preserves FIFO).
@@ -979,6 +1856,8 @@ pub struct PlayoutHandle {
     cmd_tx: mpsc::UnboundedSender<PlayoutCommand>,
     /// Shared latest scheduler status.
     status: Arc<RwLock<SchedulerStatus>>,
+    jitter_capacity_packets: usize,
+    start_watermark_ms: u32,
 }
 
 impl PlayoutHandle {
@@ -1012,6 +1891,41 @@ impl PlayoutHandle {
     /// Start the transport.
     pub fn start(&self) {
         self.send_cmd(PlayoutCommand::Start);
+    }
+
+    /// Configure an AP2 stream without starting output.
+    pub fn configure_stream(&self, runtime: Ap2StreamRuntime) {
+        self.send_cmd(PlayoutCommand::ConfigureStream(runtime));
+    }
+
+    /// Prepare the configured AP2 stream for timed playback.
+    pub fn record(&self) {
+        self.send_cmd(PlayoutCommand::Record);
+    }
+
+    /// Clear AP2 stream configuration and buffered state.
+    pub fn clear_stream(&self) {
+        self.send_cmd(PlayoutCommand::ClearStream);
+    }
+
+    pub fn set_timeline(&self, anchor: Ap2TimelineAnchor) {
+        self.send_cmd(PlayoutCommand::SetTimeline(anchor));
+    }
+
+    pub fn set_playback_rate(&self, rate: PlaybackRate) {
+        self.send_cmd(PlayoutCommand::SetPlaybackRate(rate));
+    }
+
+    pub fn clear_timeline(&self) {
+        self.send_cmd(PlayoutCommand::ClearTimeline);
+    }
+
+    /// Queue a scheduler-owned AP2 buffered flush. Returns false if the
+    /// playout task has already stopped and cannot accept the request.
+    pub fn flush_buffered(&self, range: Ap2FlushRange) -> bool {
+        self.cmd_tx
+            .send(PlayoutCommand::FlushBuffered(range))
+            .is_ok()
     }
 
     /// Pause the transport.
@@ -1050,6 +1964,22 @@ impl PlayoutHandle {
         self.ingress.diagnostics()
     }
 
+    /// Total compressed-packet capacity across ingress and jitter stages.
+    pub fn buffered_packet_capacity(&self) -> usize {
+        self.ingress
+            .capacity_packets()
+            .saturating_add(self.jitter_capacity_packets)
+    }
+
+    /// Scheduler priming latency expressed in source audio frames.
+    pub fn start_latency_frames(&self, sample_rate: u32) -> u32 {
+        ((sample_rate as u64)
+            .saturating_mul(self.start_watermark_ms as u64)
+            .saturating_add(999)
+            / 1_000)
+            .min(u32::MAX as u64) as u32
+    }
+
     /// Return a test-only channel that receives every command sent to
     /// the service, plus the ingress receiver so tests can observe
     /// packet submission.
@@ -1075,11 +2005,14 @@ impl PlayoutHandle {
             has_pending_block: false,
             pending_block_frames: 0,
             expected_sequence: 0,
+            drift: None,
         }));
         let handle = PlayoutHandle {
             ingress: ingress_tx,
             cmd_tx,
             status,
+            jitter_capacity_packets: SchedulerConfig::default().jitter_capacity_packets,
+            start_watermark_ms: SchedulerConfig::default().start_watermark_ms,
         };
         (handle, cmd_rx, ingress_rx)
     }
@@ -1115,6 +2048,21 @@ where
     spawn_playout_service_with_sink(config, decoder, sink)
 }
 
+/// Spawn production playout with a clock that can release AP2 output against
+/// the sender's network timeline.
+pub fn spawn_playout_service_with_clock<D>(
+    config: SchedulerConfig,
+    decoder: D,
+    audio_engine: AudioEngine,
+    clock: Arc<dyn NetworkClock>,
+) -> (PlayoutHandle, JoinHandle<()>)
+where
+    D: PacketDecoder + Send + 'static,
+{
+    let sink = AudioEngineSink::new(audio_engine);
+    spawn_playout_service_with_sink_and_clock(config, decoder, sink, Some(clock))
+}
+
 /// Internal helper: spawn the playout service with an explicit
 /// [`PcmSink`].  Used by production via [`spawn_playout_service`]
 /// and by tests that substitute a fake sink.
@@ -1127,12 +2075,28 @@ where
     D: PacketDecoder + Send + 'static,
     S: PcmSink + Send + 'static,
 {
+    spawn_playout_service_with_sink_and_clock(config, decoder, sink, None)
+}
+
+fn spawn_playout_service_with_sink_and_clock<D, S>(
+    config: SchedulerConfig,
+    decoder: D,
+    sink: S,
+    clock: Option<Arc<dyn NetworkClock>>,
+) -> (PlayoutHandle, JoinHandle<()>)
+where
+    D: PacketDecoder + Send + 'static,
+    S: PcmSink + Send + 'static,
+{
     let (ingress_tx, ingress_rx) = packet_ingress();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PlayoutCommand>();
 
     // Build the core once and snapshot its initial status (reflects
     // any prequeued data in the sink).
-    let core = SchedulerCore::new(config.clone(), decoder, sink);
+    let mut core = SchedulerCore::new(config.clone(), decoder, sink);
+    if let Some(clock) = clock {
+        core.set_network_clock(clock);
+    }
     let initial_status = core.status();
 
     let status = Arc::new(RwLock::new(initial_status));
@@ -1141,6 +2105,8 @@ where
         ingress: ingress_tx,
         cmd_tx,
         status: Arc::clone(&status),
+        jitter_capacity_packets: config.jitter_capacity_packets,
+        start_watermark_ms: config.start_watermark_ms,
     };
 
     let join_handle = tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status));
@@ -1169,6 +2135,26 @@ async fn playout_task<D, S>(
         // packet, a command, or the next tick.
         let tick_fut = ticker.tick();
 
+        // ── jitter-buffer flow control ───────────────────────────
+        //
+        // When the jitter buffer has no free slot for another sequential
+        // packet (total_occupied ≥ capacity), a new packet would be
+        // inserted beyond the active window and trigger
+        // InsertResult::ResyncRequired — resetting the entire pipeline.
+        //
+        // This condition arises during AP2 TCP bursts when the PCM sink
+        // is backpressured: playout_task *must* stop consuming from the
+        // bounded ingress channel so the existing sender-side
+        // send().await can propagate TCP backpressure.  While throttled,
+        // only commands and timer ticks are serviced — ticks drive
+        // process_ready, which drains the jitter buffer as the PCM sink
+        // frees capacity.
+        //
+        // The check is re-evaluated each loop iteration after
+        // drive_scheduler has had a chance to drain, so polling
+        // resumes as soon as a slot opens.
+        let jitter_full = core.jitter.total_occupied() >= core.jitter.capacity();
+
         tokio::select! {
             biased;
 
@@ -1184,8 +2170,8 @@ async fn playout_task<D, S>(
                 }
             }
 
-            // ── packets ──────────────────────────────────────────
-            packet = ingress_rx.recv(), if !ingress_closed => {
+            // ── packets (throttled when jitter buffer is full) ───
+            packet = ingress_rx.recv(), if !ingress_closed && !jitter_full => {
                 match packet {
                     Some(pkt) => {
                         core.insert_packet(pkt);
@@ -1213,6 +2199,13 @@ fn apply_command<D: PacketDecoder, S: PcmSink>(
     cmd: PlayoutCommand,
 ) {
     match cmd {
+        PlayoutCommand::ConfigureStream(runtime) => core.configure_ap2_stream(runtime),
+        PlayoutCommand::Record => core.record_ap2(),
+        PlayoutCommand::ClearStream => core.clear_ap2_stream(),
+        PlayoutCommand::SetTimeline(anchor) => core.set_timeline(anchor),
+        PlayoutCommand::SetPlaybackRate(rate) => core.set_playback_rate(rate),
+        PlayoutCommand::ClearTimeline => core.clear_timeline(),
+        PlayoutCommand::FlushBuffered(range) => core.flush_buffered(range),
         PlayoutCommand::Start => core.start(),
         PlayoutCommand::Pause => core.pause(),
         PlayoutCommand::Resume => core.resume(),
@@ -1234,6 +2227,7 @@ fn drive_scheduler<D: PacketDecoder, S: PcmSink>(
         }
     }
     core.observe_fifo();
+    core.update_drift();
     *status.write() = core.status();
 }
 
@@ -2068,6 +3062,7 @@ mod tests {
         /// If true, reject the next enqueue call.
         next_reject: bool,
         actions: Vec<FakeSinkAction>,
+        correction_ppm: f64,
     }
 
     impl FakeSink {
@@ -2079,6 +3074,7 @@ mod tests {
                 flush_count: 0,
                 next_reject: false,
                 actions: Vec::new(),
+                correction_ppm: 0.0,
             }
         }
 
@@ -2102,6 +3098,10 @@ mod tests {
             self.flush_count += 1;
             self.blocks.clear();
             self.queued_ms = 0;
+        }
+
+        fn set_drift_correction_ppm(&mut self, ppm: f64) {
+            self.correction_ppm = ppm;
         }
 
         fn enqueue(&mut self, decoded: &DecodedAudio, _unchecked: bool) -> PcmWriteResult {
@@ -2133,6 +3133,105 @@ mod tests {
         )
     }
 
+    fn ap2_packet(seq: u64, rtp_timestamp: u32) -> TimedPacket {
+        TimedPacket::new(
+            super::super::packet::StreamProtocol::AirPlay2Buffered,
+            seq,
+            seq as u32,
+            rtp_timestamp,
+            0x1500_0000,
+            Some(crate::codec::AudioFormat::Alac44100S16Stereo),
+            bytes::Bytes::from_static(&[0; 16]),
+            Instant::now(),
+            false,
+            0,
+        )
+    }
+
+    #[derive(Clone)]
+    struct FakeNetworkClock {
+        state: Arc<std::sync::Mutex<FakeNetworkClockState>>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeNetworkClockState {
+        locked: bool,
+        master_clock_id: Option<u64>,
+        now_ns: u64,
+        offset_ns: i64,
+        uncertainty_ns: u64,
+    }
+
+    impl FakeNetworkClock {
+        fn new(locked: bool, now_ns: u64) -> Self {
+            Self {
+                state: Arc::new(std::sync::Mutex::new(FakeNetworkClockState {
+                    locked,
+                    master_clock_id: locked.then_some(0x1234),
+                    now_ns,
+                    offset_ns: 0,
+                    uncertainty_ns: 1_000_000,
+                })),
+            }
+        }
+
+        fn set_now(&self, now_ns: u64) {
+            self.state.lock().unwrap().now_ns = now_ns;
+        }
+
+        fn set_locked(&self, locked: bool) {
+            let mut state = self.state.lock().unwrap();
+            state.locked = locked;
+            state.master_clock_id = locked.then_some(0x1234);
+        }
+
+        fn set_master_clock_id(&self, master_clock_id: u64) {
+            let mut state = self.state.lock().unwrap();
+            state.locked = true;
+            state.master_clock_id = Some(master_clock_id);
+        }
+    }
+
+    impl NetworkClock for FakeNetworkClock {
+        fn is_locked(&self) -> bool {
+            self.state.lock().unwrap().locked
+        }
+
+        fn master_clock_id(&self) -> Option<u64> {
+            self.state.lock().unwrap().master_clock_id
+        }
+
+        fn network_to_local_ns(&self, network_ns: u64) -> Option<u64> {
+            let state = self.state.lock().unwrap();
+            if !state.locked {
+                return None;
+            }
+            Some(if state.offset_ns >= 0 {
+                network_ns.saturating_add(state.offset_ns as u64)
+            } else {
+                network_ns.saturating_sub(state.offset_ns.unsigned_abs())
+            })
+        }
+
+        fn local_now_ns(&self) -> u64 {
+            self.state.lock().unwrap().now_ns
+        }
+
+        fn uncertainty_ns(&self) -> u64 {
+            self.state.lock().unwrap().uncertainty_ns
+        }
+    }
+
+    fn ap2_runtime(sample_rate: u32) -> Ap2StreamRuntime {
+        Ap2StreamRuntime {
+            stream_id: 7,
+            stream_connection_id: Some(9),
+            audio_format: crate::codec::AudioFormat::Alac44100S16Stereo,
+            sample_rate,
+            frames_per_packet: 1,
+        }
+    }
+
     /// Test config with small watermarks for fast priming.
     fn sched_test_config() -> SchedulerConfig {
         SchedulerConfig {
@@ -2142,6 +3241,424 @@ mod tests {
             jitter_capacity_packets: 16,
             reorder_grace_ms: 100,
         }
+    }
+
+    #[test]
+    fn ap2_record_primes_but_waits_for_anchor_deadline() {
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let clock = FakeNetworkClock::new(true, 900_000_000);
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.set_network_clock(Arc::new(clock.clone()));
+        sched.configure_ap2_stream(ap2_runtime(1000));
+        sched.record_ap2();
+        sched.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 1_000_000_000,
+            rtp_timestamp: 10,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+
+        for (seq, rtp) in [(10, 10), (11, 11), (12, 12)] {
+            assert_eq!(
+                sched.insert_packet(ap2_packet(seq, rtp)),
+                InsertResult::Accepted
+            );
+            assert_eq!(sched.process_ready(Instant::now()), 1);
+        }
+        assert_eq!(sched.status().queued_ms, 3);
+        assert_eq!(sched.status().state, PlayoutState::Priming);
+        assert!(!sched.sink().gate);
+
+        clock.set_now(999_999_999);
+        sched.observe_fifo();
+        assert_eq!(sched.status().state, PlayoutState::Priming);
+        assert!(!sched.sink().gate);
+
+        clock.set_now(1_000_000_000);
+        sched.observe_fifo();
+        assert_eq!(sched.status().state, PlayoutState::Playing);
+        assert!(sched.sink().gate);
+    }
+
+    #[test]
+    fn ap2_ptp_lock_loss_closes_gate_and_reprimes() {
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let clock = FakeNetworkClock::new(true, 1_000_000_000);
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.set_network_clock(Arc::new(clock.clone()));
+        sched.configure_ap2_stream(ap2_runtime(1000));
+        sched.record_ap2();
+        sched.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 1_000_000_000,
+            rtp_timestamp: 10,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+        for (seq, rtp) in [(10, 10), (11, 11), (12, 12)] {
+            sched.insert_packet(ap2_packet(seq, rtp));
+            sched.process_ready(Instant::now());
+        }
+        assert_eq!(sched.status().state, PlayoutState::Playing);
+
+        clock.set_locked(false);
+        sched.observe_fifo();
+        assert_eq!(sched.status().state, PlayoutState::Priming);
+        assert!(!sched.sink().gate);
+        assert_eq!(sched.status().diag.clock_lock_losses, 1);
+    }
+
+    fn playing_ap2_scheduler() -> (SchedulerCore<FakeDecoder, FakeSink>, FakeNetworkClock) {
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let clock = FakeNetworkClock::new(true, 1_000_000_000);
+        let mut scheduler = SchedulerCore::new(sched_test_config(), decoder, sink);
+        scheduler.set_network_clock(Arc::new(clock.clone()));
+        scheduler.configure_ap2_stream(ap2_runtime(1000));
+        scheduler.record_ap2();
+        scheduler.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 1_000_000_000,
+            rtp_timestamp: 10,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+        for (sequence, timestamp) in [(10, 10), (11, 11), (12, 12)] {
+            scheduler.insert_packet(ap2_packet(sequence, timestamp));
+            scheduler.process_ready(Instant::now());
+        }
+        assert_eq!(scheduler.state(), PlayoutState::Playing);
+        (scheduler, clock)
+    }
+
+    #[test]
+    fn ap2_drift_controller_uses_fifo_and_timeline_tail_error() {
+        let (mut scheduler, _clock) = playing_ap2_scheduler();
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_secs(1));
+        scheduler.update_drift();
+
+        let diagnostics = scheduler.status().drift.expect("drift diagnostics");
+        assert!(diagnostics.enabled);
+        assert_eq!(diagnostics.fifo_error_ms, -1.0);
+        assert!(diagnostics.timing_error_ns.abs() < 1.0);
+        assert!(diagnostics.correction_ppm < 0.0);
+        assert_eq!(scheduler.sink().correction_ppm, diagnostics.correction_ppm);
+
+        scheduler.stop();
+        assert_eq!(scheduler.sink().correction_ppm, 0.0);
+        assert!(!scheduler.status().drift.unwrap().enabled);
+    }
+
+    #[test]
+    fn ap2_drift_resets_and_reprimes_on_ptp_master_change() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_secs(1));
+        scheduler.update_drift();
+        assert_ne!(scheduler.sink().correction_ppm, 0.0);
+
+        clock.set_master_clock_id(0x5678);
+        scheduler.update_drift();
+        assert_eq!(scheduler.state(), PlayoutState::Priming);
+        assert_eq!(scheduler.sink().correction_ppm, 0.0);
+        assert!(!scheduler.status().drift.unwrap().enabled);
+    }
+
+    #[test]
+    fn ap2_large_timeline_error_hard_resyncs_complete_pipeline() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        scheduler.update_drift();
+        let flushes_before = scheduler.sink().flush_count;
+
+        clock.set_now(1_200_000_000);
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+
+        let diagnostics = scheduler.status().drift.expect("drift diagnostics");
+        assert_eq!(diagnostics.hard_resync_count, 1);
+        assert_eq!(scheduler.state(), PlayoutState::Priming);
+        assert_eq!(scheduler.sink().correction_ppm, 0.0);
+        assert!(scheduler.sink().flush_count > flushes_before);
+        assert_eq!(scheduler.status().diag.resync_count, 1);
+        assert_eq!(scheduler.expected_sequence(), 0);
+        assert!(scheduler.last_enqueued_ap2.is_none());
+        assert!(scheduler.pending_hard_reanchor);
+        assert!(scheduler.recovery_anchor.is_none());
+
+        for (sequence, timestamp) in [(20, 20), (21, 21), (22, 22)] {
+            assert_eq!(
+                scheduler.insert_packet(ap2_packet(sequence, timestamp)),
+                InsertResult::Accepted
+            );
+            assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        }
+
+        let recovery = scheduler
+            .recovery_anchor
+            .expect("first packet after a hard resync must install a recovery anchor");
+        assert_eq!(recovery.rtp_timestamp, 20);
+        assert_eq!(recovery.local_time_ns, 1_203_000_000);
+        assert!(!scheduler.pending_hard_reanchor);
+        assert_eq!(scheduler.state(), PlayoutState::Priming);
+
+        clock.set_now(recovery.local_time_ns);
+        scheduler.observe_fifo();
+        assert_eq!(scheduler.state(), PlayoutState::Playing);
+
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+        assert_eq!(
+            scheduler
+                .status()
+                .drift
+                .expect("drift diagnostics")
+                .hard_resync_count,
+            1,
+            "the recovery timeline must not immediately trigger another hard resync"
+        );
+    }
+
+    #[test]
+    fn sender_timeline_replaces_hard_resync_recovery_anchor() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        clock.set_now(1_200_000_000);
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+        scheduler.insert_packet(ap2_packet(20, 20));
+        assert!(scheduler.recovery_anchor.is_some());
+
+        scheduler.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 2,
+            network_time_ns: 1_300_000_000,
+            rtp_timestamp: 30,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+
+        assert!(scheduler.recovery_anchor.is_none());
+        assert!(!scheduler.pending_hard_reanchor);
+        assert_eq!(scheduler.timeline.unwrap().timeline_id, 2);
+    }
+
+    #[test]
+    fn ap2_resume_anchor_discards_stale_pause_audio_without_hard_resync() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        scheduler.set_playback_rate(PlaybackRate::Paused);
+        assert_eq!(scheduler.state(), PlayoutState::Paused);
+        let flushes_before = scheduler.sink().flush_count;
+
+        scheduler.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 1_000_000_000,
+            rtp_timestamp: 100,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+
+        assert_eq!(scheduler.state(), PlayoutState::Priming);
+        assert!(scheduler.sink().flush_count > flushes_before);
+        assert_eq!(scheduler.status().queued_ms, 0);
+        assert_eq!(
+            scheduler.insert_packet(ap2_packet(99, 99)),
+            InsertResult::TooOld
+        );
+        assert_eq!(scheduler.status().diag.buffered_flush_drops, 1);
+
+        for (sequence, timestamp) in [(100, 100), (101, 101), (102, 102)] {
+            assert_eq!(
+                scheduler.insert_packet(ap2_packet(sequence, timestamp)),
+                InsertResult::Accepted
+            );
+            assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        }
+        clock.set_now(1_000_000_000);
+        scheduler.observe_fifo();
+        assert_eq!(scheduler.state(), PlayoutState::Playing);
+
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+        assert_eq!(scheduler.status().diag.resync_count, 0);
+        assert_eq!(
+            scheduler
+                .status()
+                .drift
+                .expect("drift diagnostics")
+                .hard_resync_count,
+            0
+        );
+    }
+
+    #[test]
+    fn ap2_drift_updates_are_cadence_limited() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+        let applied_before = scheduler.sink().correction_ppm;
+        let diagnostics_before = scheduler.status().drift.expect("drift diagnostics");
+
+        // A scheduler event immediately after the prior update must not
+        // restart the sink's resampler ramp.
+        clock.set_now(1_050_000_000);
+        scheduler.update_drift();
+
+        assert_eq!(scheduler.sink().correction_ppm, applied_before);
+        assert_eq!(
+            scheduler.status().drift.expect("drift diagnostics"),
+            diagnostics_before
+        );
+        assert_eq!(scheduler.status().diag.resync_count, 0);
+    }
+
+    #[test]
+    fn ap2_drops_packet_beyond_deadline_tolerance() {
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let clock = FakeNetworkClock::new(true, 100_000_000);
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.set_network_clock(Arc::new(clock));
+        sched.configure_ap2_stream(ap2_runtime(1000));
+        sched.record_ap2();
+        sched.set_timeline(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 0,
+            rtp_timestamp: 10,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+        sched.insert_packet(ap2_packet(10, 10));
+
+        assert_eq!(sched.process_ready(Instant::now()), 0);
+        assert_eq!(sched.status().diag.late_packet_drops, 1);
+        assert_eq!(sched.status().diag.late_catchup_events, 1);
+        assert_eq!(sched.state(), PlayoutState::Priming);
+        assert_eq!(sched.decoder().decode_count, 0);
+    }
+
+    #[test]
+    fn ap2_bulk_late_catchup_flushes_old_pcm_once_and_reanchors_tail() {
+        let (mut scheduler, clock) = playing_ap2_scheduler();
+        let flushes_before = scheduler.sink().flush_count;
+        assert_eq!(scheduler.status().queued_ms, 3);
+
+        // At 1.050 s, RTP 13/14 are expired beyond the 21 ms tolerance,
+        // while RTP 40 and later are still viable.
+        clock.set_now(1_050_000_000);
+        for (sequence, timestamp) in [(13, 13), (14, 14), (15, 40), (16, 41), (17, 42)] {
+            assert_eq!(
+                scheduler.insert_packet(ap2_packet(sequence, timestamp)),
+                InsertResult::Accepted
+            );
+        }
+
+        assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        assert_eq!(scheduler.status().diag.late_packet_drops, 2);
+        assert_eq!(scheduler.status().diag.late_catchup_events, 1);
+        assert_eq!(scheduler.sink().flush_count, flushes_before + 1);
+        assert_eq!(scheduler.status().queued_ms, 1);
+        assert_eq!(scheduler.last_enqueued_ap2, Some((40, 1)));
+
+        assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        assert_eq!(scheduler.state(), PlayoutState::Playing);
+        assert_eq!(scheduler.status().queued_ms, 3);
+        assert_eq!(scheduler.sink().flush_count, flushes_before + 1);
+        assert_eq!(scheduler.last_enqueued_ap2, Some((42, 1)));
+
+        scheduler.last_drift_update = Some(Instant::now() - Duration::from_millis(200));
+        scheduler.update_drift();
+        assert_eq!(scheduler.status().diag.resync_count, 0);
+        assert_eq!(
+            scheduler
+                .status()
+                .drift
+                .expect("drift diagnostics")
+                .hard_resync_count,
+            0
+        );
+    }
+
+    #[test]
+    fn ap2_deadline_extends_rtp_across_wraparound() {
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = FakeSink::new();
+        let clock = FakeNetworkClock::new(true, 0);
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.set_network_clock(Arc::new(clock));
+        sched.timeline = Some(Ap2TimelineAnchor {
+            timeline_id: 1,
+            network_time_ns: 1_000_000_000,
+            rtp_timestamp: u32::MAX - 10,
+            sample_rate: 1000,
+            rate: PlaybackRate::Normal,
+        });
+
+        assert_eq!(sched.packet_deadline_ns(5), Some(1_016_000_000));
+    }
+
+    #[test]
+    fn reported_start_latency_uses_configured_watermark() {
+        let (handle, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(8);
+        assert_eq!(handle.start_latency_frames(44_100), 3_528);
+        assert_eq!(handle.start_latency_frames(48_000), 3_840);
+    }
+
+    #[test]
+    fn ap2_immediate_flush_drops_through_boundary_and_retains_endpoint() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decoder = FakeDecoder::new(1, 1000, 1).with_decode_log(Arc::clone(&log));
+        let sink = FakeSink::new();
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.configure_ap2_stream(ap2_runtime(1000));
+        sched.record_ap2();
+        sched.flush_buffered(Ap2FlushRange {
+            from_sequence: None,
+            from_rtp_timestamp: None,
+            until_sequence: 12,
+            until_rtp_timestamp: 102,
+        });
+        sched.resume();
+
+        for (seq, timestamp) in [(10, 100), (11, 101), (12, 102)] {
+            assert_eq!(
+                sched.insert_packet(ap2_packet(seq, timestamp)),
+                InsertResult::Accepted
+            );
+        }
+        assert_eq!(sched.process_ready(Instant::now()), 1);
+        assert_eq!(&*log.lock().unwrap(), &[12]);
+        assert_eq!(sched.status().diag.buffered_flush_drops, 2);
+    }
+
+    #[test]
+    fn ap2_deferred_flush_preserves_pcm_and_discards_only_half_open_range() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let decoder = FakeDecoder::new(1, 1000, 1).with_decode_log(Arc::clone(&log));
+        let sink = FakeSink::new();
+        let mut sched = SchedulerCore::new(sched_test_config(), decoder, sink);
+        sched.configure_ap2_stream(ap2_runtime(1000));
+        sched.record_ap2();
+        let flushes_before = sched.sink().flush_count;
+        sched.flush_buffered(Ap2FlushRange {
+            from_sequence: Some(11),
+            from_rtp_timestamp: Some(101),
+            until_sequence: 13,
+            until_rtp_timestamp: 103,
+        });
+        assert_eq!(sched.sink().flush_count, flushes_before);
+        sched.resume();
+
+        for (seq, timestamp) in [(10, 100), (11, 101), (12, 102), (13, 103)] {
+            assert_eq!(
+                sched.insert_packet(ap2_packet(seq, timestamp)),
+                InsertResult::Accepted
+            );
+        }
+        assert_eq!(sched.process_ready(Instant::now()), 1);
+        assert_eq!(sched.process_ready(Instant::now()), 1);
+        assert_eq!(&*log.lock().unwrap(), &[10, 13]);
+        assert_eq!(sched.status().diag.buffered_flush_drops, 2);
     }
 
     // ── Reordered output: 10, 12, 11 → 10, 11, 12 ─────────────
@@ -2783,6 +4300,59 @@ mod tests {
     }
 
     #[test]
+    fn audio_engine_sink_reuses_prepared_resampler_output_after_backpressure() {
+        let (engine, mut consumer) = make_engine();
+        engine.set_output_format(48_000, 2);
+        engine.set_output_gate(true);
+
+        let capacity_samples = engine.status().capacity_samples;
+        let fill = vec![0.1f32; capacity_samples - 2];
+        let (_, accepted) = engine.try_enqueue_output_frames_all_or_nothing(&fill, true);
+        assert_eq!(accepted * 2, fill.len());
+
+        let mut decoded = DecodedAudio {
+            samples: vec![0.5f32; 1024 * 2],
+            sample_rate: 44_100,
+            channels: 2,
+        };
+        let mut sink = AudioEngineSink::new(engine);
+        assert!(!sink.enqueue(&decoded, true).is_accepted());
+        assert!(sink.pending_conversion.is_some());
+
+        // Drain the original fill, then mutate the source. A retry must use
+        // the already-prepared non-zero resampler output rather than advance
+        // the stateful resampler over this block for a second time.
+        let mut drain = vec![0.0; capacity_samples];
+        consumer.fill_output(&mut drain);
+        decoded.samples.fill(0.0);
+        assert!(sink.enqueue(&decoded, true).is_accepted());
+        assert!(sink.pending_conversion.is_none());
+
+        let queued_samples = sink.engine().status().queued_samples;
+        let mut retried_output = vec![0.0; queued_samples];
+        consumer.fill_output(&mut retried_output);
+        assert!(
+            retried_output.iter().any(|sample| sample.abs() > 0.01),
+            "retry unexpectedly resampled the mutated source block"
+        );
+    }
+
+    #[test]
+    fn audio_engine_sink_reports_sub_millisecond_queue_duration_exactly() {
+        let (engine, _consumer) = make_engine();
+        engine.set_output_format(48_000, 2);
+        let decoded = DecodedAudio {
+            samples: vec![0.25, -0.25],
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let mut sink = AudioEngineSink::new(engine);
+        assert!(sink.enqueue(&decoded, true).is_accepted());
+        assert_eq!(sink.queued_ms(), 0);
+        assert_eq!(sink.queued_duration_ns(), 20_833);
+    }
+
+    #[test]
     fn audio_engine_sink_checked_gate_rejects() {
         let (engine, _consumer) = make_engine();
         engine.set_output_format(48_000, 2);
@@ -3017,12 +4587,15 @@ mod tests {
             has_pending_block: false,
             pending_block_frames: 0,
             expected_sequence: 0,
+            drift: None,
         }));
 
         let handle = PlayoutHandle {
             ingress: ingress_tx,
             cmd_tx,
             status: Arc::clone(&status),
+            jitter_capacity_packets: cfg.jitter_capacity_packets,
+            start_watermark_ms: cfg.start_watermark_ms,
         };
 
         let join_handle = {
@@ -3075,12 +4648,15 @@ mod tests {
             has_pending_block: false,
             pending_block_frames: 0,
             expected_sequence: 0,
+            drift: None,
         }));
 
         let handle = PlayoutHandle {
             ingress: ingress_tx,
             cmd_tx,
             status: Arc::clone(&status),
+            jitter_capacity_packets: cfg.jitter_capacity_packets,
+            start_watermark_ms: cfg.start_watermark_ms,
         };
 
         // Fill the 1-slot channel before spawning the service so the
@@ -3138,11 +4714,14 @@ mod tests {
             has_pending_block: false,
             pending_block_frames: 0,
             expected_sequence: 0,
+            drift: None,
         }));
         let handle = PlayoutHandle {
             ingress: tx,
             cmd_tx,
             status,
+            jitter_capacity_packets: SchedulerConfig::default().jitter_capacity_packets,
+            start_watermark_ms: SchedulerConfig::default().start_watermark_ms,
         };
 
         // Drop the receiver so the channel is closed.
@@ -3175,12 +4754,15 @@ mod tests {
             has_pending_block: false,
             pending_block_frames: 0,
             expected_sequence: 0,
+            drift: None,
         }));
 
         let handle = PlayoutHandle {
             ingress: ingress_tx,
             cmd_tx,
             status: Arc::clone(&status),
+            jitter_capacity_packets: cfg.jitter_capacity_packets,
+            start_watermark_ms: cfg.start_watermark_ms,
         };
 
         let join_handle = {
@@ -3335,5 +4917,356 @@ mod tests {
 
         handle.shutdown();
         let _ = join_handle.await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Jitter-buffer flow-control regression tests
+    // ═══════════════════════════════════════════════════════════════
+
+    /// A sink with a fixed frame capacity that rejects enqueues once
+    /// `queued_frames >= capacity`.  Supports `consume_frames(n)` to
+    /// simulate PCM drain.
+    ///
+    /// INVARIANT: `queued_frames` never exceeds `capacity_frames`.
+    struct CapacityBoundedSink {
+        queued_frames: usize,
+        capacity_frames: usize,
+        gate: bool,
+        flush_count: usize,
+        actions: Vec<FakeSinkAction>,
+    }
+
+    impl CapacityBoundedSink {
+        fn with_capacity(frames: usize) -> Self {
+            Self {
+                queued_frames: 0,
+                capacity_frames: frames,
+                gate: false,
+                flush_count: 0,
+                actions: Vec::new(),
+            }
+        }
+
+        /// Simulate the PCM sink draining `n` frames.
+        fn consume_frames(&mut self, n: usize) {
+            self.queued_frames = self.queued_frames.saturating_sub(n);
+        }
+    }
+
+    impl PcmSink for CapacityBoundedSink {
+        fn queued_ms(&self) -> u64 {
+            // At 1000 Hz, each frame ≈ 1 ms (matching FakeDecoder).
+            self.queued_frames as u64
+        }
+
+        fn set_output_gate(&mut self, enabled: bool) {
+            self.actions.push(FakeSinkAction::Gate(enabled));
+            self.gate = enabled;
+        }
+
+        fn request_flush(&mut self) {
+            self.actions.push(FakeSinkAction::Flush);
+            self.flush_count += 1;
+            self.queued_frames = 0;
+        }
+
+        fn enqueue(&mut self, decoded: &DecodedAudio, _unchecked: bool) -> PcmWriteResult {
+            let frames = decoded.frames();
+            if frames == 0 {
+                return PcmWriteResult::all_accepted(0);
+            }
+            let new_total = self.queued_frames.saturating_add(frames);
+            if new_total > self.capacity_frames {
+                return PcmWriteResult::all_rejected(frames);
+            }
+            self.queued_frames = new_total;
+            PcmWriteResult::all_accepted(frames)
+        }
+    }
+
+    /// Helper: spawn a service with a small jitter capacity and a
+    /// frame-bounded sink for flow-control tests, returning the handle
+    /// plus a shared reference to the sink so the test can release frames.
+    fn spawn_flow_control_service(
+        jitter_capacity: usize,
+        sink_capacity_frames: usize,
+    ) -> (
+        PlayoutHandle,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<std::sync::Mutex<CapacityBoundedSink>>,
+    ) {
+        let cfg = SchedulerConfig {
+            start_watermark_ms: 3,
+            low_watermark_ms: 1,
+            target_watermark_ms: 2,
+            jitter_capacity_packets: jitter_capacity,
+            reorder_grace_ms: 100,
+        };
+        let decoder = FakeDecoder::new(1, 1000, 1);
+        let sink = CapacityBoundedSink::with_capacity(sink_capacity_frames);
+        let sink_shared = Arc::new(std::sync::Mutex::new(sink));
+
+        // We use spawn_playout_service_with_sink which takes ownership.
+        // To get shared access we use the same pattern as existing tests:
+        // build the channels manually and wrap the sink in an Arc<Mutex<>>.
+        let (ingress_tx, ingress_rx) = packet_ingress();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PlayoutCommand>();
+
+        let sink_for_core = /* clone the Arc */ {
+            // We need a PcmSink that delegates through the Arc<Mutex>.
+            // Since PcmSink takes &mut self, we wrap it.
+            struct ArcSink(Arc<std::sync::Mutex<CapacityBoundedSink>>);
+            impl PcmSink for ArcSink {
+                fn queued_ms(&self) -> u64 {
+                    self.0.lock().unwrap().queued_ms()
+                }
+                fn set_output_gate(&mut self, enabled: bool) {
+                    self.0.lock().unwrap().set_output_gate(enabled);
+                }
+                fn request_flush(&mut self) {
+                    self.0.lock().unwrap().request_flush();
+                }
+                fn enqueue(&mut self, decoded: &DecodedAudio, unchecked: bool) -> PcmWriteResult {
+                    self.0.lock().unwrap().enqueue(decoded, unchecked)
+                }
+            }
+            ArcSink(Arc::clone(&sink_shared))
+        };
+
+        let core = SchedulerCore::new(cfg, decoder, sink_for_core);
+        let initial_status = core.status();
+        let status = Arc::new(RwLock::new(initial_status));
+
+        let handle = PlayoutHandle {
+            ingress: ingress_tx,
+            cmd_tx,
+            status: Arc::clone(&status),
+            jitter_capacity_packets: jitter_capacity,
+            start_watermark_ms: 3,
+        };
+
+        let join_handle = tokio::spawn(playout_task(core, ingress_rx, cmd_rx, status));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = join_handle.await;
+            let _ = tx.send(());
+        });
+
+        (handle, rx, sink_shared)
+    }
+
+    /// Sequential burst at AP2 line rate, exceeding combined ingress +
+    /// jitter capacity with a backpressured sink.  The flow-control
+    /// guard must prevent ResyncRequired and preserve packet order.
+    #[tokio::test]
+    async fn burst_with_backpressure_no_resync() {
+        // Small jitter (8) so we can overflow it with a modest burst.
+        // Sink accepts only 3 frames, then rejects.
+        let (handle, mut _rx, sink) = spawn_flow_control_service(8, 3);
+
+        // Start → Priming.
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let initial_resyncs = handle.status().diag.resync_count;
+        let initial_inserted = handle.status().diag.insert_accepted;
+
+        // Send a sequential burst of 20 packets (far exceeding jitter=8).
+        let packets: Vec<_> = (0u64..20).map(seq_packet).collect();
+        for pkt in &packets {
+            // Use send_ap2 (async, backpressure-aware) so the test
+            // doesn't drop packets on a full ingress channel.
+            let result = handle.send_ap2(pkt.clone()).await;
+            assert_eq!(
+                result,
+                crate::playout::ingress::IngressResult::Accepted,
+                "send_ap2 must accept packet seq {}",
+                pkt.extended_sequence
+            );
+        }
+
+        // Let the service process for a bit — with flow control, the
+        // burst should drain through the jitter buffer without resyncing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let after_burst = handle.status();
+
+        // The flow-control guard must prevent ResyncRequired.
+        assert_eq!(
+            after_burst.diag.resync_count, initial_resyncs,
+            "no resyncs should occur during a normal sequential burst, \
+             even with a full sink — flow control must throttle ingress \
+             instead of letting the jitter window overflow"
+        );
+
+        // At least one packet must have been inserted (the seed).
+        assert!(
+            after_burst.diag.insert_accepted > initial_inserted,
+            "packets must be inserted into jitter"
+        );
+
+        // Now drain the sink in steps, freeing jitter slots so flow
+        // control can resume ingress polling and move remaining packets
+        // through the pipeline.
+        let mut prev_inserted = after_burst.diag.insert_accepted;
+        for step in 0..8 {
+            {
+                let mut s = sink.lock().unwrap();
+                s.consume_frames(10); // drain well below capacity
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+
+            let s = handle.status();
+            assert_eq!(
+                s.diag.resync_count, initial_resyncs,
+                "no resync after drain step {}",
+                step
+            );
+            assert!(
+                s.diag.insert_accepted >= prev_inserted,
+                "insert_accepted must not regress (step {})",
+                step
+            );
+            prev_inserted = s.diag.insert_accepted;
+
+            if prev_inserted >= 20 {
+                break;
+            }
+        }
+
+        // All 20 packets should have been inserted.
+        assert!(
+            prev_inserted >= 20,
+            "all 20 packets must eventually be inserted, got {} after {} drain steps",
+            prev_inserted,
+            8
+        );
+
+        handle.shutdown();
+        // Wait for task to finish.
+        let _ = _rx.await;
+    }
+
+    /// A far-ahead sequential gap (beyond the active window) must still
+    /// trigger ResyncRequired — the flow-control guard only prevents
+    /// ingestion when the jitter buffer is *full from sequential traffic*,
+    /// not when a genuine discontinuity arrives.
+    #[tokio::test]
+    async fn far_ahead_discontinuity_triggers_resync() {
+        let (handle, mut _rx, _sink) = spawn_flow_control_service(8, 100);
+
+        // Start → Priming.
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Insert initial sequential packets to seed the jitter window.
+        for seq in 0u64..4 {
+            let result = handle.send_ap2(seq_packet(seq)).await;
+            assert_eq!(result, crate::playout::ingress::IngressResult::Accepted);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let initial_accepted = handle.status().diag.insert_accepted;
+
+        // Send a packet far beyond the active window (seq 1000, jitter
+        // capacity is 8, so the window is [expected, expected+8)).
+        // This is a genuine discontinuity and MUST trigger ResyncRequired.
+        let result = handle.send_ap2(seq_packet(1000)).await;
+        assert_eq!(result, crate::playout::ingress::IngressResult::Accepted);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let after = handle.status();
+
+        // A resync must have occurred.
+        assert!(
+            after.diag.resync_count > 0,
+            "a far-ahead discontinuity must trigger ResyncRequired"
+        );
+
+        // The resync resets the jitter, so the total inserted should be
+        // only the initial packets + the resync re-insertion.
+        // After resync, the far-ahead packet becomes the new seed.
+        // So insert_accepted might be at most initial_accepted + 2
+        // (the resync re-inserts the far-ahead packet).
+        assert!(
+            after.diag.insert_accepted > initial_accepted,
+            "the far-ahead packet must be inserted (possibly after resync)"
+        );
+
+        // Verify the pipeline is back in a valid state.
+        assert!(
+            matches!(after.state, PlayoutState::Priming | PlayoutState::Playing),
+            "after resync the pipeline must be in a valid active state, got {:?}",
+            after.state
+        );
+
+        handle.shutdown();
+        let _ = _rx.await;
+    }
+
+    /// Sequential burst into a full sink with gradually released
+    /// capacity: prove that flow control unblocks and remaining packets
+    /// are delivered in order without resyncs.
+    #[tokio::test]
+    async fn burst_recovers_after_sink_drains() {
+        let (handle, mut _rx, sink) = spawn_flow_control_service(8, 2);
+
+        handle.start();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let initial_resyncs = handle.status().diag.resync_count;
+
+        // Send 12 sequential packets (more than jitter=8).
+        for seq in 0u64..12 {
+            let result = handle.send_ap2(seq_packet(seq)).await;
+            assert_eq!(result, crate::playout::ingress::IngressResult::Accepted);
+        }
+
+        // Wait a bit — flow control should throttle after jitter fills.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // No resyncs so far.
+        assert_eq!(
+            handle.status().diag.resync_count,
+            initial_resyncs,
+            "no resync during burst with full sink"
+        );
+
+        // Gradually drain the sink in steps.
+        let mut total_accepted_before = 0u64;
+        for step in 0..5 {
+            {
+                let mut s = sink.lock().unwrap();
+                s.consume_frames(3);
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+
+            let s = handle.status();
+            assert_eq!(
+                s.diag.resync_count, initial_resyncs,
+                "no resync after drain step {}",
+                step
+            );
+            // insert_accepted should increase monotonically.
+            assert!(
+                s.diag.insert_accepted >= total_accepted_before,
+                "insert_accepted must not regress (step {})",
+                step
+            );
+            total_accepted_before = s.diag.insert_accepted;
+        }
+
+        // Eventually all packets are processed.
+        let final_status = handle.status();
+        assert!(
+            final_status.diag.insert_accepted >= 12,
+            "all 12 packets eventually inserted, got {}",
+            final_status.diag.insert_accepted
+        );
+
+        handle.shutdown();
+        let _ = _rx.await;
     }
 }

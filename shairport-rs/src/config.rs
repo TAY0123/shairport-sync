@@ -35,6 +35,8 @@ pub struct AirplayConfig {
     pub pin: String,
     pub identity_key_path: Option<String>,
     pub pairing_db_path: Option<String>,
+    /// Optional privacy-safe AP2 interoperability transcript (JSON Lines).
+    pub transcript_path: Option<String>,
     pub audio_port: u16,
     pub control_port: u16,
     pub timing_port: u16,
@@ -175,6 +177,7 @@ impl Default for AirplayConfig {
             pin: "3939".to_string(),
             identity_key_path: None,
             pairing_db_path: None,
+            transcript_path: None,
             bind: "0.0.0.0:7000".to_string(),
             ap2_bind_ip: None,
             advertised_format_policy: AdvertisedFormatPolicy::AacIfAvailable,

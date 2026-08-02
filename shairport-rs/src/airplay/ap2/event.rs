@@ -59,6 +59,7 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use crate::airplay::crypto::{CipherError, PairCipher};
+use crate::airplay::transcript::TranscriptRecorder;
 
 type SharedEventCipher = Arc<tokio::sync::Mutex<PairCipher>>;
 
@@ -505,6 +506,26 @@ impl EventListener {
         write_timeout: Duration,
         read_timeout: Duration,
     ) -> std::io::Result<(u16, Self)> {
+        Self::bind_with_transcript(
+            bind_addr,
+            secret,
+            update_info_body,
+            write_timeout,
+            read_timeout,
+            None,
+            None,
+        )
+    }
+
+    pub fn bind_with_transcript(
+        bind_addr: SocketAddr,
+        secret: Arc<Zeroizing<Vec<u8>>>,
+        update_info_body: Vec<u8>,
+        write_timeout: Duration,
+        read_timeout: Duration,
+        transcript: Option<Arc<TranscriptRecorder>>,
+        transcript_connection: Option<u64>,
+    ) -> std::io::Result<(u16, Self)> {
         if secret.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -533,6 +554,8 @@ impl EventListener {
             update_info_body,
             write_timeout,
             read_timeout,
+            transcript,
+            transcript_connection,
         ));
         Ok((
             port,
@@ -585,6 +608,7 @@ impl Drop for WorkerGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_event_listener(
     listener: TcpListener,
     mut shutdown_rx: tokio::sync::watch::Receiver<()>,
@@ -592,6 +616,8 @@ async fn run_event_listener(
     update_info_body: Vec<u8>,
     write_timeout: Duration,
     read_timeout: Duration,
+    transcript: Option<Arc<TranscriptRecorder>>,
+    transcript_connection: Option<u64>,
 ) {
     let mut worker = WorkerGuard::default();
     loop {
@@ -606,6 +632,11 @@ async fn run_event_listener(
                 break;
             }
         };
+        if let (Some(recorder), Some(connection)) = (transcript.as_ref(), transcript_connection)
+            && let Err(error) = recorder.record_event_channel_connected(connection)
+        {
+            warn!(%error, "AP2 transcript event marker write failed");
+        }
         worker.terminate_current().await;
         let cipher = Arc::clone(&cipher);
         let body = update_info_body.clone();

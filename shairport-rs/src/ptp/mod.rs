@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -30,6 +30,18 @@ pub enum PtpMessageType {
 
 static PTP_EPOCH: OnceLock<Instant> = OnceLock::new();
 static LOCAL_CLOCK_ID: OnceLock<u64> = OnceLock::new();
+const SERVO_MEDIAN_WINDOW: usize = 5;
+
+fn rolling_median(samples: &VecDeque<i64>) -> f64 {
+    let mut sorted: Vec<_> = samples.iter().copied().collect();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] as f64 + sorted[middle] as f64) / 2.0
+    } else {
+        sorted[middle] as f64
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PtpMessage {
@@ -110,6 +122,15 @@ impl PtpRuntime {
 
     fn note_master(&self, message: &PtpMessage, peer: SocketAddr, is_event: bool) {
         let mut state = self.state.lock();
+        let master_changed = state
+            .master_clock_id
+            .is_some_and(|current| current != message.clock_identity);
+        if master_changed {
+            self.sync_samples.lock().clear();
+            *self.last_sync.lock() = None;
+            self.delay_samples.lock().clear();
+            state.path_delay_ns = 0;
+        }
         state.transport_specific = message.transport_specific();
         state.domain = message.domain;
         state.master_clock_id = Some(message.clock_identity);
@@ -139,12 +160,20 @@ pub struct ClockServo {
     alpha: f64,
     /// Number of samples received
     sample_count: u64,
+    /// Recent raw offset samples. Socket receive timestamps can contain
+    /// millisecond-scale scheduler outliers, so the IIR consumes their median.
+    offset_samples: VecDeque<i64>,
     /// Master clock identity
     pub master_clock_id: Option<u64>,
+    /// Master selected by the owning AP2 session. When set, samples from all
+    /// other clocks are ignored.
+    pub selected_master_clock_id: Option<u64>,
     /// Whether the servo has locked
     pub locked: bool,
     /// Estimated mean path delay to the master clock, in nanoseconds.
     pub path_delay_ns: f64,
+    /// Recent path-delay estimates for the same outlier filtering.
+    path_delay_samples: VecDeque<i64>,
 }
 
 impl ClockServo {
@@ -153,24 +182,38 @@ impl ClockServo {
             offset_ns: 0.0,
             alpha: 0.1,
             sample_count: 0,
+            offset_samples: VecDeque::with_capacity(SERVO_MEDIAN_WINDOW),
             master_clock_id: None,
+            selected_master_clock_id: None,
             locked: false,
             path_delay_ns: 0.0,
+            path_delay_samples: VecDeque::with_capacity(SERVO_MEDIAN_WINDOW),
         }
     }
 
     /// Update the servo with a new offset sample from a Sync/FollowUp pair.
     pub fn update_offset(&mut self, sample_offset_ns: i64, master_id: u64) {
+        if self
+            .selected_master_clock_id
+            .is_some_and(|selected| selected != master_id)
+        {
+            return;
+        }
         self.master_clock_id = Some(master_id);
         self.sample_count += 1;
+        self.offset_samples.push_back(sample_offset_ns);
+        if self.offset_samples.len() > SERVO_MEDIAN_WINDOW {
+            self.offset_samples.pop_front();
+        }
+        let filtered_sample = rolling_median(&self.offset_samples);
 
-        // First few samples: use directly to converge quickly
+        // Acquire quickly, but never expose the acquisition estimate as locked.
+        // Once established, the median removes isolated receive-scheduling
+        // spikes before the IIR makes small, continuous clock corrections.
         if self.sample_count < 10 {
-            self.offset_ns = sample_offset_ns as f64;
+            self.offset_ns = filtered_sample;
         } else {
-            // IIR low-pass filter
-            self.offset_ns =
-                self.alpha * sample_offset_ns as f64 + (1.0 - self.alpha) * self.offset_ns;
+            self.offset_ns = self.alpha * filtered_sample + (1.0 - self.alpha) * self.offset_ns;
         }
 
         // Consider locked after 20 samples with consistent offset
@@ -180,12 +223,44 @@ impl ClockServo {
     }
 
     pub fn update_path_delay(&mut self, sample_path_delay_ns: i64) {
-        let sample = sample_path_delay_ns.max(0) as f64;
-        if self.sample_count < 10 {
-            self.path_delay_ns = sample;
-        } else {
-            self.path_delay_ns = self.alpha * sample + (1.0 - self.alpha) * self.path_delay_ns;
+        self.path_delay_samples
+            .push_back(sample_path_delay_ns.max(0));
+        if self.path_delay_samples.len() > SERVO_MEDIAN_WINDOW {
+            self.path_delay_samples.pop_front();
         }
+        // A DelayReq send timestamp is captured in userspace and a single
+        // deschedule can therefore look like tens of milliseconds of network
+        // delay. Keep the neutral estimate until a median can identify it.
+        if self.path_delay_samples.len() < 3 {
+            return;
+        }
+        let filtered_sample = rolling_median(&self.path_delay_samples);
+        if self.path_delay_samples.len() < SERVO_MEDIAN_WINDOW {
+            self.path_delay_ns = filtered_sample;
+        } else {
+            self.path_delay_ns =
+                self.alpha * filtered_sample + (1.0 - self.alpha) * self.path_delay_ns;
+        }
+    }
+
+    pub fn select_master(&mut self, master_id: Option<u64>) -> bool {
+        if self.selected_master_clock_id == master_id {
+            return false;
+        }
+        self.selected_master_clock_id = master_id;
+        self.master_clock_id = None;
+        self.offset_ns = 0.0;
+        self.path_delay_ns = 0.0;
+        self.sample_count = 0;
+        self.offset_samples.clear();
+        self.path_delay_samples.clear();
+        self.locked = false;
+        true
+    }
+
+    pub fn accepts_master(&self, master_id: u64) -> bool {
+        self.selected_master_clock_id
+            .is_none_or(|selected| selected == master_id)
     }
 
     /// Convert an RTP timestamp (44.1kHz or 48kHz sample clock) to local time in nanoseconds.
@@ -209,9 +284,9 @@ impl ClockServo {
     /// Apply the clock offset to convert master timebase to local timebase.
     pub fn master_to_local(&self, master_time_ns: u64) -> u64 {
         if self.offset_ns >= 0.0 {
-            master_time_ns + self.offset_ns as u64
+            master_time_ns.saturating_add(self.offset_ns as u64)
         } else {
-            master_time_ns - self.offset_ns.abs() as u64
+            master_time_ns.saturating_sub(self.offset_ns.abs() as u64)
         }
     }
 }
@@ -231,6 +306,14 @@ impl PtpServo {
 
     pub fn update_offset(&self, sample: i64, master_id: u64) {
         self.inner.write().update_offset(sample, master_id);
+    }
+
+    pub fn select_master(&self, master_id: Option<u64>) -> bool {
+        self.inner.write().select_master(master_id)
+    }
+
+    pub fn accepts_master(&self, master_id: u64) -> bool {
+        self.inner.read().accepts_master(master_id)
     }
 
     pub fn is_locked(&self) -> bool {
@@ -253,6 +336,41 @@ impl PtpServo {
 
     pub fn master_to_local(&self, master_time_ns: u64) -> u64 {
         self.inner.read().master_to_local(master_time_ns)
+    }
+
+    pub fn local_time_ns(&self) -> u64 {
+        timestamp_now_ns()
+    }
+
+    pub fn uncertainty_ns(&self) -> u64 {
+        let inner = self.inner.read();
+        if !inner.locked {
+            return u64::MAX;
+        }
+        (inner.path_delay_ns.abs() as u64).max(1_000_000)
+    }
+}
+
+impl crate::playout::scheduler::NetworkClock for PtpServo {
+    fn is_locked(&self) -> bool {
+        PtpServo::is_locked(self)
+    }
+
+    fn master_clock_id(&self) -> Option<u64> {
+        PtpServo::master_clock_id(self)
+    }
+
+    fn network_to_local_ns(&self, network_ns: u64) -> Option<u64> {
+        self.is_locked()
+            .then(|| PtpServo::master_to_local(self, network_ns))
+    }
+
+    fn local_now_ns(&self) -> u64 {
+        self.local_time_ns()
+    }
+
+    fn uncertainty_ns(&self) -> u64 {
+        PtpServo::uncertainty_ns(self)
     }
 }
 
@@ -280,7 +398,7 @@ pub async fn spawn_ptp_service(
         }
     };
 
-    let servo = PtpServo::new();
+    let servo = state.ptp_servo.clone();
     let runtime = PtpRuntime::new();
     state.mark_ptp_running();
 
@@ -447,6 +565,13 @@ async fn run_event_socket(
         match tokio::time::timeout(Duration::from_secs(30), socket.recv_from(&mut buf)).await {
             Ok(Ok((len, peer))) => {
                 if let Some(message) = parse_ptp_message(&buf[..len]) {
+                    if !servo.accepts_master(message.clock_identity) {
+                        trace!(
+                            clock = format_args!("{:016x}", message.clock_identity),
+                            "PTP event packet ignored from unselected master"
+                        );
+                        continue;
+                    }
                     runtime.note_master(&message, peer, true);
                     trace!(%peer, family, message_type = ?message.message_type, seq = message.sequence_id, "PTP event packet received");
                     match message.message_type {
@@ -496,6 +621,13 @@ async fn run_general_socket(
         match tokio::time::timeout(Duration::from_secs(30), socket.recv_from(&mut buf)).await {
             Ok(Ok((len, peer))) => {
                 if let Some(message) = parse_ptp_message(&buf[..len]) {
+                    if !servo.accepts_master(message.clock_identity) {
+                        trace!(
+                            clock = format_args!("{:016x}", message.clock_identity),
+                            "PTP general packet ignored from unselected master"
+                        );
+                        continue;
+                    }
                     runtime.note_master(&message, peer, false);
                     trace!(%peer, family, message_type = ?message.message_type, seq = message.sequence_id, "PTP general packet received");
                     match message.message_type {
@@ -552,13 +684,20 @@ async fn send_periodic_delay_req(
     socket_v4: std::sync::Arc<UdpSocket>,
     socket_v6: Option<std::sync::Arc<UdpSocket>>,
     state: AppState,
-    _servo: PtpServo,
+    servo: PtpServo,
     runtime: PtpRuntime,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(750));
     loop {
         interval.tick().await;
         let snapshot = *runtime.state.lock();
+        if snapshot
+            .master_clock_id
+            .is_some_and(|master| !servo.accepts_master(master))
+        {
+            trace!("PTP DelayReq skipped for unselected former master");
+            continue;
+        }
         let Some(master_addr) = snapshot.master_event_addr else {
             trace!("PTP DelayReq skipped without master endpoint");
             continue;
@@ -598,11 +737,20 @@ async fn publish_ptp_diagnostics(state: AppState, servo: PtpServo) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let s = servo.inner.read();
-        state.set_diagnostic("ptp_offset_ns", format!("{:.0}", s.offset_ns));
-        state.set_diagnostic("ptp_path_delay_ns", format!("{:.0}", s.path_delay_ns));
-        state.set_diagnostic("ptp_locked", if s.locked { "yes" } else { "no" });
-        if let Some(id) = s.master_clock_id {
+        let (offset_ns, path_delay_ns, locked, master_clock_id) = {
+            let servo = servo.inner.read();
+            (
+                servo.offset_ns,
+                servo.path_delay_ns,
+                servo.locked,
+                servo.master_clock_id,
+            )
+        };
+        state.set_diagnostic("ptp_offset_ns", format!("{offset_ns:.0}"));
+        state.set_diagnostic("ptp_path_delay_ns", format!("{path_delay_ns:.0}"));
+        state.set_diagnostic("ptp_locked", if locked { "yes" } else { "no" });
+        state.update_ptp_servo_status(master_clock_id, offset_ns as i64, locked);
+        if let Some(id) = master_clock_id {
             state.set_diagnostic("ptp_master_clock", format!("{id:016x}"));
         }
     }
@@ -618,12 +766,14 @@ fn update_servo_from_sync(
     let offset = (sample.local_receipt_ns as i128 - origin_ns as i128 - path_delay_ns as i128)
         .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     servo.update_offset(offset, sample.master_clock_id);
+    let filtered_offset_ns = servo.offset_ns();
     *runtime.last_sync.lock() = Some(SyncSample {
         origin_ns: Some(origin_ns),
         ..sample.clone()
     });
     debug!(
         offset_ns = offset,
+        filtered_offset_ns,
         path_delay_ns,
         master = format_args!("{:016x}", sample.master_clock_id),
         "PTP Sync offset updated"
@@ -655,17 +805,18 @@ fn update_servo_from_delay_resp(
         .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let offset = ((t2_minus_t1 - t4_minus_t3) / 2).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
-    runtime.state.lock().path_delay_ns = path_delay;
-    {
+    let filtered_path_delay = {
         let mut inner = servo.inner.write();
         inner.update_path_delay(path_delay);
-        inner.update_offset(offset, sync.master_clock_id);
-    }
+        inner.path_delay_ns.round() as i64
+    };
+    runtime.state.lock().path_delay_ns = filtered_path_delay;
 
     debug!(
         sequence_id = delay.sequence_id,
-        offset_ns = offset,
+        candidate_offset_ns = offset,
         path_delay_ns = path_delay,
+        filtered_path_delay_ns = filtered_path_delay,
         "PTP DelayResp updated servo"
     );
 }
@@ -825,6 +976,27 @@ mod tests {
     }
 
     #[test]
+    fn clock_servo_rejects_periodic_receive_timestamp_spikes() {
+        let mut servo = ClockServo::new();
+        let baseline = -37_758_795_700_000i64;
+        for _ in 0..25 {
+            servo.update_offset(baseline, 0x42);
+        }
+        assert!(servo.locked);
+
+        for spike in [18_000_000, 37_000_000, 67_000_000, 89_000_000] {
+            servo.update_offset(baseline + spike, 0x42);
+            servo.update_offset(baseline + 80_000, 0x42);
+            servo.update_offset(baseline - 120_000, 0x42);
+            servo.update_offset(baseline + 40_000, 0x42);
+            assert!(
+                (servo.offset_ns - baseline as f64).abs() < 100_000.0,
+                "isolated receive-timestamp spike moved the clock servo"
+            );
+        }
+    }
+
+    #[test]
     fn frame_to_local_time_basic() {
         let servo = ClockServo::new();
         let sample_period = 1_000_000_000 / 44100;
@@ -842,6 +1014,30 @@ mod tests {
     }
 
     #[test]
+    fn selected_master_filters_samples_and_switch_resets_lock() {
+        let servo = PtpServo::new();
+        assert!(servo.select_master(Some(0x42)));
+        for _ in 0..25 {
+            servo.update_offset(1_000, 0x99);
+        }
+        assert_eq!(servo.master_clock_id(), None);
+        assert!(!servo.is_locked());
+
+        for _ in 0..25 {
+            servo.update_offset(2_000, 0x42);
+        }
+        assert_eq!(servo.master_clock_id(), Some(0x42));
+        assert!(servo.is_locked());
+
+        assert!(servo.select_master(Some(0x43)));
+        assert_eq!(servo.master_clock_id(), None);
+        assert!(!servo.is_locked());
+        assert_eq!(servo.offset_ns(), 0.0);
+        assert!(!servo.accepts_master(0x42));
+        assert!(servo.accepts_master(0x43));
+    }
+
+    #[test]
     fn builds_delay_req_packet() {
         let packet = build_delay_req(1, 0, 0x1122334455667788, 7, 9_000_000_123);
         let parsed = parse_ptp_message(&packet).unwrap();
@@ -853,8 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn delay_resp_updates_path_delay_and_offset() {
+    fn delay_resp_updates_path_delay_without_perturbing_offset() {
         let servo = PtpServo::new();
+        for _ in 0..25 {
+            servo.update_offset(20, 0x42);
+        }
         let runtime = PtpRuntime::new();
         *runtime.last_sync.lock() = Some(SyncSample {
             local_receipt_ns: 1_100,
@@ -871,8 +1070,19 @@ mod tests {
 
         update_servo_from_delay_resp(&servo, &runtime, 9, 1_260);
 
-        assert_eq!(runtime.state.lock().path_delay_ns, 80);
+        assert_eq!(runtime.state.lock().path_delay_ns, 0);
         assert_eq!(servo.inner.read().offset_ns as i64, 20);
         assert_eq!(servo.inner.read().master_clock_id, Some(0x42));
+    }
+
+    #[test]
+    fn path_delay_requires_three_samples_and_rejects_initial_outlier() {
+        let mut servo = ClockServo::new();
+        servo.update_path_delay(29_000_000);
+        servo.update_path_delay(0);
+        assert_eq!(servo.path_delay_ns, 0.0);
+
+        servo.update_path_delay(100_000);
+        assert_eq!(servo.path_delay_ns, 100_000.0);
     }
 }
