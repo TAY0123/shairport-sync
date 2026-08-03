@@ -95,14 +95,12 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState::new(config.clone());
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
-    let (audio_engine, audio_output) = match audio_manager.create_engine_and_output() {
-        (engine, Ok(output)) => (engine, Some(output)),
-        (engine, Err(err)) => {
-            warn!(%err, "audio output stream not started");
-            app_state.set_diagnostic("audio_output_error", err.to_string());
-            (engine, None)
-        }
-    };
+    let (audio_engine, audio_output, audio_controller, initial_output_result) =
+        audio_manager.create_engine_and_supervised_output();
+    if let Err(err) = initial_output_result {
+        warn!(%err, "audio output stream not started; retrying on default device");
+        app_state.set_diagnostic("audio_output_error", err.to_string());
+    }
     let player = player::SharedPlayer::new();
     let dacp = airplay::dacp::DacpController::new(app_state.clone());
     app_state.update_audio_devices(audio_manager.list_devices());
@@ -218,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         mdns_advertiser,
         dacp,
     )
+    .with_audio_output(audio_controller)
     .with_playout(playout_handle.clone());
     let router = Router::new()
         .merge(api::router(api_context))
@@ -263,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    drop(audio_output);
+    audio_output.shutdown();
     Ok(())
 }
 

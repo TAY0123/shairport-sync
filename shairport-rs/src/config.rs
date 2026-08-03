@@ -174,7 +174,9 @@ impl Default for AirplayConfig {
         Self {
             enabled: true,
             airplay2_enabled: false,
-            pin: "3939".to_string(),
+            // Empty PIN = no password required. Set a PIN to enable the
+            // AirPlay password prompt.
+            pin: String::new(),
             identity_key_path: None,
             pairing_db_path: None,
             transcript_path: None,
@@ -325,6 +327,15 @@ mod tests {
         assert_eq!(config.audio.start_watermark_ms, 100);
         assert_eq!(config.audio.low_watermark_ms, 50);
         assert_eq!(config.audio.target_watermark_ms, 100);
+    }
+
+    #[test]
+    fn airplay_config_defaults_password_disabled() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(
+            config.airplay.pin.is_empty(),
+            "AirPlay password must be disabled by default"
+        );
     }
 
     #[test]

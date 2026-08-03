@@ -55,6 +55,11 @@ Audio output uses CPAL. `host = "default"` lets CPAL select the platform default
 host, which is typically WASAPI on Windows, CoreAudio on macOS, and ALSA/Pulse or
 the available CPAL default on Linux. The decoder emits interleaved `f32`, and
 the audio engine resamples/remaps to the selected output device format.
+If the active output device is unplugged or invalidated, output automatically
+falls back to the current system default device and keeps retrying until one is
+available. When no explicit device is set, output also follows the system
+default if it changes while the app is running. Setting a device in the config
+or through the audio device API pins output to that device.
 
 ```toml
 [audio]

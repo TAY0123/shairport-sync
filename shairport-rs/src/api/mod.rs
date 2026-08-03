@@ -13,7 +13,10 @@ use tokio::sync::broadcast;
 
 use crate::{
     airplay::dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
-    audio::{AudioEngine, AudioEngineStatus, AudioManager, SelectAudioDeviceRequest},
+    audio::{
+        AudioEngine, AudioEngineStatus, AudioManager, AudioOutputController,
+        SelectAudioDeviceRequest,
+    },
     mdns::MdnsAdvertiser,
     playout::scheduler::{PlayoutHandle, PlayoutState},
     state::{AppState, PlayerState, RemoteControlState, StateSnapshot, TrackInfo, VolumeState},
@@ -24,6 +27,7 @@ pub struct ApiContext {
     state: AppState,
     audio: AudioManager,
     audio_engine: AudioEngine,
+    audio_output: AudioOutputController,
     mdns: MdnsAdvertiser,
     dacp: DacpController,
     playout: Option<PlayoutHandle>,
@@ -95,10 +99,16 @@ impl ApiContext {
             state,
             audio,
             audio_engine,
+            audio_output: AudioOutputController::default(),
             mdns,
             dacp,
             playout: None,
         }
+    }
+
+    pub fn with_audio_output(mut self, audio_output: AudioOutputController) -> Self {
+        self.audio_output = audio_output;
+        self
     }
 
     pub fn with_playout(mut self, playout: PlayoutHandle) -> Self {
@@ -189,7 +199,8 @@ async fn select_audio_device(
     State(context): State<ApiContext>,
     Json(request): Json<SelectAudioDeviceRequest>,
 ) -> Json<StateSnapshot> {
-    context.state.select_audio_device(request.device_id);
+    context.state.select_audio_device(request.device_id.clone());
+    context.audio_output.set_device(request.device_id);
     Json(context.state.snapshot())
 }
 
