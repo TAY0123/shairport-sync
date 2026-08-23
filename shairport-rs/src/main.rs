@@ -11,9 +11,10 @@ mod player;
 mod playout;
 mod ptp;
 mod state;
+mod system_media;
 mod web;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{future::IntoFuture, net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use axum::Router;
@@ -224,6 +225,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_audio_output(audio_controller)
     .with_playout(playout_handle.clone());
+
+    let mut system_media = match system_media::SystemMediaIntegration::start(
+        &config.system_media,
+        app_state.clone(),
+        api_context.clone(),
+    ) {
+        Ok(integration) => integration,
+        Err(err) => {
+            warn!(%err, "system media integration unavailable; continuing without it");
+            app_state.set_diagnostic("system_media_error", err.to_string());
+            None
+        }
+    };
+
     let router = Router::new()
         .merge(api::router(api_context))
         .merge(web::router())
@@ -237,9 +252,40 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     info!(%bind, "shairport-rs listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = server_shutdown_rx.await;
+        })
+        .into_future();
+    tokio::pin!(server);
+
+    let server_finished = if let Some(integration) = system_media.as_mut() {
+        tokio::select! {
+            result = &mut server => {
+                result?;
+                true
+            }
+            _ = shutdown_signal() => false,
+            _ = integration.run() => {
+                warn!("system media integration loop stopped unexpectedly");
+                false
+            }
+        }
+    } else {
+        tokio::select! {
+            result = &mut server => {
+                result?;
+                true
+            }
+            _ = shutdown_signal() => false,
+        }
+    };
+
+    if !server_finished {
+        let _ = server_shutdown_tx.send(());
+        server.await?;
+    }
 
     if let Some(handle) = ptp_handle {
         handle.abort();

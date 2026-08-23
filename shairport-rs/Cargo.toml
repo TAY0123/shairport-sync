@@ -27,6 +27,7 @@ futures-util = "0.3"
 hkdf = "0.12"
 mdns-sd = "0.15"
 parking_lot = "0.12"
+playwire = "1.0.0"
 plist = "1.8"
 rand = "0.9"
 rand_core = "0.6"
@@ -54,6 +55,14 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSResponder", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3.2", features = ["NSDate", "NSRunLoop"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
