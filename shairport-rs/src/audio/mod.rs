@@ -1,6 +1,6 @@
 use anyhow::Context;
 use cpal::{
-    I24, SampleFormat, Stream, U24,
+    I24, SampleFormat, Stream, StreamError, U24,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use parking_lot::Mutex;
@@ -9,9 +9,14 @@ use ringbuf::{
     traits::{Consumer, Split},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
+    thread::JoinHandle,
+    time::Duration,
 };
 
 pub mod drift;
@@ -142,10 +147,244 @@ pub struct AudioConsumer {
 }
 
 pub struct AudioOutput {
-    _stream: Stream,
+    stream: Option<Stream>,
+    consumer_return_rx: Option<Receiver<AudioConsumer>>,
     pub sample_rate: u32,
     pub channels: u16,
     pub sample_format: SampleFormat,
+}
+
+impl AudioOutput {
+    /// Stop this CPAL stream and recover its sole ring-buffer consumer.
+    ///
+    /// The callback owns `AudioConsumer` directly while active. When CPAL
+    /// drops the callback closure, `ReturningConsumer::drop` hands it back
+    /// over this control-thread channel. No lock is taken in the callback.
+    fn reclaim_consumer(mut self) -> anyhow::Result<AudioConsumer> {
+        let receiver = self
+            .consumer_return_rx
+            .take()
+            .context("audio output is missing its consumer return channel")?;
+        drop(self.stream.take());
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .context("CPAL callback did not return its audio consumer after stream shutdown")
+    }
+}
+
+const OUTPUT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+type OutputRecoveryHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+enum OutputSupervisorMessage {
+    StreamError { generation: u64, error: StreamError },
+    SetDevice(Option<String>),
+    Shutdown,
+}
+
+/// Cloneable control handle for runtime output-device changes.
+#[derive(Clone)]
+pub struct AudioOutputController {
+    command_tx: Sender<OutputSupervisorMessage>,
+    recovery_hook: Arc<Mutex<Option<OutputRecoveryHook>>>,
+}
+
+impl AudioOutputController {
+    fn new(
+        command_tx: Sender<OutputSupervisorMessage>,
+        recovery_hook: Arc<Mutex<Option<OutputRecoveryHook>>>,
+    ) -> Self {
+        Self {
+            command_tx,
+            recovery_hook,
+        }
+    }
+
+    /// Set the explicitly preferred output device. `None` resumes following
+    /// the current system default device.
+    pub fn set_device(&self, device: Option<String>) {
+        let _ = self
+            .command_tx
+            .send(OutputSupervisorMessage::SetDevice(device));
+    }
+
+    /// Register a control-thread hook invoked before output recovery.
+    pub fn set_recovery_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.recovery_hook.lock() = Some(Arc::new(hook));
+    }
+}
+
+impl Default for AudioOutputController {
+    fn default() -> Self {
+        let (command_tx, _command_rx) = mpsc::channel();
+        Self {
+            command_tx,
+            recovery_hook: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Owns the live CPAL output stream on a dedicated control thread and
+/// rebuilds it after device loss or runtime device changes.
+///
+/// Audio callbacks remain lock-free: each live callback exclusively owns the
+/// same `AudioConsumer`, which is returned to this supervisor when the stream
+/// is dropped and then moved into the replacement callback.
+pub struct AudioOutputSupervisor {
+    command_tx: Option<Sender<OutputSupervisorMessage>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AudioOutputSupervisor {
+    fn spawn(
+        manager: AudioManager,
+        engine: AudioEngine,
+        consumer: AudioConsumer,
+        initial_device: Option<SelectedOutput>,
+    ) -> (Self, AudioOutputController, anyhow::Result<()>) {
+        let (command_tx, command_rx) = mpsc::channel();
+        let recovery_hook = Arc::new(Mutex::new(None));
+        let controller = AudioOutputController::new(command_tx.clone(), recovery_hook.clone());
+        let (initial_tx, initial_rx) = mpsc::channel();
+        let thread_command_tx = command_tx.clone();
+
+        let join = std::thread::Builder::new()
+            .name("cpal-output-supervisor".to_string())
+            .spawn(move || {
+                let mut current: Option<AudioOutput> = None;
+                let mut available_consumer = Some(consumer);
+                let mut current_device_id: Option<cpal::DeviceId> = None;
+                let mut current_using_fallback = false;
+                let mut preferred_device = manager.config.device.clone();
+                let mut generation = 0u64;
+
+                let initial = match initial_device {
+                    Some(selected) => activate_selected_output(
+                        &manager,
+                        &engine,
+                        &thread_command_tx,
+                        &mut generation,
+                        &mut current,
+                        &mut available_consumer,
+                        &mut current_device_id,
+                        &mut current_using_fallback,
+                        selected,
+                    ),
+                    None => try_activate_output(
+                        &manager,
+                        &engine,
+                        &thread_command_tx,
+                        &mut generation,
+                        &mut current,
+                        &mut available_consumer,
+                        &mut current_device_id,
+                        &mut current_using_fallback,
+                        preferred_device.as_deref(),
+                        false,
+                        &recovery_hook,
+                    ),
+                };
+
+                if let Err(err) = &initial {
+                    tracing::warn!(%err, "CPAL output stream not started; supervisor will keep retrying");
+                }
+                let _ = initial_tx.send(initial);
+
+                supervisor_loop(
+                    &manager,
+                    &engine,
+                    &thread_command_tx,
+                    &command_rx,
+                    &recovery_hook,
+                    &mut generation,
+                    &mut current,
+                    &mut available_consumer,
+                    &mut current_device_id,
+                    &mut current_using_fallback,
+                    &mut preferred_device,
+                );
+            })
+            .expect("failed to spawn CPAL output supervisor thread");
+
+        let initial = initial_rx.recv().unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "CPAL output supervisor thread exited during startup"
+            ))
+        });
+
+        (
+            Self {
+                command_tx: Some(command_tx),
+                join: Some(join),
+            },
+            controller,
+            initial,
+        )
+    }
+
+    pub fn shutdown(mut self) {
+        if let Some(tx) = self.command_tx.take() {
+            let _ = tx.send(OutputSupervisorMessage::Shutdown);
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for AudioOutputSupervisor {
+    fn drop(&mut self) {
+        if let Some(tx) = self.command_tx.take() {
+            let _ = tx.send(OutputSupervisorMessage::Shutdown);
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+struct ReturningConsumer {
+    consumer: Option<AudioConsumer>,
+    return_tx: Sender<AudioConsumer>,
+}
+
+impl ReturningConsumer {
+    fn new(consumer: AudioConsumer, return_tx: Sender<AudioConsumer>) -> Self {
+        Self {
+            consumer: Some(consumer),
+            return_tx,
+        }
+    }
+
+    fn consumer_mut(&mut self) -> &mut AudioConsumer {
+        self.consumer
+            .as_mut()
+            .expect("audio callback consumer already returned")
+    }
+}
+
+impl Drop for ReturningConsumer {
+    fn drop(&mut self) {
+        if let Some(consumer) = self.consumer.take() {
+            let _ = self.return_tx.send(consumer);
+        }
+    }
+}
+
+struct OutputBuildFailure {
+    error: anyhow::Error,
+    consumer: AudioConsumer,
+}
+
+struct SelectedOutput {
+    device: cpal::Device,
+    stream_config: cpal::StreamConfig,
+    sample_format: SampleFormat,
+    device_id: cpal::DeviceId,
+    using_fallback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,165 +479,282 @@ impl AudioManager {
             .collect()
     }
 
-    /// Select the CPAL device, create an [`AudioEngine`] with capacity
-    /// derived from `config.audio.pcm_fifo_ms` and the actual sample rate /
-    /// channel count, build the output stream, and return both.
-    ///
-    /// The [`AudioConsumer`] is created internally and moved into the
-    /// output callback — the caller only receives the engine (for the
-    /// producer path) and the output handle (to keep the stream alive).
-    ///
-    /// If the output stream cannot be created the engine is still returned
-    /// so the application can continue (RTP enqueue will still function;
-    /// samples will overflow once the ring is full).
+    /// Create the traditional single CPAL output. New application code uses
+    /// [`create_engine_and_supervised_output`] so output can recover at runtime.
     pub fn create_engine_and_output(&self) -> (AudioEngine, anyhow::Result<AudioOutput>) {
-        // normalize() is idempotent — Config::load already normalized, but
-        // tests may construct AudioConfig directly, so keep this safety net.
         let mut config = self.config.clone();
         config.normalize();
 
-        let device_result = self.open_device();
-        let (device, stream_config, sample_format) = match device_result {
-            Ok(t) => t,
+        let selected = match self.open_selected_output(self.config.device.as_deref()) {
+            Ok(selected) => selected,
             Err(err) => {
-                let (engine, _consumer) = AudioEngine::new_for_output(44100, 2, config.pcm_fifo_ms);
+                let (engine, _consumer) =
+                    AudioEngine::new_for_output(44_100, 2, config.pcm_fifo_ms);
                 return (engine, Err(err));
             }
         };
 
         let (engine, consumer) = AudioEngine::new_for_output(
-            stream_config.sample_rate,
-            stream_config.channels,
+            selected.stream_config.sample_rate,
+            selected.stream_config.channels,
             config.pcm_fifo_ms,
         );
-
         tracing::info!(
-            sample_rate = stream_config.sample_rate,
-            channels = stream_config.channels,
-            sample_format = ?sample_format,
+            sample_rate = selected.stream_config.sample_rate,
+            channels = selected.stream_config.channels,
+            sample_format = ?selected.sample_format,
             pcm_fifo_ms = config.pcm_fifo_ms,
             "CPAL output stream format"
         );
 
-        let output = self.build_stream(device, &stream_config, sample_format, consumer);
-        (engine, output)
+        match self.build_stream(selected, consumer, None, 0) {
+            Ok(output) => (engine, Ok(output)),
+            Err(failure) => (engine, Err(failure.error)),
+        }
     }
 
-    /// Select the CPAL host and output device; return the device, its
-    /// stream config, and sample format.
-    fn open_device(&self) -> anyhow::Result<(cpal::Device, cpal::StreamConfig, SampleFormat)> {
+    /// Create an [`AudioEngine`] plus a dedicated output supervisor.
+    ///
+    /// If no output device exists at startup, a fallback-shaped engine is
+    /// returned immediately and the supervisor keeps retrying once per second.
+    /// Runtime device changes preserve the same ring-buffer consumer by moving
+    /// it from the old CPAL callback into the replacement callback.
+    pub fn create_engine_and_supervised_output(
+        &self,
+    ) -> (
+        AudioEngine,
+        AudioOutputSupervisor,
+        AudioOutputController,
+        anyhow::Result<()>,
+    ) {
+        let mut config = self.config.clone();
+        config.normalize();
+
+        match self.open_selected_output(self.config.device.as_deref()) {
+            Ok(selected) => {
+                let (engine, consumer) = AudioEngine::new_for_output(
+                    selected.stream_config.sample_rate,
+                    selected.stream_config.channels,
+                    config.pcm_fifo_ms,
+                );
+                let (supervisor, controller, initial) = AudioOutputSupervisor::spawn(
+                    self.clone(),
+                    engine.clone(),
+                    consumer,
+                    Some(selected),
+                );
+                (engine, supervisor, controller, initial)
+            }
+            Err(_) => {
+                let (engine, consumer) = AudioEngine::new_for_output(44_100, 2, config.pcm_fifo_ms);
+                let (supervisor, controller, initial) =
+                    AudioOutputSupervisor::spawn(self.clone(), engine.clone(), consumer, None);
+                (engine, supervisor, controller, initial)
+            }
+        }
+    }
+
+    fn host(&self) -> anyhow::Result<cpal::Host> {
         let host_id = match self.config.host {
             AudioHostName::Default => cpal::default_host().id(),
             host => host_to_cpal(host)
                 .context("requested CPAL host is not available on this platform")?,
         };
-        let host = cpal::host_from_id(host_id).context("failed to initialise CPAL host")?;
-        let device = if let Some(selected) = &self.config.device {
-            host.output_devices()?
-                .find(|device| {
-                    #[allow(deprecated)]
-                    let name = device.name().unwrap_or_default();
-                    format!("{host_id:?}:{name}") == *selected
-                })
-                .or_else(|| host.default_output_device())
-        } else {
-            host.default_output_device()
-        }
-        .context("no CPAL output device available")?;
-        let (stream_config, sample_format) = choose_stream_config(&device)?;
-        Ok((device, stream_config, sample_format))
+        cpal::host_from_id(host_id).context("failed to initialise CPAL host")
     }
 
-    /// Build and start the output stream, moving `consumer` into the
-    /// real-time callback.
+    /// Select an explicit device when available; otherwise temporarily fall
+    /// back to the system default. `using_fallback` lets the supervisor keep
+    /// polling so it can return to the preferred device when it reappears.
+    #[allow(deprecated)]
+    fn select_device_with_policy(
+        &self,
+        selected_device: Option<&str>,
+    ) -> anyhow::Result<(cpal::Device, cpal::DeviceId, bool)> {
+        let host = self.host()?;
+        let host_id = host.id();
+        let (device, using_fallback) = if let Some(selected) = selected_device {
+            match host.output_devices()?.find(|device| {
+                let name = device.name().unwrap_or_default();
+                format!("{host_id:?}:{name}") == selected
+            }) {
+                Some(device) => (device, false),
+                None => (
+                    host.default_output_device()
+                        .context("no CPAL output device available")?,
+                    true,
+                ),
+            }
+        } else {
+            (
+                host.default_output_device()
+                    .context("no CPAL output device available")?,
+                false,
+            )
+        };
+        let device_id = device
+            .id()
+            .map_err(|err| anyhow::anyhow!("failed to get CPAL output device id: {err}"))?;
+        Ok((device, device_id, using_fallback))
+    }
+
+    fn open_selected_output(
+        &self,
+        selected_device: Option<&str>,
+    ) -> anyhow::Result<SelectedOutput> {
+        let (device, device_id, using_fallback) =
+            self.select_device_with_policy(selected_device)?;
+        let (stream_config, sample_format) = choose_stream_config(&device)?;
+        Ok(SelectedOutput {
+            device,
+            stream_config,
+            sample_format,
+            device_id,
+            using_fallback,
+        })
+    }
+
     fn build_stream(
         &self,
-        device: cpal::Device,
-        stream_config: &cpal::StreamConfig,
-        sample_format: SampleFormat,
-        mut consumer: AudioConsumer,
-    ) -> anyhow::Result<AudioOutput> {
-        let err_fn = |err| tracing::warn!(%err, "CPAL output stream error");
-        let stream = match sample_format {
+        selected: SelectedOutput,
+        consumer: AudioConsumer,
+        supervisor_tx: Option<Sender<OutputSupervisorMessage>>,
+        generation: u64,
+    ) -> Result<AudioOutput, OutputBuildFailure> {
+        let SelectedOutput {
+            device,
+            stream_config,
+            sample_format,
+            ..
+        } = selected;
+        let (return_tx, return_rx) = mpsc::channel();
+        let mut consumer = ReturningConsumer::new(consumer, return_tx);
+        let error_tx = supervisor_tx;
+        let err_fn = move |error: StreamError| {
+            if should_rebuild(&error) {
+                tracing::warn!(%error, generation, "CPAL output device lost");
+                if let Some(tx) = &error_tx {
+                    let _ = tx.send(OutputSupervisorMessage::StreamError { generation, error });
+                }
+            } else {
+                tracing::warn!(%error, generation, "CPAL output stream error");
+            }
+        };
+
+        let stream_result = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
-                stream_config,
+                &stream_config,
                 move |data: &mut [f32], _| {
-                    consumer.fill_output(data);
+                    consumer.consumer_mut().fill_output(data);
                 },
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::F64 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [f64], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [f64], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I8 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [i8], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [i8], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I16 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [i16], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [i16], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I24 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [I24], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [I24], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I32 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [i32], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [i32], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I64 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [i64], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [i64], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U8 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [u8], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [u8], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U16 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [u16], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [u16], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U24 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [U24], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [U24], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U32 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [u32], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [u32], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U64 => device.build_output_stream(
-                stream_config,
-                move |data: &mut [u64], _| fill_converted(data, &mut consumer),
+                &stream_config,
+                move |data: &mut [u64], _| fill_converted(data, consumer.consumer_mut()),
                 err_fn,
                 None,
-            )?,
-            sample_format => anyhow::bail!("unsupported CPAL sample format {sample_format:?}"),
+            ),
+            sample_format => {
+                drop(consumer);
+                let consumer = return_rx
+                    .recv()
+                    .expect("unsupported-format callback consumer was not returned");
+                return Err(OutputBuildFailure {
+                    error: anyhow::anyhow!("unsupported CPAL sample format {sample_format:?}"),
+                    consumer,
+                });
+            }
         };
-        stream.play()?;
+
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                let consumer = return_rx
+                    .recv()
+                    .expect("failed CPAL stream build did not return its audio consumer");
+                return Err(OutputBuildFailure {
+                    error: error.into(),
+                    consumer,
+                });
+            }
+        };
+
+        if let Err(error) = stream.play() {
+            drop(stream);
+            let consumer = return_rx
+                .recv()
+                .expect("failed CPAL stream start did not return its audio consumer");
+            return Err(OutputBuildFailure {
+                error: error.into(),
+                consumer,
+            });
+        }
+
         Ok(AudioOutput {
-            _stream: stream,
+            stream: Some(stream),
+            consumer_return_rx: Some(return_rx),
             sample_rate: stream_config.sample_rate,
             channels: stream_config.channels,
             sample_format,
@@ -406,42 +762,24 @@ impl AudioManager {
     }
 
     /// Legacy API — create an output stream from a pre-existing engine and consumer.
-    ///
-    /// Prefer [`create_engine_and_output`] for new code; this method
-    /// exists for backward compatibility and tests.
     pub fn start_output(
         &self,
         engine: &AudioEngine,
         consumer: AudioConsumer,
     ) -> anyhow::Result<AudioOutput> {
-        let host_id = match self.config.host {
-            AudioHostName::Default => cpal::default_host().id(),
-            host => host_to_cpal(host)
-                .context("requested CPAL host is not available on this platform")?,
-        };
-        let host = cpal::host_from_id(host_id).context("failed to initialise CPAL host")?;
-        let device = if let Some(selected) = &self.config.device {
-            host.output_devices()?
-                .find(|device| {
-                    #[allow(deprecated)]
-                    let name = device.name().unwrap_or_default();
-                    format!("{host_id:?}:{name}") == *selected
-                })
-                .or_else(|| host.default_output_device())
-        } else {
-            host.default_output_device()
-        }
-        .context("no CPAL output device available")?;
-
-        let (stream_config, sample_format) = choose_stream_config(&device)?;
-        engine.set_output_format(stream_config.sample_rate, stream_config.channels);
+        let selected = self.open_selected_output(self.config.device.as_deref())?;
+        engine.set_output_format(
+            selected.stream_config.sample_rate,
+            selected.stream_config.channels,
+        );
         tracing::info!(
-            sample_rate = stream_config.sample_rate,
-            channels = stream_config.channels,
-            sample_format = ?sample_format,
+            sample_rate = selected.stream_config.sample_rate,
+            channels = selected.stream_config.channels,
+            sample_format = ?selected.sample_format,
             "CPAL output stream format"
         );
-        self.build_stream(device, &stream_config, sample_format, consumer)
+        self.build_stream(selected, consumer, None, 0)
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -450,6 +788,296 @@ where
     T: cpal::Sample + cpal::FromSample<f32>,
 {
     consumer.fill_output_converted(output);
+}
+
+fn should_rebuild(error: &StreamError) -> bool {
+    matches!(
+        error,
+        StreamError::DeviceNotAvailable | StreamError::StreamInvalidated
+    )
+}
+
+fn should_recheck_device(preferred_device: Option<&str>, using_fallback: bool) -> bool {
+    preferred_device.is_none() || using_fallback
+}
+
+fn prepare_output_recovery(
+    engine: &AudioEngine,
+    recovery_hook: &Arc<Mutex<Option<OutputRecoveryHook>>>,
+) {
+    let hook = recovery_hook.lock().clone();
+
+    // A scheduler hook is installed shortly after the supervisor starts. Once
+    // it exists we can close the output gate and rely on the scheduler's flush
+    // transition to re-prime and reopen it. Before that hook exists (the tiny
+    // startup window), still discard stale PCM/reset drift but do not close a
+    // gate that nobody can yet reopen.
+    if hook.is_some() {
+        engine.set_output_gate(false);
+    }
+    engine.request_flush();
+    engine.set_drift_correction_ppm(0.0);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_selected_output(
+    manager: &AudioManager,
+    engine: &AudioEngine,
+    command_tx: &Sender<OutputSupervisorMessage>,
+    generation: &mut u64,
+    current: &mut Option<AudioOutput>,
+    available_consumer: &mut Option<AudioConsumer>,
+    current_device_id: &mut Option<cpal::DeviceId>,
+    current_using_fallback: &mut bool,
+    selected: SelectedOutput,
+) -> anyhow::Result<()> {
+    let device_id = selected.device_id.clone();
+    let using_fallback = selected.using_fallback;
+    let sample_rate = selected.stream_config.sample_rate;
+    let channels = selected.stream_config.channels;
+    let sample_format = selected.sample_format;
+    let consumer = available_consumer
+        .take()
+        .context("audio consumer unavailable while activating output")?;
+
+    engine.set_output_format(sample_rate, channels);
+    *generation = generation.wrapping_add(1);
+    let stream_generation = *generation;
+    match manager.build_stream(
+        selected,
+        consumer,
+        Some(command_tx.clone()),
+        stream_generation,
+    ) {
+        Ok(output) => {
+            tracing::info!(
+                device = %device_id,
+                sample_rate,
+                channels,
+                sample_format = ?sample_format,
+                using_fallback,
+                generation = stream_generation,
+                "CPAL output stream started"
+            );
+            *current = Some(output);
+            *current_device_id = Some(device_id);
+            *current_using_fallback = using_fallback;
+            Ok(())
+        }
+        Err(failure) => {
+            *available_consumer = Some(failure.consumer);
+            *current_device_id = None;
+            *current_using_fallback = false;
+            Err(failure.error)
+        }
+    }
+}
+
+fn reclaim_current_output(
+    current: &mut Option<AudioOutput>,
+    available_consumer: &mut Option<AudioConsumer>,
+    current_device_id: &mut Option<cpal::DeviceId>,
+    current_using_fallback: &mut bool,
+) -> anyhow::Result<()> {
+    if let Some(output) = current.take() {
+        let consumer = output.reclaim_consumer()?;
+        *available_consumer = Some(consumer);
+    }
+    *current_device_id = None;
+    *current_using_fallback = false;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_activate_output(
+    manager: &AudioManager,
+    engine: &AudioEngine,
+    command_tx: &Sender<OutputSupervisorMessage>,
+    generation: &mut u64,
+    current: &mut Option<AudioOutput>,
+    available_consumer: &mut Option<AudioConsumer>,
+    current_device_id: &mut Option<cpal::DeviceId>,
+    current_using_fallback: &mut bool,
+    preferred_device: Option<&str>,
+    recovering: bool,
+    recovery_hook: &Arc<Mutex<Option<OutputRecoveryHook>>>,
+) -> anyhow::Result<()> {
+    let selected = manager.open_selected_output(preferred_device)?;
+    if recovering {
+        prepare_output_recovery(engine, recovery_hook);
+    }
+    activate_selected_output(
+        manager,
+        engine,
+        command_tx,
+        generation,
+        current,
+        available_consumer,
+        current_device_id,
+        current_using_fallback,
+        selected,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_output(
+    manager: &AudioManager,
+    engine: &AudioEngine,
+    command_tx: &Sender<OutputSupervisorMessage>,
+    recovery_hook: &Arc<Mutex<Option<OutputRecoveryHook>>>,
+    generation: &mut u64,
+    current: &mut Option<AudioOutput>,
+    available_consumer: &mut Option<AudioConsumer>,
+    current_device_id: &mut Option<cpal::DeviceId>,
+    current_using_fallback: &mut bool,
+    preferred_device: Option<&str>,
+) -> anyhow::Result<()> {
+    prepare_output_recovery(engine, recovery_hook);
+    reclaim_current_output(
+        current,
+        available_consumer,
+        current_device_id,
+        current_using_fallback,
+    )?;
+    try_activate_output(
+        manager,
+        engine,
+        command_tx,
+        generation,
+        current,
+        available_consumer,
+        current_device_id,
+        current_using_fallback,
+        preferred_device,
+        false,
+        recovery_hook,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supervisor_loop(
+    manager: &AudioManager,
+    engine: &AudioEngine,
+    command_tx: &Sender<OutputSupervisorMessage>,
+    command_rx: &Receiver<OutputSupervisorMessage>,
+    recovery_hook: &Arc<Mutex<Option<OutputRecoveryHook>>>,
+    generation: &mut u64,
+    current: &mut Option<AudioOutput>,
+    available_consumer: &mut Option<AudioConsumer>,
+    current_device_id: &mut Option<cpal::DeviceId>,
+    current_using_fallback: &mut bool,
+    preferred_device: &mut Option<String>,
+) {
+    loop {
+        match command_rx.recv_timeout(OUTPUT_POLL_INTERVAL) {
+            Ok(OutputSupervisorMessage::Shutdown) => break,
+            Ok(OutputSupervisorMessage::SetDevice(device)) => {
+                tracing::info!(device = ?device, "output device preference updated");
+                *preferred_device = device;
+                if let Err(error) = rebuild_output(
+                    manager,
+                    engine,
+                    command_tx,
+                    recovery_hook,
+                    generation,
+                    current,
+                    available_consumer,
+                    current_device_id,
+                    current_using_fallback,
+                    preferred_device.as_deref(),
+                ) {
+                    tracing::warn!(%error, "CPAL device selection failed; will retry");
+                }
+            }
+            Ok(OutputSupervisorMessage::StreamError {
+                generation: failed_generation,
+                error,
+            }) => {
+                if failed_generation != *generation || current.is_none() {
+                    tracing::debug!(
+                        failed_generation,
+                        active_generation = *generation,
+                        "ignoring stale CPAL stream error"
+                    );
+                    continue;
+                }
+                tracing::warn!(%error, generation = failed_generation, "rebuilding failed CPAL output");
+                if let Err(rebuild_error) = rebuild_output(
+                    manager,
+                    engine,
+                    command_tx,
+                    recovery_hook,
+                    generation,
+                    current,
+                    available_consumer,
+                    current_device_id,
+                    current_using_fallback,
+                    preferred_device.as_deref(),
+                ) {
+                    tracing::warn!(%rebuild_error, "CPAL recovery build failed; will retry");
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if current.is_none() {
+                    if let Err(error) = try_activate_output(
+                        manager,
+                        engine,
+                        command_tx,
+                        generation,
+                        current,
+                        available_consumer,
+                        current_device_id,
+                        current_using_fallback,
+                        preferred_device.as_deref(),
+                        true,
+                        recovery_hook,
+                    ) {
+                        tracing::debug!(%error, "CPAL output retry failed");
+                    }
+                    continue;
+                }
+
+                if !should_recheck_device(preferred_device.as_deref(), *current_using_fallback) {
+                    continue;
+                }
+
+                match manager.select_device_with_policy(preferred_device.as_deref()) {
+                    Ok((_device, desired_id, desired_fallback)) => {
+                        let changed = current_device_id.as_ref() != Some(&desired_id)
+                            || *current_using_fallback != desired_fallback;
+                        if changed {
+                            tracing::info!(
+                                device = %desired_id,
+                                using_fallback = desired_fallback,
+                                "preferred/default output device changed"
+                            );
+                            if let Err(error) = rebuild_output(
+                                manager,
+                                engine,
+                                command_tx,
+                                recovery_hook,
+                                generation,
+                                current,
+                                available_consumer,
+                                current_device_id,
+                                current_using_fallback,
+                                preferred_device.as_deref(),
+                            ) {
+                                tracing::warn!(%error, "CPAL output switch failed; will retry");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "no output device available while polling");
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
 }
 
 impl AudioEngine {
@@ -1183,6 +1811,52 @@ impl AudioEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_error_classification_rebuilds_only_device_loss() {
+        assert!(should_rebuild(&StreamError::DeviceNotAvailable));
+        assert!(should_rebuild(&StreamError::StreamInvalidated));
+        assert!(!should_rebuild(&StreamError::BufferUnderrun));
+    }
+
+    #[test]
+    fn device_recheck_policy_tracks_default_and_temporary_fallback() {
+        assert!(should_recheck_device(None, false));
+        assert!(should_recheck_device(Some("preferred"), true));
+        assert!(!should_recheck_device(Some("preferred"), false));
+    }
+
+    #[test]
+    fn returning_consumer_hands_ownership_back_without_callback_mutex() {
+        let (_engine, consumer) = AudioEngine::new(16);
+        let (tx, rx) = mpsc::channel();
+        drop(ReturningConsumer::new(consumer, tx));
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_ok());
+    }
+
+    #[test]
+    fn recovery_before_scheduler_hook_does_not_leave_output_gate_closed() {
+        let (engine, _consumer) = AudioEngine::new(16);
+        let hook: Arc<Mutex<Option<OutputRecoveryHook>>> = Arc::new(Mutex::new(None));
+        assert!(engine.is_playback_enabled());
+        prepare_output_recovery(&engine, &hook);
+        assert!(engine.is_playback_enabled());
+    }
+
+    #[test]
+    fn recovery_with_scheduler_hook_closes_gate_and_invokes_hook() {
+        let (engine, _consumer) = AudioEngine::new(16);
+        let called = Arc::new(AtomicBool::new(false));
+        let hook_called = called.clone();
+        let hook: Arc<Mutex<Option<OutputRecoveryHook>>> =
+            Arc::new(Mutex::new(Some(Arc::new(move || {
+                hook_called.store(true, Ordering::Release)
+            }))));
+
+        prepare_output_recovery(&engine, &hook);
+        assert!(!engine.is_playback_enabled());
+        assert!(called.load(Ordering::Acquire));
+    }
 
     // ---------------------------------------------------------------------------
     // Existing tests (preserved, adapted to new API)
