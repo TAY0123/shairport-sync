@@ -42,6 +42,24 @@ pub struct AirplayConfig {
     pub timing_port: u16,
 }
 
+impl AirplayConfig {
+    /// Whether the receiver should advertise that a user-supplied AirPlay
+    /// password is required.
+    pub fn password_required(&self) -> bool {
+        !self.pin.is_empty()
+    }
+
+    /// PIN used by HomeKit pair-setup. Upstream shairport-sync uses the
+    /// protocol-standard 3939 value when no user-facing password is set.
+    pub fn pairing_pin(&self) -> &str {
+        if self.pin.is_empty() {
+            "3939"
+        } else {
+            &self.pin
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdvertisedFormatPolicy {
@@ -174,7 +192,9 @@ impl Default for AirplayConfig {
         Self {
             enabled: true,
             airplay2_enabled: false,
-            pin: "3939".to_string(),
+            // Empty means no user-facing AirPlay password. HomeKit SRP still
+            // uses the protocol-standard 3939 value internally.
+            pin: String::new(),
             identity_key_path: None,
             pairing_db_path: None,
             transcript_path: None,
@@ -325,6 +345,23 @@ mod tests {
         assert_eq!(config.audio.start_watermark_ms, 100);
         assert_eq!(config.audio.low_watermark_ms, 50);
         assert_eq!(config.audio.target_watermark_ms, 100);
+    }
+
+    #[test]
+    fn airplay_defaults_to_no_user_password_but_keeps_pairing_pin() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.airplay.password_required());
+        assert_eq!(config.airplay.pairing_pin(), "3939");
+
+        let configured: Config = toml::from_str(
+            r#"
+            [airplay]
+            pin = "1234"
+            "#,
+        )
+        .unwrap();
+        assert!(configured.airplay.password_required());
+        assert_eq!(configured.airplay.pairing_pin(), "1234");
     }
 
     #[test]
