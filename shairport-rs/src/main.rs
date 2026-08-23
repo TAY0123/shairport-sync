@@ -112,8 +112,12 @@ async fn main() -> anyhow::Result<()> {
     // and is the single authority for audio lifecycle commands.
     let scheduler_config = SchedulerConfig::from_audio_config(&config.audio);
     let decoder = AirPlayPacketDecoder::new(app_state.clone());
-    let (playout_handle, playout_task) =
-        playout::scheduler::spawn_playout_service(scheduler_config, decoder, audio_engine.clone());
+    let (playout_handle, playout_task) = playout::scheduler::spawn_playout_service_with_clock(
+        scheduler_config,
+        decoder,
+        audio_engine.clone(),
+        std::sync::Arc::new(app_state.ptp_servo.clone()),
+    );
 
     let mut ptp_running = false;
     let ptp_handle = if config.airplay.enabled
@@ -213,7 +217,8 @@ async fn main() -> anyhow::Result<()> {
         audio_engine,
         mdns_advertiser,
         dacp,
-    );
+    )
+    .with_playout(playout_handle.clone());
     let router = Router::new()
         .merge(api::router(api_context))
         .merge(web::router())

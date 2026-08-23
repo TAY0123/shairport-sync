@@ -14,6 +14,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
+pub mod drift;
+
 use crate::codec;
 use crate::config::{AudioConfig, AudioHostName, MAX_PCM_FIFO_MS};
 
@@ -107,6 +109,8 @@ pub struct AudioEngine {
     /// Monotonically incrementing flush epoch. Each clear_output_samples / request_flush
     /// call bumps this; the consumer drains on the next callback when it detects the change.
     flush_epoch: Arc<AtomicU64>,
+    /// Latest flush epoch applied by the real-time consumer.
+    applied_flush_epoch: Arc<AtomicU64>,
     /// Write-index boundary captured at the moment of the latest flush request.
     /// The consumer pops samples only up to (but not past) this index, preserving
     /// samples enqueued after the flush request was issued.
@@ -123,9 +127,11 @@ pub struct AudioEngine {
 pub struct AudioConsumer {
     consumer: ringbuf::HeapCons<f32>,
     volume_gain_bits: Arc<AtomicU32>,
+    current_volume_gain: f32,
     playback_enabled: Arc<AtomicBool>,
     callback_underrun_samples: Arc<AtomicUsize>,
     flush_epoch: Arc<AtomicU64>,
+    applied_flush_epoch: Arc<AtomicU64>,
     /// The last flush epoch observed by this consumer. On mismatch the
     /// consumer drains the ring buffer up to `flush_target_write_index`
     /// before producing output.
@@ -456,6 +462,7 @@ impl AudioEngine {
         let playback_enabled = Arc::new(AtomicBool::new(true));
         let callback_underrun_samples = Arc::new(AtomicUsize::new(0));
         let flush_epoch = Arc::new(AtomicU64::new(0));
+        let applied_flush_epoch = Arc::new(AtomicU64::new(0));
         let flush_target_write_index = Arc::new(AtomicUsize::new(0));
         let engine = Self {
             producer: Arc::new(Mutex::new(producer)),
@@ -472,15 +479,18 @@ impl AudioEngine {
             playback_disabled_rejected_samples: Arc::new(AtomicUsize::new(0)),
             flush_count: Arc::new(AtomicU64::new(0)),
             flush_epoch: Arc::clone(&flush_epoch),
+            applied_flush_epoch: Arc::clone(&applied_flush_epoch),
             flush_target_write_index: Arc::clone(&flush_target_write_index),
             max_observed_occupancy: Arc::new(AtomicUsize::new(0)),
         };
         let audio_consumer = AudioConsumer {
             consumer,
             volume_gain_bits,
+            current_volume_gain: 1.0,
             playback_enabled,
             callback_underrun_samples,
             flush_epoch,
+            applied_flush_epoch,
             flush_target_write_index,
             last_seen_flush_epoch: 0,
         };
@@ -537,16 +547,34 @@ impl AudioEngine {
         };
     }
 
+    /// Set drift correction ratio in parts per million, forwarded to the
+    /// resampler cache.  A positive value speeds up output (compensates
+    /// for a fast DAC).  Only meaningful for AP2 buffered playback with
+    /// PTP clock lock.
+    pub fn set_drift_correction_ppm(&self, ppm: f64) {
+        self.resampler_cache.lock().set_correction_ppm(ppm);
+    }
+
     /// Return the output channel count (≥ 1).
     fn output_channels(&self) -> u16 {
         self.output_format.lock().channels.max(1)
     }
 
+    /// Update the software volume target.
+    ///
+    /// Non-finite control values are ignored. Passing NaN through to the
+    /// real-time callback would produce NaN PCM samples, which some platform
+    /// audio stacks and enhancement drivers do not handle safely.
     pub fn set_volume_db(&self, db: f64) {
+        if !db.is_finite() {
+            tracing::warn!(volume_db = db, "ignoring non-finite volume");
+            return;
+        }
+        let db = db.clamp(-144.0, 0.0);
         let gain = if db <= -144.0 {
             0.0
         } else {
-            10.0f64.powf(db.clamp(-144.0, 0.0) / 20.0) as f32
+            10.0f64.powf(db / 20.0) as f32
         };
         self.volume_gain_bits
             .store(gain.to_bits(), Ordering::Release);
@@ -607,17 +635,15 @@ impl AudioEngine {
     ) -> Vec<f32> {
         let output_format = *self.output_format.lock();
         let converted_channels = convert_channels(samples, input_channels, output_format.channels);
-        if input_sample_rate != output_format.sample_rate {
-            let mut cache = self.resampler_cache.lock();
-            cache.resample(
-                &converted_channels,
-                input_sample_rate,
-                output_format.sample_rate,
-                output_format.channels,
-            )
-        } else {
-            converted_channels
-        }
+        // Always pass through the cache: its zero-correction/equal-rate path
+        // is cheap, while AP2 drift correction must also work when source and
+        // DAC nominal rates are identical.
+        self.resampler_cache.lock().resample(
+            &converted_channels,
+            input_sample_rate,
+            output_format.sample_rate,
+            output_format.channels,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -873,6 +899,11 @@ impl AudioEngine {
         self.request_flush();
     }
 
+    /// Whether the real-time callback has not yet applied the latest flush.
+    pub fn is_flush_pending(&self) -> bool {
+        self.applied_flush_epoch.load(Ordering::Acquire) != self.flush_epoch.load(Ordering::Acquire)
+    }
+
     pub fn status(&self) -> AudioEngineStatus {
         let output_format = *self.output_format.lock();
         let channels = output_format.channels.max(1) as usize;
@@ -965,6 +996,8 @@ impl AudioConsumer {
             // times), so discard nothing.
 
             self.last_seen_flush_epoch = current_epoch;
+            self.applied_flush_epoch
+                .store(current_epoch, Ordering::Release);
         }
     }
 
@@ -978,12 +1011,15 @@ impl AudioConsumer {
 
         if !self.playback_enabled.load(Ordering::Acquire) {
             output.fill(0.0);
+            self.current_volume_gain =
+                f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
             return 0;
         }
-        let gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
+        let target_gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
         let mut filled = 0usize;
         let mut underrun = 0usize;
         for sample in output.iter_mut() {
+            let gain = smooth_volume_gain(&mut self.current_volume_gain, target_gain);
             match self.consumer.try_pop() {
                 Some(value) => {
                     *sample = value * gain;
@@ -1013,12 +1049,15 @@ impl AudioConsumer {
             for sample in output.iter_mut() {
                 *sample = T::from_sample(0.0);
             }
+            self.current_volume_gain =
+                f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
             return 0;
         }
-        let gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
+        let target_gain = f32::from_bits(self.volume_gain_bits.load(Ordering::Acquire));
         let mut filled = 0usize;
         let mut underrun = 0usize;
         for sample in output.iter_mut() {
+            let gain = smooth_volume_gain(&mut self.current_volume_gain, target_gain);
             match self.consumer.try_pop() {
                 Some(value) => {
                     *sample = T::from_sample(value * gain);
@@ -1036,6 +1075,25 @@ impl AudioConsumer {
         }
         filled
     }
+}
+
+/// Apply a short, lock-free gain ramp in the real-time callback.
+///
+/// An instantaneous gain step creates an audible click because it introduces
+/// a discontinuity in the PCM waveform. At 48 kHz stereo this coefficient
+/// settles a normal slider change in roughly 7 ms.
+#[inline]
+fn smooth_volume_gain(current: &mut f32, target: f32) -> f32 {
+    const SMOOTHING_FACTOR: f32 = 0.01;
+    const SNAP_THRESHOLD: f32 = 0.000_01;
+
+    let delta = target - *current;
+    if delta.abs() <= SNAP_THRESHOLD {
+        *current = target;
+    } else {
+        *current += delta * SMOOTHING_FACTOR;
+    }
+    *current
 }
 
 fn convert_channels(samples: &[f32], input_channels: u16, output_channels: u16) -> Vec<f32> {
@@ -1148,8 +1206,31 @@ mod tests {
         assert_eq!(engine.enqueue_interleaved(&[1.0, 1.0]), 2);
         let mut out = [0.0; 2];
         consumer.fill_output(&mut out);
+        assert!(out[0] < 1.0 && out[0] > 0.501_187_2);
+        assert!(out[1] < out[0] && out[1] > 0.501_187_2);
+
+        let mut silence = [0.0; 2_048];
+        consumer.fill_output(&mut silence);
+        assert_eq!(engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        consumer.fill_output(&mut out);
         assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
         assert!((out[1] - 0.501_187_2).abs() < 0.000_01);
+    }
+
+    #[test]
+    fn audio_engine_ignores_non_finite_volume() {
+        let (engine, mut consumer) = AudioEngine::new(4);
+        engine.set_volume_db(-6.0);
+        engine.set_volume_db(f64::NAN);
+        engine.set_volume_db(f64::INFINITY);
+
+        let mut silence = [0.0; 2_048];
+        consumer.fill_output(&mut silence);
+        assert_eq!(engine.enqueue_interleaved(&[1.0, 1.0]), 2);
+        let mut out = [0.0; 2];
+        consumer.fill_output(&mut out);
+        assert!(out.iter().all(|sample| sample.is_finite()));
+        assert!((out[0] - 0.501_187_2).abs() < 0.000_01);
     }
 
     #[test]
@@ -1405,6 +1486,7 @@ mod tests {
 
         // Now flush via the engine — captures write_index at 80.
         engine.clear_output_samples();
+        assert!(engine.is_flush_pending());
         // The consumer sees the new epoch, reads flush_target_write_index=80,
         // and pops from its current read_index (30) up to 80, discarding
         // the 50 remaining pre-flush samples.
@@ -1420,6 +1502,7 @@ mod tests {
             0,
             "ring is empty after flush+callback"
         );
+        assert!(!engine.is_flush_pending());
     }
 
     // ---------------------------------------------------------------------------
@@ -1819,7 +1902,7 @@ mod tests {
             scheduler::{PlayoutState, SchedulerConfig, spawn_playout_service},
         };
 
-        let (engine, _consumer) = AudioEngine::new_for_output(48_000, 2, 100);
+        let (engine, mut consumer) = AudioEngine::new_for_output(48_000, 2, 100);
         let config = SchedulerConfig {
             start_watermark_ms: 20,
             low_watermark_ms: 10,
@@ -1830,6 +1913,9 @@ mod tests {
         let (handle, task) = spawn_playout_service(config, Ap2PrimingTestDecoder, engine.clone());
         handle.start();
         wait_for_playout_status(&handle, |status| status.state == PlayoutState::Priming).await;
+        let mut callback = [0.0f32; 128];
+        consumer.fill_output(&mut callback);
+        assert!(!engine.is_flush_pending());
 
         let packet = |seq: u64| {
             TimedPacket::new(
