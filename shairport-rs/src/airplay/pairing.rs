@@ -336,6 +336,14 @@ impl PairingService {
     ) -> Self {
         let device_id = device_id.into();
         let pin_text = pin_text.into();
+        // An empty configured PIN means "no password prompt" (`pw=false`),
+        // but SRP pairing still uses the standard default PIN so Apple
+        // clients can complete pair-setup without being asked for a code.
+        let pin_text = if pin_text.is_empty() {
+            "3939".to_string()
+        } else {
+            pin_text
+        };
         let db_path = db_path.map(|p| p.into());
         let db = PairingDatabase::load(db_path.as_deref());
         Self {
