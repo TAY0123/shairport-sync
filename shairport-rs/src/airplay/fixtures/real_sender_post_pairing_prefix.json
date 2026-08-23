@@ -1,0 +1,47 @@
+{
+  "source": "privacy-safe real sender transcript",
+  "complete": false,
+  "stop_reason": "type-103 SETUP was rejected before the missing-sr fix",
+  "exchanges": [
+    {"kind": "exchange", "method": "POST", "path": "/fp-setup", "content_type": "application/octet-stream", "response_status": 200},
+    {"kind": "exchange", "method": "POST", "path": "/fp-setup", "content_type": "application/octet-stream", "response_status": 200},
+    {
+      "kind": "exchange",
+      "method": "SETUP",
+      "path": "/session",
+      "content_type": "application/x-apple-binary-plist",
+      "request_keys": ["timingProtocol", "timingPeerInfo", "timingPeerList"],
+      "response_status": 200
+    },
+    {"kind": "event-channel-connected"},
+    {"kind": "exchange", "method": "GET", "path": "/info", "response_status": 200},
+    {"kind": "exchange", "method": "RECORD", "path": "/session", "response_status": 200},
+    {"kind": "exchange", "method": "SETPEERS", "path": "/session", "content_type": "/peer-list-changed", "response_status": 200},
+    {"kind": "exchange", "method": "POST", "path": "/command", "content_type": "application/x-apple-binary-plist", "response_status": 200},
+    {"kind": "exchange", "method": "POST", "path": "/command", "content_type": "application/x-apple-binary-plist", "response_status": 200},
+    {"kind": "exchange", "method": "POST", "path": "/command", "content_type": "application/x-apple-binary-plist", "response_status": 200},
+    {"kind": "exchange", "method": "SET_PARAMETER", "path": "/session", "content_type": "text/parameters", "response_status": 200},
+    {"kind": "exchange", "method": "POST", "path": "/feedback", "response_status": 200},
+    {
+      "kind": "exchange",
+      "method": "SETUP",
+      "path": "/session",
+      "content_type": "application/x-apple-binary-plist",
+      "request_keys": [
+        "streams[].type",
+        "streams[].audioFormat",
+        "streams[].audioFormatIndex",
+        "streams[].audioMode",
+        "streams[].clientID",
+        "streams[].ct",
+        "streams[].shk",
+        "streams[].spf",
+        "streams[].streamConnectionID",
+        "streams[].supportsDynamicStreamID"
+      ],
+      "stream": {"type": 103, "audioFormat": 8388608, "spf": 1024, "sr_present": false},
+      "captured_response_status": 400,
+      "required_response_status": 200
+    }
+  ]
+}

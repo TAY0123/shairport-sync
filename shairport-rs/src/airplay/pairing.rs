@@ -347,6 +347,14 @@ impl PairingService {
         }
     }
 
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn identity_public_key(&self) -> [u8; 32] {
+        self.identity.verifying_key()
+    }
+
     // ── Top-level dispatch ───────────────────────────────────────────
 
     pub fn handle(
@@ -696,7 +704,10 @@ impl PairingService {
             return (auth_error(6), None);
         }
 
-        debug!(client_id, "pair-setup M5 client signature verified");
+        debug!(
+            client_identifier_len = client_id.len(),
+            "pair-setup M5 client signature verified"
+        );
 
         // Generate M6 before persisting or marking the session verified.
         let m6_tlv = match self.setup_m6(&session_key) {
@@ -717,10 +728,7 @@ impl PairingService {
             db.save(self.db_path.as_deref());
         }
         session.verified = true;
-        info!(
-            client_id,
-            "non-transient pair-setup completed and client persisted"
-        );
+        info!("non-transient pair-setup completed and client persisted");
 
         drop(enc_key);
         drop(device_x);
@@ -919,22 +927,22 @@ impl PairingService {
 
         let mut signed_message = Vec::with_capacity(32 + 32 + client_id.len());
         signed_message.extend_from_slice(&client_public);
-        signed_message.extend_from_slice(&our_pub);
         signed_message.extend_from_slice(client_id);
+        signed_message.extend_from_slice(&our_pub);
 
         let client_identifier = String::from_utf8_lossy(client_id);
         let db = self.db.read();
         let verified = match db.find_client(&client_identifier) {
             Some(stored) => IdentityKey::verify(&stored.public_key, &signed_message, &client_sig),
             None => {
-                warn!(identifier = %client_identifier, "client not found in pairing DB");
+                warn!("client not found in pairing DB");
                 false
             }
         };
 
         if !verified {
             warn!(
-                identifier = %client_identifier,
+                identifier_len = client_id.len(),
                 signed_message_len = signed_message.len(),
                 "pair-verify: client signature verification failed"
             );
@@ -942,7 +950,7 @@ impl PairingService {
             return (auth_error(4), None);
         }
 
-        debug!(identifier = %client_identifier, "pair-verify: client authenticated");
+        debug!("pair-verify: client authenticated");
         session.verified = true;
 
         // Capture the shared secret before it's consumed.
@@ -1473,11 +1481,11 @@ mod tests {
             b"Pair-Verify-Encrypt-Info",
         );
 
-        // Construct the signed message: client_pub || server_pub || identifier
+        // Construct the signed message: client_pub || identifier || server_pub
         let mut signed_msg = Vec::with_capacity(32 + 32 + client_identifier.len());
         signed_msg.extend_from_slice(&client.public_key());
-        signed_msg.extend_from_slice(&server_public);
         signed_msg.extend_from_slice(client_identifier);
+        signed_msg.extend_from_slice(&server_public);
         let signature = client_ed25519.sign(&signed_msg);
 
         // M3 with valid signature but client not in DB
@@ -1539,8 +1547,8 @@ mod tests {
 
         let mut signed_msg = Vec::with_capacity(32 + 32 + client_identifier.len());
         signed_msg.extend_from_slice(&client.public_key());
-        signed_msg.extend_from_slice(&server_public);
         signed_msg.extend_from_slice(client_identifier);
+        signed_msg.extend_from_slice(&server_public);
         let signature = client_ed25519.sign(&signed_msg);
 
         let mut inner = Tlv::default();

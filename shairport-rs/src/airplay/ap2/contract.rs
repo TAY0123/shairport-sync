@@ -491,10 +491,15 @@ impl fmt::Display for ContractError {
 /// We only mark an entry **Implemented** when the handler in `rtsp.rs` fully
 /// implements the sub-protocol.  Entries like `/pair-setup` and
 /// `/pair-verify` have complete SRP + Ed25519 logic in `pairing.rs` →
-/// Implemented.  `/fp-setup` and `/configure` are acknowledged but the
-/// FairPlay implementation is a stub → Stub. `SETUP` with buffered audio
-/// (type 103) + PTP timing is Partial because timeline anchors are not yet
-/// applied to scheduler deadlines. Remote-control-only initial SETUP is
+/// Implemented. FairPlay request framing, modes, sequencing, and upstream
+/// response bytes are implemented, and upstream confirms `shk` is the direct
+/// buffered-media key. A real encrypted sender fixture is still needed →
+/// Partial. `/configure`
+/// validates the observed typed fields → Partial. `SETUP` with buffered audio
+/// (type 103) + PTP timing is Partial: timeline anchors drive scheduler
+/// deadlines, range-aware FLUSHBUFFERED, and bounded DAC drift correction;
+/// long-duration real-device validation remains.
+/// Remote-control-only initial SETUP is
 /// implemented. Data-stream SETUP and encrypted transport (type 130) are
 /// Partial because MediaRemote protobuf decoding/dispatch is not implemented.
 /// Realtime audio (type 96), NTP timing, and bare no-timing mode are rejected.
@@ -630,8 +635,9 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         idempotency: Ap2Idempotency::NotIdempotent,
         state_effects: &[],
         error_policy: Ap2ErrorPolicy::BestEffort,
-        // Handler echoes the request body — no real FairPlay implementation.
-        implementation: Ap2ImplementationStatus::Stub,
+        // Strict two-stage exchange is implemented; real-sender media-key
+        // authentication remains the interop exit criterion.
+        implementation: Ap2ImplementationStatus::Partial,
         discriminator: Ap2RequestDiscriminator::None,
     },
     // ── Configuration ──────────────────────────────────────────────────────
@@ -643,13 +649,12 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         required_request_keys: &[],
         optional_request_keys: &["timingProtocol", "groupUUID", "streamCategory"],
         expected_status: 200,
-        response_content_type: Ap2ContentType::None,
+        response_content_type: Ap2ContentType::BinaryPlist,
         required_response_keys: &[],
         idempotency: Ap2Idempotency::NotIdempotent,
-        state_effects: &[],
-        error_policy: Ap2ErrorPolicy::BestEffort,
-        // Always acknowledged with 200; body is ignored.
-        implementation: Ap2ImplementationStatus::Stub,
+        state_effects: &[Ap2StateEffect::DiagnosticUpdate],
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Partial,
         discriminator: Ap2RequestDiscriminator::None,
     },
     Ap2Contract {
@@ -657,15 +662,15 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         endpoint: Ap2Endpoint::Path("/audioMode"),
         operation: "POST /audioMode",
         request_content_type: Ap2ContentType::BinaryPlist,
-        required_request_keys: &[],
-        optional_request_keys: &["audioMode"],
+        required_request_keys: &["audioMode"],
+        optional_request_keys: &[],
         expected_status: 200,
         response_content_type: Ap2ContentType::None,
         required_response_keys: &[],
         idempotency: Ap2Idempotency::Idempotent,
         state_effects: &[Ap2StateEffect::AudioModeChanged],
-        error_policy: Ap2ErrorPolicy::BestEffort,
-        implementation: Ap2ImplementationStatus::Partial,
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Implemented,
         discriminator: Ap2RequestDiscriminator::None,
     },
     // ── Control ────────────────────────────────────────────────────────────
@@ -689,16 +694,18 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         method: Ap2Method::Post,
         endpoint: Ap2Endpoint::Path("/feedback"),
         operation: "POST /feedback",
-        request_content_type: Ap2ContentType::OctetStream,
+        request_content_type: Ap2ContentType::None,
         required_request_keys: &[],
         optional_request_keys: &[],
         expected_status: 200,
-        response_content_type: Ap2ContentType::None,
-        required_response_keys: &[],
-        idempotency: Ap2Idempotency::NotIdempotent,
-        state_effects: &[Ap2StateEffect::DiagnosticUpdate],
+        // Active playback returns this shape. Before a stream reaches
+        // Recording, upstream returns an empty 200 response.
+        response_content_type: Ap2ContentType::BinaryPlist,
+        required_response_keys: &["streams"],
+        idempotency: Ap2Idempotency::Idempotent,
+        state_effects: &[],
         error_policy: Ap2ErrorPolicy::BestEffort,
-        implementation: Ap2ImplementationStatus::Partial,
+        implementation: Ap2ImplementationStatus::Implemented,
         discriminator: Ap2RequestDiscriminator::None,
     },
     // ── Stream setup ───────────────────────────────────────────────────────
@@ -802,8 +809,8 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
             Ap2StateEffect::PeersUpdated,
             Ap2StateEffect::DiagnosticUpdate,
         ],
-        error_policy: Ap2ErrorPolicy::BestEffort,
-        implementation: Ap2ImplementationStatus::Stub,
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Implemented,
         discriminator: Ap2RequestDiscriminator::None,
     },
     Ap2Contract {
@@ -821,8 +828,8 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
             Ap2StateEffect::PeersUpdated,
             Ap2StateEffect::DiagnosticUpdate,
         ],
-        error_policy: Ap2ErrorPolicy::BestEffort,
-        implementation: Ap2ImplementationStatus::Stub,
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Implemented,
         discriminator: Ap2RequestDiscriminator::None,
     },
     // ── Playback ───────────────────────────────────────────────────────────
@@ -902,8 +909,8 @@ pub static AP2_CONTRACTS: &[Ap2Contract] = &[
         required_response_keys: &[],
         idempotency: Ap2Idempotency::Idempotent,
         state_effects: &[Ap2StateEffect::PlaybackPaused],
-        error_policy: Ap2ErrorPolicy::BestEffort,
-        implementation: Ap2ImplementationStatus::Partial,
+        error_policy: Ap2ErrorPolicy::Standard,
+        implementation: Ap2ImplementationStatus::Implemented,
         discriminator: Ap2RequestDiscriminator::None,
     },
     // ── Teardown ───────────────────────────────────────────────────────────

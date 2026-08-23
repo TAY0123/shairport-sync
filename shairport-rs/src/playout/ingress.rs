@@ -98,6 +98,11 @@ pub fn packet_ingress_with_capacity(capacity: usize) -> (IngressSender, IngressR
 }
 
 impl IngressSender {
+    /// Configured bounded channel capacity in packets.
+    pub fn capacity_packets(&self) -> usize {
+        self.tx.max_capacity()
+    }
+
     /// Non-blocking submission for AP1 UDP receive loops.
     ///
     /// Never awaits. Returns [`IngressResult::Full`] when the channel is at

@@ -104,6 +104,7 @@ Example:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:3689/api/v1/media
+Invoke-RestMethod http://127.0.0.1:3689/api/v1/playout/status
 Invoke-RestMethod -Method Post http://127.0.0.1:3689/api/v1/media/control `
   -ContentType application/json `
   -Body '{"command":"next"}'
@@ -127,17 +128,17 @@ The receiver advertises AirPlay 2 over `_airplay._tcp.local.` and RAOP over
 | `POST /pair-verify` | Verifies paired sender and activates control/event ciphers |
 | `POST /fp-setup` | FairPlay setup response |
 | `SETUP` initial plist | Negotiates AP2 timing/event setup |
-| `SETUP` streams plist | Opens realtime audio, buffered audio, or data/event stream ports |
-| `RECORD` | Starts the negotiated audio timeline |
+| `SETUP` streams plist | Configures buffered audio or data/event stream ports without starting output |
+| `RECORD` | Records playback intent; output starts from a valid rate anchor |
 | `SETRATEANCHORTIME` | Applies AP2 rate and RTP/network-time anchor |
 | `POST /command` | Now-playing metadata, artwork, supported commands, remote commands |
-| `POST /feedback` | Sender feedback/status endpoint |
-| `POST /audioMode` | Records AP2 audio mode diagnostics |
-| `POST /configure` | Acknowledged configuration endpoint |
-| `SETPEERS`, `SETPEERSX` | Records peer/group diagnostics |
+| `POST /feedback` | Returns the active stream type and playback sample rate while recording |
+| `POST /audioMode` | Validates and retains the selected AP2 audio mode |
+| `POST /configure` | Validates typed timing/group/category and HomeKit access-control configuration |
+| `SETPEERS`, `SETPEERSX` | Validates PTP peers, selects the sender clock, and resets the servo on master changes |
 | `FLUSHBUFFERED` | Flushes buffered stream ranges and local queue |
 | `TEARDOWN` stream plist | Tears down one AP2 stream |
-| `TEARDOWN` session | Stops playback and clears session keys |
+| `TEARDOWN` session | Stops playback and clears pairing and stream-owned keys |
 
 ### Handshake
 
@@ -174,8 +175,8 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["SETUP stream type 103"] --> B["Open dynamic TCP data port"]
-    B --> C["Derive media key from session key + shk"]
+    A["SETUP stream type 103"] --> B["Create immutable session-owned stream context"]
+    B --> C["Open dynamic TCP data port"]
     C --> D["Read encrypted packet blocks"]
     D --> E["Decrypt with AP2 buffered cipher"]
     E --> F["Resolve format from SETUP audioFormat/SSRC"]
@@ -188,16 +189,16 @@ flowchart TD
 ### Media Change Guard
 
 When the sender tears down a buffered stream or the receiver sends a navigation
-command, the receiver flushes queued audio, clears the current track, resets AP2
-format hints, and waits for fresh title metadata before enabling playback. This
-prevents old stream packets from playing briefly after next/previous.
+command, the receiver flushes queued audio and clears stale track state. AP2
+transport is controlled by RECORD/rate-anchor messages rather than title
+metadata, so artwork or title delivery cannot accidentally start or block audio.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Playing
-    Playing --> WaitingForTitle: next/previous or buffered TEARDOWN
-    WaitingForTitle --> WaitingForTitle: drain audio packets
-    WaitingForTitle --> Playing: /command contains new title
+    Playing --> Priming: next/previous or buffered TEARDOWN
+    Priming --> Priming: metadata updates
+    Priming --> Playing: RECORD + valid rate anchor
     Playing --> Stopped: TEARDOWN session
 ```
 
@@ -221,3 +222,47 @@ remote-control unavailable error instead of pretending success.
 
 Default logs keep high-volume timing traffic quiet. PTP announce packets and AP2
 `/feedback` pings are debug-level logs.
+
+### AP2 interoperability transcript
+
+Set `airplay.transcript_path` to capture the shape of a real sender handshake:
+
+```toml
+[airplay]
+transcript_path = "logs/ap2-transcript.jsonl"
+```
+
+The file is recreated on each server start and flushed after every JSONL record.
+It contains request methods and paths, content types, plist key names and types,
+allow-listed stream parameters (`type`, `audioFormat`, `sr`, and `spf`), and
+response status/key shapes. It deliberately excludes headers, plist values,
+payload bytes, signatures, keys, and UUID values.
+
+For an interoperability capture, rebuild and restart the receiver, connect the
+sender once, let the attempt finish or fail, then stop the receiver and preserve
+`logs/ap2-transcript.jsonl`. Inspect the file before sharing it even though its
+schema is privacy-filtered.
+
+For the remaining encrypted-audio and long-duration validation:
+
+```powershell
+$env:RUST_LOG='shairport_rs=info'
+cargo run --manifest-path shairport-rs/Cargo.toml -- `
+  --config shairport-rs/shairport-rs.toml
+```
+
+Start playback from one iPhone or Mac. In a second PowerShell window, sample
+playout state and drift diagnostics:
+
+```powershell
+while ($true) {
+  Invoke-RestMethod http://127.0.0.1:3689/api/v1/playout/status |
+    ConvertTo-Json -Depth 4 -Compress
+  Start-Sleep -Seconds 5
+}
+```
+
+A successful first-packet run reaches type-103 SETUP status 200 and logs
+`buffered audio: block decrypted successfully`. A long-duration pass keeps
+`queued_ms` bounded, avoids progressive saturation, and does not continually
+increase `hard_resync_count`.

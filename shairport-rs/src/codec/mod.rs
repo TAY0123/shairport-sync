@@ -276,14 +276,33 @@ pub fn mixdown_to_stereo(samples: &[f32], input_channels: u16) -> Vec<f32> {
     stereo
 }
 
-/// Sample rate conversion cache.
+/// Sample rate conversion cache with optional drift correction.
+///
+/// When [`correction_ppm`] is non-zero the resample ratio is adjusted
+/// by that fraction even when the nominal input and output rates are
+/// equal, allowing AP2 clock drift to be compensated.
+///
+/// The rubato `Async<f32>` resampler supports dynamic ratio changes via
+/// [`Resampler::set_resample_ratio`] with a ramped transition, so small
+/// drift-correction updates do not require rebuilding the resampler.
+/// Rebuilding only occurs when the format or block shape changes
+/// (input/output rate, channels, or input frame count).
+///
+/// [`correction_ppm`]: Self::set_correction_ppm
 pub struct ResamplerCache {
     cached_input_rate: u32,
     cached_output_rate: u32,
     cached_channels: u16,
     cached_input_frames: usize,
-    pending_output_frames: f64,
     resampler: Option<Async<f32>>,
+
+    /// Drift correction in parts per million applied on top of the
+    /// nominal resample ratio.  Zero means no correction (passthrough
+    /// when input == output rate).
+    correction_ppm: f64,
+    /// The ratio most recently set on the rubato resampler via
+    /// [`set_resample_ratio`], or 0.0 if no resampler exists yet.
+    resampler_ratio: f64,
 }
 
 impl ResamplerCache {
@@ -293,9 +312,25 @@ impl ResamplerCache {
             cached_output_rate: 0,
             cached_channels: 0,
             cached_input_frames: 0,
-            pending_output_frames: 0.0,
             resampler: None,
+            correction_ppm: 0.0,
+            resampler_ratio: 0.0,
         }
+    }
+
+    /// Set the drift correction in parts per million.
+    ///
+    /// A positive value speeds up the output relative to the input
+    /// (compensates for a fast DAC).  A negative value slows it down.
+    /// The change takes effect on the next [`resample`] call.
+    ///
+    /// [`resample`]: Self::resample
+    pub fn set_correction_ppm(&mut self, ppm: f64) {
+        self.correction_ppm = if ppm.is_finite() {
+            ppm.clamp(-1_000.0, 1_000.0)
+        } else {
+            0.0
+        };
     }
 
     pub fn resample(
@@ -305,45 +340,76 @@ impl ResamplerCache {
         output_rate: u32,
         channels: u16,
     ) -> Vec<f32> {
-        if input_rate == output_rate || input_rate == 0 || output_rate == 0 {
-            return input.to_vec();
-        }
         let ch = channels.max(1) as usize;
         let input_frames = input.len() / ch;
         if input_frames == 0 {
             return Vec::new();
         }
 
-        if self.cached_input_rate != input_rate
+        let correction = self.correction_ppm / 1_000_000.0;
+        let nominal_ratio = if input_rate == 0 || output_rate == 0 {
+            1.0
+        } else {
+            output_rate as f64 / input_rate as f64
+        };
+        let effective_ratio = nominal_ratio * (1.0 + correction);
+
+        // Fast path: no correction and rates already match → passthrough.
+        if (effective_ratio - 1.0).abs() < 1e-12 {
+            // Correction is effectively zero and rates equal → no resampling needed.
+            if self.resampler.is_some() {
+                self.resampler = None;
+                self.resampler_ratio = 0.0;
+            }
+            return input.to_vec();
+        }
+
+        // Rebuild if format or block shape changed (rare).
+        let shape_changed = self.cached_input_rate != input_rate
             || self.cached_output_rate != output_rate
             || self.cached_channels as usize != ch
-            || self.cached_input_frames != input_frames
-        {
+            || self.cached_input_frames != input_frames;
+
+        if shape_changed || self.resampler.is_none() {
             self.cached_input_rate = input_rate;
             self.cached_output_rate = output_rate;
             self.cached_channels = channels;
             self.cached_input_frames = input_frames;
-            self.pending_output_frames = 0.0;
-            self.resampler = Self::build_resampler(input_rate, output_rate, ch, input_frames);
+            self.resampler = Self::build_resampler_with_ratio(effective_ratio, ch, input_frames);
+            self.resampler_ratio = effective_ratio;
+        } else if let Some(ref mut resampler) = self.resampler {
+            // Dynamic ratio update via rubato's ramped set_resample_ratio.
+            // This avoids rebuilding the entire resampler for small ppm changes.
+            if (effective_ratio - self.resampler_ratio).abs() > 1e-12 {
+                if resampler.set_resample_ratio(effective_ratio, true).is_err() {
+                    // Fallback: rebuild if dynamic update fails (ratio out of bounds).
+                    self.resampler =
+                        Self::build_resampler_with_ratio(effective_ratio, ch, input_frames);
+                }
+                self.resampler_ratio = effective_ratio;
+            }
         }
 
-        let expected_frames = self.expected_output_frames(input_frames, input_rate, output_rate);
-        let expected_samples = expected_frames * ch;
-        let output = self
-            .resampler
+        self.resampler
             .as_mut()
             .and_then(|resampler| resample_with_rubato(resampler, input, ch, input_frames))
-            .unwrap_or_else(|| linear_resample(input, input_rate, output_rate, channels));
-        normalize_resampled_len(output, expected_samples, ch)
+            .unwrap_or_else(|| {
+                let adjusted_output_rate = if nominal_ratio > 0.0 {
+                    (input_rate as f64 * effective_ratio).round() as u32
+                } else {
+                    output_rate
+                }
+                .max(1);
+                linear_resample(input, input_rate, adjusted_output_rate, channels)
+            })
     }
 
-    fn build_resampler(
-        input_rate: u32,
-        output_rate: u32,
+    /// Build a rubato `Async<f32>` resampler for the given effective ratio.
+    fn build_resampler_with_ratio(
+        effective_ratio: f64,
         channels: usize,
         input_frames: usize,
     ) -> Option<Async<f32>> {
-        let ratio = output_rate as f64 / input_rate as f64;
         let window = WindowFunction::BlackmanHarris2;
         let sinc_len = 64;
         let params = SincInterpolationParameters {
@@ -355,7 +421,7 @@ impl ResamplerCache {
         };
 
         Async::<f32>::new_sinc(
-            ratio,
+            effective_ratio,
             1.1,
             &params,
             input_frames,
@@ -363,19 +429,6 @@ impl ResamplerCache {
             FixedAsync::Input,
         )
         .ok()
-    }
-
-    fn expected_output_frames(
-        &mut self,
-        input_frames: usize,
-        input_rate: u32,
-        output_rate: u32,
-    ) -> usize {
-        let exact = input_frames as f64 * output_rate as f64 / input_rate as f64
-            + self.pending_output_frames;
-        let frames = exact.floor().max(1.0) as usize;
-        self.pending_output_frames = exact - frames as f64;
-        frames
     }
 }
 
@@ -396,38 +449,6 @@ fn resample_with_rubato(
         .process(&input, 0, None)
         .ok()
         .map(|output| output.take_data())
-}
-
-fn normalize_resampled_len(
-    mut output: Vec<f32>,
-    expected_samples: usize,
-    channels: usize,
-) -> Vec<f32> {
-    if expected_samples == 0 || output.len() == expected_samples {
-        return output;
-    }
-
-    if output.len() > expected_samples {
-        output.truncate(expected_samples);
-        return output;
-    }
-
-    let first_pad = output.len().saturating_sub(channels).min(output.len());
-    let last_frame: Vec<f32> = output
-        .get(first_pad..first_pad + channels.min(output.len() - first_pad))
-        .unwrap_or(&[])
-        .to_vec();
-
-    while output.len() < expected_samples {
-        for ch in 0..channels {
-            let sample = last_frame.get(ch).copied().unwrap_or(0.0);
-            output.push(sample);
-            if output.len() == expected_samples {
-                break;
-            }
-        }
-    }
-    output
 }
 
 /// Fallback sample rate conversion (linear interpolation).
@@ -548,7 +569,65 @@ mod tests {
         let mut cache = ResamplerCache::new();
         let input = vec![0.0; 2048];
         let output = cache.resample(&input, 48_000, 96_000, 2);
-        assert_eq!(output.len(), 4096);
+        let output_frames = output.len() / 2;
+        assert!(
+            output_frames.abs_diff(2048) <= 8,
+            "native sinc delay must stay small, got {output_frames} frames"
+        );
+    }
+
+    #[test]
+    fn resampler_cache_does_not_pad_filtered_blocks_with_repeated_tail_frames() {
+        let mut cache = ResamplerCache::new();
+        cache.set_correction_ppm(300.0);
+        let mut input = Vec::with_capacity(1024 * 2);
+        for frame in 0..1024 {
+            let sample = (frame as f32 * 0.013).sin();
+            input.extend_from_slice(&[sample, -sample]);
+        }
+
+        let output = cache.resample(&input, 48_000, 48_000, 2);
+        let left_tail = output
+            .chunks_exact(2)
+            .rev()
+            .take(8)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>();
+
+        assert!(
+            left_tail
+                .windows(2)
+                .any(|pair| (pair[0] - pair[1]).abs() > 1e-6),
+            "filtered output tail must not be extended by repeating one frame"
+        );
+    }
+
+    #[test]
+    fn resampler_cache_applies_fractional_correction_at_equal_nominal_rate() {
+        let input = vec![0.25f32; 1_000 * 2];
+        let mut faster = ResamplerCache::new();
+        faster.set_correction_ppm(1_000.0);
+        let mut faster_frames = 0usize;
+        for _ in 0..10 {
+            faster_frames += faster.resample(&input, 48_000, 48_000, 2).len() / 2;
+        }
+        assert!(faster_frames > 10_000);
+
+        let mut slower = ResamplerCache::new();
+        slower.set_correction_ppm(-1_000.0);
+        let mut slower_frames = 0usize;
+        for _ in 0..10 {
+            slower_frames += slower.resample(&input, 48_000, 48_000, 2).len() / 2;
+        }
+        assert!(slower_frames < 10_000);
+    }
+
+    #[test]
+    fn resampler_cache_sanitizes_non_finite_correction() {
+        let input = vec![0.25f32; 128 * 2];
+        let mut cache = ResamplerCache::new();
+        cache.set_correction_ppm(f64::NAN);
+        assert_eq!(cache.resample(&input, 48_000, 48_000, 2), input);
     }
 
     #[test]
