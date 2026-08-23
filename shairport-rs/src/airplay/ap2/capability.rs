@@ -137,7 +137,7 @@ impl Ap2CapabilityPolicy {
         let ptp_configured =
             config.ptp.enabled && !matches!(config.ptp.backend, PtpBackendName::Off);
         let ptp_available = airplay2 && ptp_configured && ptp_running;
-        let password_set = !config.airplay.pin.is_empty();
+        let password_set = config.airplay.password_required();
 
         // --- Features ---
         let mut features: u64 = 0;

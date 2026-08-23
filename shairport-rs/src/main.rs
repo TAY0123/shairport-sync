@@ -95,14 +95,12 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState::new(config.clone());
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
-    let (audio_engine, audio_output) = match audio_manager.create_engine_and_output() {
-        (engine, Ok(output)) => (engine, Some(output)),
-        (engine, Err(err)) => {
-            warn!(%err, "audio output stream not started");
-            app_state.set_diagnostic("audio_output_error", err.to_string());
-            (engine, None)
-        }
-    };
+    let (audio_engine, audio_output, audio_controller, initial_output_result) =
+        audio_manager.create_engine_and_supervised_output();
+    if let Err(err) = initial_output_result {
+        warn!(%err, "audio output stream not started; supervisor will keep retrying");
+        app_state.set_diagnostic("audio_output_error", err.to_string());
+    }
     let player = player::SharedPlayer::new();
     let dacp = airplay::dacp::DacpController::new(app_state.clone());
     app_state.update_audio_devices(audio_manager.list_devices());
@@ -118,6 +116,12 @@ async fn main() -> anyhow::Result<()> {
         audio_engine.clone(),
         std::sync::Arc::new(app_state.ptp_servo.clone()),
     );
+
+    // Device loss / output-format changes invalidate queued PCM and drift
+    // assumptions. Ask the scheduler to flush and re-prime before the
+    // supervisor starts the replacement CPAL stream.
+    let recovery_playout = playout_handle.clone();
+    audio_controller.set_recovery_hook(move || recovery_playout.flush());
 
     let mut ptp_running = false;
     let ptp_handle = if config.airplay.enabled
@@ -218,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         mdns_advertiser,
         dacp,
     )
+    .with_audio_output(audio_controller)
     .with_playout(playout_handle.clone());
     let router = Router::new()
         .merge(api::router(api_context))
@@ -263,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    drop(audio_output);
+    audio_output.shutdown();
     Ok(())
 }
 

@@ -336,6 +336,14 @@ impl PairingService {
     ) -> Self {
         let device_id = device_id.into();
         let pin_text = pin_text.into();
+        // A blank configured PIN means the receiver is not user-password
+        // protected (`pw=false`). HomeKit pair-setup nevertheless uses 3939
+        // as its protocol PIN, matching upstream pair_homekit.c.
+        let pin_text = if pin_text.is_empty() {
+            "3939".to_string()
+        } else {
+            pin_text
+        };
         let db_path = db_path.map(|p| p.into());
         let db = PairingDatabase::load(db_path.as_deref());
         Self {
@@ -1204,6 +1212,17 @@ mod tests {
     };
 
     // ── Setup completion tests ─────────────────────────────────────────
+
+    #[test]
+    fn empty_configured_pin_uses_homekit_pairing_default() {
+        let service = PairingService::new(
+            IdentityKey::generate(),
+            "00:11:22:33:44:55",
+            "",
+            None::<std::path::PathBuf>,
+        );
+        assert_eq!(service.pin_text, "3939");
+    }
 
     #[test]
     fn pair_setup_m1_returns_srp_salt_and_public_key() {

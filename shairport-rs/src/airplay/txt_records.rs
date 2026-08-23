@@ -91,7 +91,7 @@ pub fn raop_ap2_txt(config: &Config, policy: &Ap2CapabilityPolicy) -> Vec<String
         "cn=0,1".to_string(),
         "da=true".to_string(),
         "et=0,1".to_string(),
-        format!("pw={}", !config.airplay.pin.is_empty()),
+        format!("pw={}", config.airplay.password_required()),
         format!("ft=0x{features_lo:X},0x{features_hi:X}"),
         format!("fv={FIRMWARE_VERSION}"),
         format!("sf=0x{:X}", policy.status_flags),
@@ -125,7 +125,7 @@ pub fn airplay_txt(config: &Config, policy: &Ap2CapabilityPolicy) -> Vec<String>
         format!("pi={pi}"),
         format!("psi={psi}"),
         format!("pk={}", public_key_hex(&config.airplay.device_id)),
-        format!("pw={}", !config.airplay.pin.is_empty()),
+        format!("pw={}", config.airplay.password_required()),
         format!("srcvers={SRCVERS}"),
         format!("osvers={OSVERS}"),
         "vv=2".to_string(),
@@ -168,6 +168,22 @@ mod tests {
         assert_eq!(services[0].service_type, "_raop._tcp.local.");
         assert!(services[0].txt.iter().any(|e| e.starts_with("sr=44100")));
         assert!(services[0].txt.iter().any(|e| e.starts_with("txtvers=1")));
+    }
+
+    #[test]
+    fn default_ap2_discovery_does_not_advertise_user_password() {
+        let config = base_config_ap2();
+        let policy = Ap2CapabilityPolicy::from_config(&config, true);
+        assert!(
+            raop_ap2_txt(&config, &policy)
+                .iter()
+                .any(|entry| entry == "pw=false")
+        );
+        assert!(
+            airplay_txt(&config, &policy)
+                .iter()
+                .any(|entry| entry == "pw=false")
+        );
     }
 
     #[test]

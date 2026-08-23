@@ -56,6 +56,13 @@ host, which is typically WASAPI on Windows, CoreAudio on macOS, and ALSA/Pulse o
 the available CPAL default on Linux. The decoder emits interleaved `f32`, and
 the audio engine resamples/remaps to the selected output device format.
 
+The output stream is supervised at runtime. If the active device is unplugged
+or invalidated, the receiver closes the output gate, flushes/re-primes playout,
+and retries on an available device. With no explicit device configured it
+follows system-default changes; an explicit device is preferred and the
+receiver temporarily falls back to the system default while that device is
+unavailable. The CPAL callback remains lock-free during these transitions.
+
 ```toml
 [audio]
 backend = "cpal"
