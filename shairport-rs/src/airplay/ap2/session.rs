@@ -27,7 +27,9 @@
 use std::{fmt, net::IpAddr, sync::Arc};
 
 use crate::airplay::ap2::contract::{Ap2StreamType, Ap2TimingProtocol};
-use crate::airplay::buffered_audio::BufferedStreamContext;
+use crate::airplay::{
+    buffered_audio::BufferedStreamContext, realtime_audio::RealtimeStreamContext,
+};
 use crate::codec::AudioFormat;
 
 /// Maximum number of concurrent AP2 streams per session.
@@ -512,17 +514,10 @@ pub enum Ap2StreamConfig {
         /// Decimal seed used for data cipher derivation.
         seed: u64,
     },
-    /// Realtime audio stream (type 96) — not yet implemented.
-    #[allow(dead_code)]
+    /// Realtime audio stream (type 96).
     RealtimeAudio {
-        /// Negotiated audio format.
-        audio_format: AudioFormat,
-        /// Sample rate in Hz.
-        sample_rate: u32,
-        /// Frames per packet.
-        frames_per_packet: u32,
-        /// Per-stream media key (shared secret for this stream).
-        media_key: [u8; 32],
+        /// Immutable runtime shared with the UDP stream listener.
+        runtime: Arc<RealtimeStreamContext>,
     },
 }
 
@@ -532,8 +527,8 @@ impl Drop for Ap2StreamConfig {
             Self::BufferedAudio { .. } => {
                 // BufferedStreamContext zeroizes on final Arc drop.
             }
-            Self::RealtimeAudio { media_key, .. } => {
-                media_key.fill(0);
+            Self::RealtimeAudio { .. } => {
+                // RealtimeStreamContext zeroizes on final Arc drop.
             }
             Self::Data { .. } => {
                 // No secret key material in the Data variant.
@@ -553,16 +548,11 @@ impl std::fmt::Debug for Ap2StreamConfig {
                 .field("media_key", &"[REDACTED]")
                 .finish(),
             Self::Data { .. } => f.debug_struct("Data").finish_non_exhaustive(),
-            Self::RealtimeAudio {
-                audio_format,
-                sample_rate,
-                frames_per_packet,
-                ..
-            } => f
+            Self::RealtimeAudio { runtime } => f
                 .debug_struct("RealtimeAudio")
-                .field("audio_format", audio_format)
-                .field("sample_rate", sample_rate)
-                .field("frames_per_packet", frames_per_packet)
+                .field("audio_format", &runtime.audio_format)
+                .field("sample_rate", &runtime.sample_rate)
+                .field("frames_per_packet", &runtime.frames_per_packet)
                 .field("media_key", &"[REDACTED]")
                 .finish(),
         }
@@ -610,7 +600,7 @@ impl Ap2Stream {
     pub fn audio_format(&self) -> Option<AudioFormat> {
         match &self.config {
             Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.audio_format),
-            Ap2StreamConfig::RealtimeAudio { audio_format, .. } => Some(*audio_format),
+            Ap2StreamConfig::RealtimeAudio { runtime } => Some(runtime.audio_format),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -619,7 +609,7 @@ impl Ap2Stream {
     pub fn sample_rate(&self) -> Option<u32> {
         match &self.config {
             Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.sample_rate),
-            Ap2StreamConfig::RealtimeAudio { sample_rate, .. } => Some(*sample_rate),
+            Ap2StreamConfig::RealtimeAudio { runtime } => Some(runtime.sample_rate),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -628,9 +618,7 @@ impl Ap2Stream {
     pub fn frames_per_packet(&self) -> Option<u32> {
         match &self.config {
             Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.frames_per_packet),
-            Ap2StreamConfig::RealtimeAudio {
-                frames_per_packet, ..
-            } => Some(*frames_per_packet),
+            Ap2StreamConfig::RealtimeAudio { runtime } => Some(runtime.frames_per_packet),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -639,7 +627,7 @@ impl Ap2Stream {
     pub fn media_key(&self) -> Option<&[u8; 32]> {
         match &self.config {
             Ap2StreamConfig::BufferedAudio { runtime } => Some(runtime.media_key()),
-            Ap2StreamConfig::RealtimeAudio { media_key, .. } => Some(media_key),
+            Ap2StreamConfig::RealtimeAudio { runtime } => Some(runtime.media_key()),
             Ap2StreamConfig::Data { .. } => None,
         }
     }
@@ -978,6 +966,17 @@ impl Ap2SessionState {
         self.streams.iter().find(|s| s.stream_type == stream_type)
     }
 
+    /// Find the configured AP2 audio stream, whether buffered (103) or
+    /// realtime (96). The receiver permits only one audio stream per session.
+    pub fn find_audio_stream(&self) -> Option<&Ap2Stream> {
+        self.streams.iter().find(|s| {
+            matches!(
+                s.stream_type,
+                Ap2StreamType::BufferedAudio | Ap2StreamType::RealtimeAudio
+            )
+        })
+    }
+
     /// Begin recording (audio playback active).
     ///
     /// Requires at least one configured stream and a valid phase.
@@ -1113,9 +1112,7 @@ impl Ap2SessionState {
         for stream in &mut self.streams {
             match &mut stream.config {
                 Ap2StreamConfig::BufferedAudio { .. } => {}
-                Ap2StreamConfig::RealtimeAudio { media_key, .. } => {
-                    media_key.fill(0);
-                }
+                Ap2StreamConfig::RealtimeAudio { .. } => {}
                 Ap2StreamConfig::Data { .. } => {}
             }
         }
@@ -1665,8 +1662,14 @@ mod tests {
     #[cfg(test)]
     fn clear_key_for_test(state: &mut Ap2SessionState) {
         for stream in &mut state.streams {
-            if let Ap2StreamConfig::BufferedAudio { runtime } = &mut stream.config {
-                Arc::get_mut(runtime).unwrap().media_key_mut().fill(0);
+            match &mut stream.config {
+                Ap2StreamConfig::BufferedAudio { runtime } => {
+                    Arc::get_mut(runtime).unwrap().media_key_mut().fill(0);
+                }
+                Ap2StreamConfig::RealtimeAudio { runtime } => {
+                    Arc::get_mut(runtime).unwrap().media_key_mut().fill(0);
+                }
+                Ap2StreamConfig::Data { .. } => {}
             }
         }
     }
@@ -2358,10 +2361,14 @@ mod tests {
                 )),
             },
             Ap2StreamType::RealtimeAudio => Ap2StreamConfig::RealtimeAudio {
-                audio_format: AudioFormat::Alac44100S16Stereo,
-                sample_rate: 44100,
-                frames_per_packet: 352,
-                media_key: [0u8; 32],
+                runtime: Arc::new(RealtimeStreamContext::new(
+                    [0u8; 32],
+                    AudioFormat::Alac44100S16Stereo,
+                    44100,
+                    352,
+                    id,
+                    None,
+                )),
             },
             Ap2StreamType::DataStream => Ap2StreamConfig::Data { seed: 0 },
         };

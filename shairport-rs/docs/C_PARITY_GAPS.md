@@ -8,7 +8,7 @@ already implements from protocol areas that are incomplete in both implementatio
 
 | Area | C implementation | Rust implementation | Priority |
 | --- | --- | --- | --- |
-| AP2 realtime audio, stream type 96 | Implemented with a UDP realtime-audio socket and `rtp_realtime_audio_receiver` (`rtsp.c`, type 96 SETUP) | Explicitly rejected; no listener is activated | High |
+| AP2 realtime audio, stream type 96 | Implemented with a UDP realtime-audio socket and `rtp_realtime_audio_receiver` (`rtsp.c`, type 96 SETUP) | Implemented with UDP RTP authentication/decrypt, immutable zeroizing stream context, and shared PTP-scheduled playout; real-device validation remains | Validation |
 | AP2 six/eight-channel audio | Supported/configurable by the C audio/FFmpeg path (`six_channel_mode`, `eight_channel_mode`, channel layouts and mixdown) | 5.1/7.1 formats are deliberately excluded from AP2 advertised buffered formats | Medium |
 | AP2 output channel mapping | C supports named FFmpeg channel layouts, explicit channel maps and automatic mixdown | Rust has basic remap/mixdown but no equivalent configurable channel-layout/mapping surface | Medium |
 | AP1 resend policy tuning | C exposes first/check/last resend timings and diagnostic disable controls | Rust implements resend handling but does not expose the equivalent policy controls | Low |
@@ -19,7 +19,7 @@ already implements from protocol areas that are incomplete in both implementatio
 These should not be counted as features the Rust rewrite lost:
 
 - **AP2 NTP timing:** the C path explicitly logs that NTP stream handling is not implemented (`rtsp.c` around the NTP initial SETUP branch). Rust also rejects AP2 NTP audio.
-- **Type-130 MediaRemote/MRP:** C creates the Remote Control data port and cipher context, but there is no data-socket consumer/MediaRemote decoder in the C tree. Rust has encrypted DataStream framing/sync handling but likewise does not decode/dispatch MediaRemote protobuf messages.
+- **Type-130 MediaRemote/MRP:** C creates the Remote Control data port and cipher context, but there is no data-socket consumer/MediaRemote decoder in the C tree. Rust now goes further: encrypted DataStream framing/sync plus an outbound Play/Pause/Toggle/Stop/Next/Previous MediaRemote command subset are implemented. Full inbound MediaRemote state/protobuf decoding remains incomplete.
 - **FairPlay:** both implementations use the known `/fp-setup` reply material and consume the `shk` supplied during stream SETUP. Neither tree contains a complete independent FairPlay key-exchange implementation.
 
 ## Audio/output gaps
@@ -60,13 +60,14 @@ The C MPRIS handler sends `pause` through DACP (`mpris-service.c` calls
 endpoint when `DACP-ID` and `Active-Remote` are present. A regression test verifies the actual request
 is written to the sender endpoint.
 
-For AP2 clients that do not expose DACP, true sender-side Pause will require implementing MediaRemote
-control over the type-130 DataStream. That is a new protocol capability rather than C-parity work.
+For AP2 clients that do not expose DACP, Rust now falls back to the connected type-130 DataStream and
+sends a MediaRemote Pause command. DACP remains preferred when available to avoid duplicate source
+commands. Full inbound MediaRemote state handling remains future protocol work rather than C-parity work.
 
 ## Recommended implementation order
 
 1. Keep real iPhone/macOS AP2 interoperability as the primary exit test for the existing type-103/PTP path.
-2. Implement type-130 MediaRemote decode/encode sufficiently for play/pause/next/previous when DACP is absent.
-3. Port AP2 realtime stream type 96 from the C receiver into the Rust playout/scheduler architecture.
+2. Validate type-96 realtime audio and type-130 outbound MediaRemote controls against real iPhone/macOS senders.
+3. Extend type-130 with inbound MediaRemote device/now-playing/supported-command state handling as required by captures.
 4. Add six/eight-channel advertisement, decode and configurable channel-layout/mixdown support.
 5. Add operational integrations in demand order: native D-Bus, metadata outputs/MQTT, then backend-specific audio/DSP features.

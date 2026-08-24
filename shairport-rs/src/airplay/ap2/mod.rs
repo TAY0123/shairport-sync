@@ -26,6 +26,7 @@ pub mod capability;
 pub mod contract;
 pub mod data;
 pub mod event;
+pub mod mrp;
 pub mod request;
 pub mod response;
 pub mod session;

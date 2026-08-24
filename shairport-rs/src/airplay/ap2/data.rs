@@ -1,8 +1,9 @@
 //! AirPlay 2 encrypted data-stream transport (stream type 130).
 //!
 //! The channel is used by remote-control-only sessions. It implements the
-//! verified transport envelope and mandatory `sync` acknowledgement, but it
-//! deliberately does not decode or dispatch MediaRemote protobuf messages.
+//! verified transport envelope, mandatory `sync` acknowledgement, and the
+//! outbound MediaRemote playback-command subset used by the local/system media
+//! control surfaces.
 //!
 //! A data frame consists of a 32-byte big-endian header followed by an
 //! optional binary-plist payload:
@@ -24,15 +25,24 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::Mutex,
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Mutex, broadcast},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-use crate::airplay::crypto::{CipherError, PairCipher};
+use crate::{
+    airplay::{
+        ap2::mrp::{self, MrpCommand},
+        crypto::{CipherError, PairCipher},
+    },
+    state::AppState,
+};
 
 /// Size of the unencrypted data-stream header.
 pub const DATA_HEADER_LEN: usize = 32;
@@ -50,6 +60,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SYNC_PREFIX: &[u8; 4] = b"sync";
 const REPLY_TYPE: [u8; 12] = [b'r', b'p', b'l', b'y', 0, 0, 0, 0, 0, 0, 0, 0];
 const EMPTY_COMMAND: [u8; 4] = [0; 4];
+const COMMAND_TYPE: [u8; 12] = [b's', b'y', b'n', b'c', 0, 0, 0, 0, 0, 0, 0, 0];
+const COMMAND_NAME: [u8; 4] = *b"comm";
 
 type SharedDataCipher = Arc<Mutex<PairCipher>>;
 
@@ -76,6 +88,8 @@ pub enum DataStreamError {
     PlaintextPendingTooLarge,
     #[error("invalid binary-plist payload")]
     InvalidPlist,
+    #[error("failed to serialize outbound binary-plist payload")]
+    OutboundPlist,
 }
 
 /// Parsed 32-byte data-stream header.
@@ -159,6 +173,21 @@ pub fn build_sync_reply(seqno: u64) -> Vec<u8> {
     build_frame(&REPLY_TYPE, &EMPTY_COMMAND, seqno, &[])
 }
 
+fn build_mrp_command_frame(seqno: u64, command: MrpCommand) -> Result<Vec<u8>, DataStreamError> {
+    let protobuf = mrp::encode_send_command(command);
+    let mut params = plist::Dictionary::new();
+    params.insert("data".into(), plist::Value::Data(protobuf));
+    let mut root = plist::Dictionary::new();
+    root.insert("params".into(), plist::Value::Dictionary(params));
+    let mut payload = Vec::new();
+    plist::to_writer_binary(&mut payload, &plist::Value::Dictionary(root))
+        .map_err(|_| DataStreamError::OutboundPlist)?;
+    if payload.len() > MAX_PLIST_PAYLOAD {
+        return Err(DataStreamError::FrameTooLarge);
+    }
+    Ok(build_frame(&COMMAND_TYPE, &COMMAND_NAME, seqno, &payload))
+}
+
 fn build_frame(message_type: &[u8], command: &[u8], seqno: u64, payload: &[u8]) -> Vec<u8> {
     let total_size = DATA_HEADER_LEN
         .checked_add(payload.len())
@@ -221,6 +250,36 @@ impl DataStreamListener {
         seed: u64,
         timeout_duration: Duration,
     ) -> std::io::Result<(u16, Self)> {
+        Self::bind_inner(bind_addr, shared_secret, seed, timeout_duration, None)
+    }
+
+    /// Bind a type-130 transport that can also emit MediaRemote playback
+    /// commands from [`AppState`]. The command subscription is created only
+    /// after a peer connects, so callers never report source-control success
+    /// merely because a listener is idle.
+    pub fn bind_with_state(
+        bind_addr: SocketAddr,
+        shared_secret: Arc<Zeroizing<Vec<u8>>>,
+        seed: u64,
+        timeout_duration: Duration,
+        state: AppState,
+    ) -> std::io::Result<(u16, Self)> {
+        Self::bind_inner(
+            bind_addr,
+            shared_secret,
+            seed,
+            timeout_duration,
+            Some(state),
+        )
+    }
+
+    fn bind_inner(
+        bind_addr: SocketAddr,
+        shared_secret: Arc<Zeroizing<Vec<u8>>>,
+        seed: u64,
+        timeout_duration: Duration,
+        command_state: Option<AppState>,
+    ) -> std::io::Result<(u16, Self)> {
         if shared_secret.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -244,7 +303,12 @@ impl DataStreamListener {
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let listener = TcpListener::from_std(listener)?;
-        let parent = tokio::spawn(run_listener(listener, cipher, timeout_duration));
+        let parent = tokio::spawn(run_listener(
+            listener,
+            cipher,
+            timeout_duration,
+            command_state,
+        ));
         Ok((port, Self { parent, port }))
     }
 
@@ -291,7 +355,12 @@ impl Drop for WorkerGuard {
     }
 }
 
-async fn run_listener(listener: TcpListener, cipher: SharedDataCipher, timeout_duration: Duration) {
+async fn run_listener(
+    listener: TcpListener,
+    cipher: SharedDataCipher,
+    timeout_duration: Duration,
+    command_state: Option<AppState>,
+) {
     let mut worker = WorkerGuard::default();
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -303,8 +372,9 @@ async fn run_listener(listener: TcpListener, cipher: SharedDataCipher, timeout_d
         };
         worker.terminate_current().await;
         let cipher = Arc::clone(&cipher);
+        let command_state = command_state.clone();
         let next = tokio::spawn(async move {
-            if let Err(error) = data_worker(stream, cipher, timeout_duration).await {
+            if let Err(error) = data_worker(stream, cipher, timeout_duration, command_state).await {
                 warn!(%peer, %error, "AP2 data worker closed");
             }
         });
@@ -313,57 +383,139 @@ async fn run_listener(listener: TcpListener, cipher: SharedDataCipher, timeout_d
     }
 }
 
-async fn data_worker(
-    mut stream: TcpStream,
-    cipher: SharedDataCipher,
+async fn read_with_deadline(
+    reader: &mut OwnedReadHalf,
+    read_buf: &mut [u8],
+    partial_deadline: Option<Instant>,
+    timeout_duration: Duration,
+) -> Result<usize, DataStreamError> {
+    match partial_deadline {
+        Some(deadline) => timeout_at(deadline, reader.read(read_buf))
+            .await
+            .map_err(|_| DataStreamError::Timeout)?
+            .map_err(DataStreamError::Io),
+        None => timeout(timeout_duration, reader.read(read_buf))
+            .await
+            .map_err(|_| DataStreamError::Timeout)?
+            .map_err(DataStreamError::Io),
+    }
+}
+
+async fn send_encrypted_frame(
+    writer: &mut OwnedWriteHalf,
+    cipher: &SharedDataCipher,
+    frame: &[u8],
     timeout_duration: Duration,
 ) -> Result<(), DataStreamError> {
+    let mut cipher = cipher.lock().await;
+    let prepared = cipher.prepare_encryption(frame)?;
+    timeout(timeout_duration, writer.write_all(prepared.ciphertext()))
+        .await
+        .map_err(|_| DataStreamError::Timeout)??;
+    prepared.commit();
+    Ok(())
+}
+
+async fn data_worker(
+    stream: TcpStream,
+    cipher: SharedDataCipher,
+    timeout_duration: Duration,
+    command_state: Option<AppState>,
+) -> Result<(), DataStreamError> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut command_rx = command_state.as_ref().map(AppState::subscribe_mrp_commands);
+    let mut command_seqno = 0x1_0000_0000u64 | u64::from(rand::random::<u32>());
     let mut encrypted_pending = Vec::new();
     let mut plaintext_pending = Vec::new();
     let mut read_buf = [0u8; 8192];
     let mut partial_deadline: Option<Instant> = None;
 
     loop {
-        let read = match partial_deadline {
-            Some(deadline) => timeout_at(deadline, stream.read(&mut read_buf))
-                .await
-                .map_err(|_| DataStreamError::Timeout)??,
-            None => timeout(timeout_duration, stream.read(&mut read_buf))
-                .await
-                .map_err(|_| DataStreamError::Timeout)??,
-        };
-        if read == 0 {
-            if encrypted_pending.is_empty() && plaintext_pending.is_empty() {
-                return Ok(());
+        let action = if let Some(rx) = command_rx.as_mut() {
+            tokio::select! {
+                read = read_with_deadline(
+                    &mut reader,
+                    &mut read_buf,
+                    partial_deadline,
+                    timeout_duration,
+                ) => WorkerAction::Read(read?),
+                command = rx.recv() => match command {
+                    Ok(command) => WorkerAction::Command(command),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "AP2 MediaRemote command queue lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        command_rx = None;
+                        continue;
+                    }
+                },
             }
-            return Err(DataStreamError::UnexpectedEof);
-        }
-        if partial_deadline.is_none() {
-            partial_deadline = Some(Instant::now() + timeout_duration);
-        }
-        checked_append_encrypted(&mut encrypted_pending, &read_buf[..read])?;
-
-        let (plaintext, consumed) = {
-            let mut cipher = cipher.lock().await;
-            cipher.decrypt_blocks(&encrypted_pending)?
+        } else {
+            WorkerAction::Read(
+                read_with_deadline(
+                    &mut reader,
+                    &mut read_buf,
+                    partial_deadline,
+                    timeout_duration,
+                )
+                .await?,
+            )
         };
-        if consumed > 0 {
-            encrypted_pending.drain(..consumed);
-            checked_append_plaintext(&mut plaintext_pending, &plaintext)?;
-        }
 
-        process_complete_frames(
-            &mut stream,
-            &cipher,
-            &mut plaintext_pending,
-            timeout_duration,
-        )
-        .await?;
+        match action {
+            WorkerAction::Command(command) => {
+                let frame = build_mrp_command_frame(command_seqno, command)?;
+                send_encrypted_frame(&mut writer, &cipher, &frame, timeout_duration).await?;
+                debug!(
+                    seqno = command_seqno,
+                    command = ?command,
+                    "AP2 MediaRemote command sent"
+                );
+                command_seqno = command_seqno.wrapping_add(1);
+                continue;
+            }
+            WorkerAction::Read(read) => {
+                if read == 0 {
+                    if encrypted_pending.is_empty() && plaintext_pending.is_empty() {
+                        return Ok(());
+                    }
+                    return Err(DataStreamError::UnexpectedEof);
+                }
+                if partial_deadline.is_none() {
+                    partial_deadline = Some(Instant::now() + timeout_duration);
+                }
+                checked_append_encrypted(&mut encrypted_pending, &read_buf[..read])?;
 
-        if encrypted_pending.is_empty() && plaintext_pending.is_empty() {
-            partial_deadline = None;
+                let (plaintext, consumed) = {
+                    let mut cipher = cipher.lock().await;
+                    cipher.decrypt_blocks(&encrypted_pending)?
+                };
+                if consumed > 0 {
+                    encrypted_pending.drain(..consumed);
+                    checked_append_plaintext(&mut plaintext_pending, &plaintext)?;
+                }
+
+                process_complete_frames(
+                    &mut writer,
+                    &cipher,
+                    &mut plaintext_pending,
+                    timeout_duration,
+                )
+                .await?;
+
+                if encrypted_pending.is_empty() && plaintext_pending.is_empty() {
+                    partial_deadline = None;
+                }
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WorkerAction {
+    Read(usize),
+    Command(MrpCommand),
 }
 
 fn checked_append_encrypted(target: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DataStreamError> {
@@ -391,7 +543,7 @@ fn checked_append_plaintext(target: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Da
 }
 
 async fn process_complete_frames(
-    stream: &mut TcpStream,
+    writer: &mut OwnedWriteHalf,
     cipher: &SharedDataCipher,
     plaintext_pending: &mut Vec<u8>,
     timeout_duration: Duration,
@@ -420,12 +572,7 @@ async fn process_complete_frames(
 
         if header.is_sync() {
             let reply = build_sync_reply(header.seqno);
-            let mut cipher = cipher.lock().await;
-            let prepared = cipher.prepare_encryption(&reply)?;
-            timeout(timeout_duration, stream.write_all(prepared.ciphertext()))
-                .await
-                .map_err(|_| DataStreamError::Timeout)??;
-            prepared.commit();
+            send_encrypted_frame(writer, cipher, &reply, timeout_duration).await?;
         }
     }
 }
@@ -433,6 +580,7 @@ async fn process_complete_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use tokio::time::sleep;
 
     const SEED: u64 = 123_456_789;
@@ -638,6 +786,51 @@ mod tests {
             Err(DataStreamError::PlaintextPendingTooLarge)
         ));
         assert_eq!(plaintext.len(), MAX_PLAINTEXT_PENDING);
+    }
+
+    #[tokio::test]
+    async fn connected_worker_sends_encrypted_mrp_pause_command() {
+        let state = AppState::new(Config::default());
+        let (port, listener) = DataStreamListener::bind_with_state(
+            "127.0.0.1:0".parse().unwrap(),
+            test_secret(),
+            SEED,
+            Duration::from_secs(2),
+            state.clone(),
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut client = PairCipher::data_for_client(test_secret().as_slice(), SEED);
+
+        timeout(Duration::from_secs(1), async {
+            while state.mrp_command_receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("type-130 worker never subscribed for MRP commands");
+
+        assert!(state.send_mrp_command(MrpCommand::Pause));
+        let frame = read_encrypted_frame(&mut stream, &mut client).await;
+        let header = DataHeader::parse(&frame).unwrap().unwrap();
+        assert_eq!(header.message_type(), b"sync");
+        assert_eq!(header.command(), b"comm");
+        assert!(header.seqno >= 0x1_0000_0000);
+
+        let payload = &frame[DATA_HEADER_LEN..];
+        let plist = plist::from_bytes::<plist::Dictionary>(payload).unwrap();
+        let protobuf = plist
+            .get("params")
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|params| params.get("data"))
+            .and_then(plist::Value::as_data)
+            .expect("missing params.data protobuf");
+        assert_eq!(
+            &protobuf[1..9],
+            &[0x08, 0x01, 0x20, 0x00, 0x32, 0x02, 0x08, 0x02]
+        );
+        assert_eq!(protobuf[0] as usize, protobuf.len() - 1);
+        listener.abort();
     }
 
     #[tokio::test]

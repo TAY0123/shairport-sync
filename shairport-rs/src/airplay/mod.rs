@@ -5,6 +5,7 @@ pub mod dacp;
 pub mod metadata;
 pub mod pairing;
 pub mod playout_decoder;
+pub mod realtime_audio;
 pub mod rtp;
 pub mod rtsp;
 pub mod sdp;

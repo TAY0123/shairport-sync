@@ -1049,7 +1049,7 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
     ///
     /// [`Accepted`]: InsertResult::Accepted
     pub fn insert_packet(&mut self, packet: TimedPacket) -> InsertResult {
-        if packet.protocol == super::packet::StreamProtocol::AirPlay2Buffered {
+        if packet.protocol.is_airplay2_audio() {
             self.maybe_install_hard_recovery_anchor(packet.rtp_timestamp);
         }
 
@@ -1198,13 +1198,14 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                     let pkt_clone = pkt.clone();
                     let seq = pkt_clone.extended_sequence;
                     let packet_rtp = pkt_clone.rtp_timestamp;
-                    let packet_is_ap2 =
+                    let packet_is_ap2 = pkt_clone.protocol.is_airplay2_audio();
+                    let packet_is_buffered =
                         pkt_clone.protocol == super::packet::StreamProtocol::AirPlay2Buffered;
                     if packet_is_ap2 {
                         self.maybe_install_hard_recovery_anchor(packet_rtp);
                     }
 
-                    if packet_is_ap2 && self.packet_is_in_flush_range(&pkt_clone) {
+                    if packet_is_buffered && self.packet_is_in_flush_range(&pkt_clone) {
                         match self.jitter.take_expected() {
                             TakeExpectedResult::Packet(_) => {}
                             _ => unreachable!("peek gave Packet but take did not"),

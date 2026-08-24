@@ -1,14 +1,12 @@
 # AirPlay 2 API Conformance Matrix
 
-**Target profile:** PTP + buffered audio (type 103), and
-**remote-control-only** with encrypted data stream (type 130).
+**Target profile:** PTP + buffered audio (type 103), PTP + realtime audio
+(type 96), and **remote-control-only** with encrypted data stream (type 130).
 
-Realtime audio (type 96), NTP timing, and bare `None` timing (without
-`isRemoteControlOnly`) are **truthfully rejected** — the SETUP handler
-returns `status=1` for unsupported stream types and `400 Bad Request`
-for unsupported timing protocols. Remote-control-only sessions
-(`timingProtocol=None` with `isRemoteControlOnly=true`) are accepted
-when paired and AP2 is enabled; PTP is not required for this path.
+NTP timing and bare `None` timing (without `isRemoteControlOnly`) are
+**truthfully rejected** with `400 Bad Request`. Remote-control-only sessions
+(`timingProtocol=None` with `isRemoteControlOnly=true`) are accepted when
+paired and AP2 is enabled; PTP is not required for this path.
 
 ## Capability policy
 
@@ -148,10 +146,11 @@ are always idempotent.
 
 ### Stream management
 
-`Ap2Stream` owns an immutable buffered-audio context (stream and connection
-IDs, audio format, sample rate, frames-per-packet, zeroizing media key) plus
-its data port. Buffered workers receive this context directly and do not read
-media keys or formats from global application state.
+`Ap2Stream` owns an immutable audio runtime context (buffered type 103 or
+realtime type 96) containing stream and connection IDs, audio format, sample
+rate, frames-per-packet, and a zeroizing media key, plus its data port. Audio
+workers receive this context directly and do not read media keys or formats
+from global application state.
 Up to `MAX_AP2_STREAMS` (8) concurrent streams are supported.
 `add_stream` and `remove_stream` are explicit methods that preserve
 the current phase when adding/removing streams from `Recording` or
@@ -207,9 +206,9 @@ clears its own AP2 secrets.
 
 | Type | Num | Transport | Status                              |
 |------|-----|-----------|-------------------------------------|
-| Real-time audio | 96  | —         | Rejected (status=1). No listener.   |
-| Buffered audio  | 103 | TCP       | Framing, decrypt, decode, and bounded enqueue work; timed playout remains partial. |
-| Data stream     | 130 | TCP       | Encrypted channel for remote-control-only sessions. Sync reply protocol implemented. MediaRemote protobuf decoding/dispatch remains unsupported. |
+| Real-time audio | 96  | UDP       | RTP + ChaCha20-Poly1305 authentication/decrypt, sequence extension, decode and shared PTP-scheduled playout implemented; real-device interoperability remains pending. |
+| Buffered audio  | 103 | TCP       | Framing, decrypt, decode, bounded enqueue and PTP-scheduled playout implemented; long-duration real-device validation remains pending. |
+| Data stream     | 130 | TCP       | Encrypted channel for remote-control-only sessions. Sync reply plus outbound MediaRemote Play/Pause/Toggle/Stop/Next/Previous commands are implemented. Full inbound MediaRemote protobuf/state handling remains unsupported. |
 
 ## Pairing & control framing guarantees
 
@@ -316,22 +315,25 @@ RTSP control buffers are bounded at 16 MiB plaintext and 64 KiB
 pending encrypted data. The larger plaintext limit accommodates metadata
 and artwork bodies; exceeding either limit drops the connection.
 
-## Known gaps (target profile: PTP + buffered 103)
+## Known gaps
 
-1. **Realtime audio (type 96).**  The SETUP handler returns `status=1`
-   without opening any listener.  No runtime resources are consumed.
+1. **Realtime audio (type 96) real-device validation.**  SETUP now opens a
+   dedicated UDP listener, authenticates/decrypts the C-compatible RTP wire
+   format using the negotiated `shk`, and feeds the same PTP scheduler as type
+   103. A negotiated-loopback integration test covers the data path; iPhone/
+   macOS interoperability and sustained timing validation remain exit criteria.
 
 2. **NTP / None timing.**  The initial audio SETUP returns `400 Bad Request`.
    Only `"PTP"` is accepted for audio. Complete rate anchors are converted
    to local monotonic deadlines through the selected-master servo; output
    remains gated until lock, watermark, and presentation time all agree.
 
-3. **Data stream MediaRemote decoding.**  The encrypted data stream
-   (type 130) transport and sync reply protocol are implemented.
-   Binary-plist payload shape is inspected for diagnostics, but
-   protobuf messages (`DEVICE_INFO_MESSAGE`, etc.) are not decoded
-   or dispatched.  The channel is fully operational as a transport;
-   only the MRP-level message handling is missing.
+3. **Full DataStream MediaRemote state handling.**  The encrypted data stream
+   (type 130) transport, sync reply protocol, and outbound playback-command
+   subset (Play/Pause/Toggle/Stop/Next/Previous) are implemented. Binary-plist
+   payload shape is inspected for diagnostics, but inbound protobuf state such
+   as `DEVICE_INFO_MESSAGE`, now-playing state and supported-command updates is
+   not yet decoded/dispatched.
 
 4. **FairPlay (`/fp-setup`).** The observed two-stage exchange is validated
    strictly by version, message type, mode, declared length, and sequence,
@@ -352,7 +354,7 @@ and artwork bodies; exceeding either limit drops the connection.
 6. **`/command`.**  Encrypted plist commands are decrypted and
    parsed for playback control (play/pause/stop/toggle), volume,
    and metadata updates.  Screen mirroring, Siri, and advanced
-   MediaRemote commands are not handled.
+   advanced MediaRemote state/command families are not handled.
 
 7. **`/feedback` and `/audioMode`.** The captured sender sends `/feedback`
    without a body. While the owning session is recording a buffered stream,
@@ -440,7 +442,7 @@ The `rtsp.rs` AP2 SETUP tests cover:
   encrypted packet using the exact `shk` supplied in stream SETUP
 - Actual ingress/jitter-capacity-derived `audioBufferSize`
 - Single buffered-stream enforcement and transactional listener rollback
-- Realtime type 96 rejection (status=1, no listener, no activation)
+- Realtime type 96 happy-path (UDP ports + immutable runtime + encrypted RTP packet reaching shared ingress)
 - Data type 130 rejection without remote-control-only session (455)
 - Remote-control-only None timing + isRemoteControlOnly SETUP
 - Unknown stream type rejection (status=1)
@@ -476,7 +478,7 @@ The `crypto.rs` module contains **23 focused tests** covering:
 - Client/server control cipher cross-direction round-trip
 - Fragmented header at every byte boundary (accumulator pattern)
 
-The `ap2/data.rs` module contains **17 focused tests** covering:
+The `ap2/data.rs` module contains focused tests covering:
 - Exact 32-byte big-endian header parsing and canonical field prefixes
 - Header fragmentation at every boundary, size limits, and zero padding
 - Exact `sync` → `rply` bytes and sequence-number preservation
@@ -485,7 +487,8 @@ The `ap2/data.rs` module contains **17 focused tests** covering:
 - Real encrypted TCP sync round-trip with bytewise fragmentation
 - Reconnect counter continuity and authentication-failure retry
 - Sequential worker replacement and active-worker abort/drop cleanup
-- Fixed partial-frame deadlines, non-sync no-reply behavior, and safe errors
+- Fixed partial-frame deadlines, non-sync no-reply behavior, safe errors, and
+  encrypted outbound MediaRemote playback commands
 
 Route-level RTSP integration tests additionally cover:
 - Actual control-only initial SETUP with an encrypted event listener
@@ -494,7 +497,7 @@ Route-level RTSP integration tests additionally cover:
 - Strict/transactional seed, dedicated-socket, and control-type rejection
 - Duplicate SETUP rollback, data-only TEARDOWN, and full session cleanup
 
-Full test count: **788** tests passing (`cargo test --all-targets`).
+Full test count: **796** tests passing (`cargo test --all-targets`).
 
 Contract and pure validation tests do not open sockets. The event/data
 transport and RTSP lifecycle integration tests intentionally use loopback TCP
