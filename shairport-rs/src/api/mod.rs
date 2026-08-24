@@ -459,6 +459,7 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use serde_json::Value;
+    use tokio::io::AsyncReadExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -560,6 +561,45 @@ mod tests {
                 .unwrap()
                 .contains("remote control unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn system_media_pause_is_forwarded_to_airplay_client_via_dacp() {
+        let config = Config::default();
+        let state = AppState::new(config.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+
+        state.set_remote_control_session(
+            Some("A1B2C3D4".to_string()),
+            Some("123456789".to_string()),
+            Some(endpoint),
+        );
+        state.set_dacp_endpoint(Some(endpoint));
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
+        let context = ApiContext::new(
+            state.clone(),
+            AudioManager::new(config.audio.clone()),
+            audio_engine,
+            MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
+            dacp,
+        );
+
+        assert!(context.dispatch_system_media_command("pause").await);
+        let request = server.await.unwrap();
+
+        assert!(request.starts_with("GET /ctrl-int/1/pause HTTP/1.1\r\n"));
+        assert!(request.contains("Active-Remote: 123456789\r\n"));
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
     }
 
     #[tokio::test]

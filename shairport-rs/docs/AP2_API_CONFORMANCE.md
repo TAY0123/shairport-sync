@@ -494,7 +494,7 @@ Route-level RTSP integration tests additionally cover:
 - Strict/transactional seed, dedicated-socket, and control-type rejection
 - Duplicate SETUP rollback, data-only TEARDOWN, and full session cleanup
 
-Full test count: **787** tests passing (`cargo test --all-targets`).
+Full test count: **788** tests passing (`cargo test --all-targets`).
 
 Contract and pure validation tests do not open sockets. The event/data
 transport and RTSP lifecycle integration tests intentionally use loopback TCP
