@@ -26,3 +26,10 @@ enabled = true
 backend = "embedded"
 event_port = 319
 general_port = 320
+
+[system_media]
+# Publish now-playing metadata and accept OS media keys via MPRIS/SMTC/Control Center.
+enabled = true
+identity = "Shairport RS"
+bus_name = "ShairportRS"
+desktop_entry = "shairport-rs"

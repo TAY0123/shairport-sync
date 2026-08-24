@@ -3564,6 +3564,7 @@ fn apply_airplay_volume(
 
     let applied_db = requested_db.clamp(-144.0, 0.0);
     state.set_airplay_volume(applied_db);
+    state.set_volume(applied_db);
     audio_engine.set_volume_db(applied_db);
     debug!(volume_db = applied_db, source, "AirPlay volume applied");
 }

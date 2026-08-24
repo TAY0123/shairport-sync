@@ -75,6 +75,31 @@ ASIO support is feature-gated:
 cargo build --manifest-path shairport-rs/Cargo.toml --features asio
 ```
 
+## System media controls
+
+System media integration is enabled by default. It publishes now-playing metadata,
+playback state, artwork, and progress to Linux MPRIS, Windows System Media Transport
+Controls (SMTC), and macOS Now Playing / Remote Command Center. Play, pause, toggle,
+stop, next, and previous commands are routed through the same local/DACP command path
+as the HTTP API. Linux MPRIS volume changes control the receiver's local output gain.
+The receiver publishes `can_seek = false` and ignores seek requests because it does not
+own the sender's timeline.
+
+The integration is optional and non-fatal. On headless Linux systems without a user
+D-Bus session, for example, AirPlay playback continues even if MPRIS registration is
+unavailable. Disable the integration completely with `enabled = false`:
+
+```toml
+[system_media]
+enabled = true
+identity = "Shairport RS"
+bus_name = "ShairportRS"      # Linux: org.mpris.MediaPlayer2.ShairportRS
+desktop_entry = "shairport-rs" # Linux .desktop basename; optional for generic icon
+```
+
+Windows uses a hidden message window owned by shairport-rs for SMTC. macOS starts an
+accessory `NSApplication` and services its main run loop without showing a Dock icon.
+
 ## Local HTTP API
 
 The API is intended for the bundled web UI and local automation.

@@ -115,6 +115,25 @@ impl ApiContext {
         self.playout = Some(playout);
         self
     }
+
+    pub(crate) async fn dispatch_system_media_command(&self, command: &str) -> bool {
+        apply_remote_command(self, command.to_string())
+            .await
+            .accepted
+    }
+
+    pub(crate) fn set_system_volume_linear(&self, volume: f64) {
+        if !volume.is_finite() {
+            return;
+        }
+        let db = if volume <= 0.0 {
+            -144.0
+        } else {
+            (20.0 * volume.clamp(f64::MIN_POSITIVE, 1.0).log10()).clamp(-144.0, 0.0)
+        };
+        self.state.set_volume(db);
+        self.audio_engine.set_volume_db(db);
+    }
 }
 
 pub fn router(context: ApiContext) -> Router {

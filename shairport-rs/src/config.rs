@@ -15,6 +15,7 @@ pub struct Config {
     pub mdns: MdnsConfig,
     pub audio: AudioConfig,
     pub ptp: PtpConfig,
+    pub system_media: SystemMediaConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -163,6 +164,19 @@ pub struct PtpConfig {
     pub general_port: u16,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SystemMediaConfig {
+    /// Publish now-playing information and accept host OS media-key commands.
+    pub enabled: bool,
+    /// Human-readable player name shown by the host OS.
+    pub identity: String,
+    /// Linux MPRIS D-Bus suffix (`org.mpris.MediaPlayer2.<bus_name>`).
+    pub bus_name: String,
+    /// Linux desktop-entry basename used by GNOME/KDE for player identity/icon.
+    pub desktop_entry: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PtpBackendName {
@@ -250,6 +264,17 @@ impl Default for PtpConfig {
             backend: PtpBackendName::Embedded,
             event_port: 319,
             general_port: 320,
+        }
+    }
+}
+
+impl Default for SystemMediaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            identity: "Shairport RS".to_string(),
+            bus_name: "ShairportRS".to_string(),
+            desktop_entry: "shairport-rs".to_string(),
         }
     }
 }
@@ -362,6 +387,40 @@ mod tests {
         .unwrap();
         assert!(configured.airplay.password_required());
         assert_eq!(configured.airplay.pairing_pin(), "1234");
+    }
+
+    #[test]
+    fn system_media_defaults_enabled_and_can_be_disabled() {
+        let defaults: Config = toml::from_str("").unwrap();
+        assert!(defaults.system_media.enabled);
+        assert_eq!(defaults.system_media.identity, "Shairport RS");
+        assert_eq!(defaults.system_media.bus_name, "ShairportRS");
+
+        let disabled: Config = toml::from_str(
+            r#"
+            [system_media]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        assert!(!disabled.system_media.enabled);
+    }
+
+    #[test]
+    fn system_media_public_config_shape_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            [system_media]
+            enabled = true
+            identity = "Living Room Receiver"
+            bus_name = "LivingRoomReceiver"
+            desktop_entry = "shairport-rs"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.system_media.identity, "Living Room Receiver");
+        assert_eq!(config.system_media.bus_name, "LivingRoomReceiver");
+        assert_eq!(config.system_media.desktop_entry, "shairport-rs");
     }
 
     #[test]
