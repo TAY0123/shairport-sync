@@ -39,6 +39,7 @@ use crate::{
         buffered_audio::{BufferedStreamContext, advertised_audio_buffer_size},
         crypto::{IdentityKey, PairCipher},
         dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
+        realtime_audio::RealtimeStreamContext,
         transcript::TranscriptRecorder,
     },
     audio::AudioEngine,
@@ -723,16 +724,13 @@ fn perform_connection_cleanup(
     session: &mut RtspSession,
 ) {
     state.clear_ptp_master_if_owner(session.connection_id);
-    let had_buffered_stream = session
-        .ap2
-        .find_stream_by_type(Ap2StreamType::BufferedAudio)
-        .is_some();
+    let had_audio_stream = session.ap2.find_audio_stream().is_some();
     // Call begin_teardown + close idempotently.
     let _ = session.ap2.begin_teardown();
 
     if session.is_playback_owner {
         player.stop();
-        if had_buffered_stream {
+        if had_audio_stream {
             playout.clear_stream();
         } else {
             playout.stop();
@@ -1066,13 +1064,13 @@ fn route_request(
         ("SETRATEANCHORTI", _) | ("SETRATEANCHORTIME", _) => {
             let Some(sample_rate) = session
                 .ap2
-                .find_stream_by_type(Ap2StreamType::BufferedAudio)
+                .find_audio_stream()
                 .and_then(Ap2Stream::sample_rate)
             else {
                 return response(455, "Method Not Valid in This State")
                     .header(
                         "X-Reason",
-                        "type-103 stream must be configured before anchor",
+                        "AP2 audio stream must be configured before anchor",
                     )
                     .with_cseq(request);
             };
@@ -1253,7 +1251,7 @@ fn route_request(
                 state.set_diagnostic("ap2_play_enabled", "pending-anchor");
                 let audio_latency = session
                     .ap2
-                    .find_stream_by_type(Ap2StreamType::BufferedAudio)
+                    .find_audio_stream()
                     .and_then(Ap2Stream::sample_rate)
                     .map(|sample_rate| playout.start_latency_frames(sample_rate))
                     .unwrap_or(0);
@@ -1365,16 +1363,16 @@ fn route_request(
                         return response(200, "OK").with_cseq(request);
                     }
 
-                    // Stop global playback only if this is the last buffered audio stream.
-                    let had_buffered = session
-                        .ap2
-                        .find_stream_by_type(Ap2StreamType::BufferedAudio)
-                        .is_some();
-                    let is_last_buffered = had_buffered
-                        && stream_type == Ap2StreamType::BufferedAudio
+                    // Stop global playback when the negotiated AP2 audio stream is removed.
+                    let is_audio_stream = matches!(
+                        stream_type,
+                        Ap2StreamType::BufferedAudio | Ap2StreamType::RealtimeAudio
+                    );
+                    let is_last_audio = is_audio_stream
+                        && session.ap2.find_audio_stream().is_some()
                         && session.ap2.stream_count() == 1;
 
-                    if session.is_playback_owner && is_last_buffered {
+                    if session.is_playback_owner && is_last_audio {
                         player.stop();
                         playout.clear_stream();
                         state.set_player_state(PlayerState::Stopped);
@@ -1386,11 +1384,11 @@ fn route_request(
                         let stream_id = stream.stream_id;
                         session.ap2.remove_stream(stream_id);
                     }
-                    if stream_type == Ap2StreamType::BufferedAudio {
+                    if is_audio_stream {
                         session.fairplay = FairPlayState::NotStarted;
                     }
 
-                    if session.is_playback_owner && is_last_buffered {
+                    if session.is_playback_owner && is_last_audio {
                         player.flush();
                         state.clear_track_for_transition();
                         state.set_diagnostic("audio_waiting_for_track_title", "true");
@@ -1404,13 +1402,10 @@ fn route_request(
                     state.clear_ptp_master_if_owner(session.connection_id);
                     let _ = session.ap2.begin_teardown();
 
-                    let had_buffered_stream = session
-                        .ap2
-                        .find_stream_by_type(Ap2StreamType::BufferedAudio)
-                        .is_some();
+                    let had_audio_stream = session.ap2.find_audio_stream().is_some();
                     if session.is_playback_owner {
                         player.stop();
-                        if had_buffered_stream {
+                        if had_audio_stream {
                             playout.clear_stream();
                         } else {
                             playout.stop();
@@ -2122,12 +2117,22 @@ impl RtspSession {
         Ok(port)
     }
 
-    fn ensure_realtime_audio_listener(&mut self) -> anyhow::Result<u16> {
+    fn ensure_realtime_audio_listener(
+        &mut self,
+        state: &AppState,
+        playout: &PlayoutHandle,
+        context: Arc<RealtimeStreamContext>,
+    ) -> anyhow::Result<u16> {
         if let Some(port) = self.realtime_audio_port {
             return Ok(port);
         }
         let bind = self.receiver_bind_addr();
-        let (port, handle) = spawn_ap2_control_receiver(bind)?;
+        let (port, handle) = crate::airplay::realtime_audio::spawn_realtime_audio_receiver(
+            bind,
+            state.clone(),
+            playout.clone(),
+            context,
+        )?;
         self.realtime_audio_port = Some(port);
         self.realtime_audio_listener = Some(handle);
         Ok(port)
@@ -2140,11 +2145,13 @@ impl Drop for RtspSession {
     }
 }
 
-/// Handle a type-103 (buffered audio) stream SETUP.
+/// Handle an AP2 PTP audio stream SETUP (type 103 buffered or type 96 realtime).
 ///
-/// Extracted from the main dispatch to keep the handler readable.
+/// Both stream types share strict FairPlay/key/format/lifecycle validation and
+/// the same PTP-aware playout scheduler; only their ingress transport differs.
 #[allow(clippy::too_many_arguments)]
-fn handle_ap2_setup_type_103(
+fn handle_ap2_setup_audio_stream(
+    stream_type: Ap2StreamType,
     config: &AirplayConfig,
     state: &AppState,
     session: &mut RtspSession,
@@ -2156,12 +2163,17 @@ fn handle_ap2_setup_type_103(
     ap2_policy: &Ap2CapabilityPolicy,
 ) -> RtspResponse {
     let _ = config; // used indirectly via state/playout
+    let (expected_type, stream_label) = match stream_type {
+        Ap2StreamType::BufferedAudio => (103u32, "buffered"),
+        Ap2StreamType::RealtimeAudio => (96u32, "realtime"),
+        Ap2StreamType::DataStream => unreachable!("data stream uses dedicated SETUP handler"),
+    };
     state.set_diagnostic("ap2_phase", "stream-setup");
     if !session.fairplay.is_complete() {
         return response(455, "Method Not Valid in This State")
             .header(
                 "X-Reason",
-                "FairPlay setup must complete before type-103 SETUP",
+                format!("FairPlay setup must complete before type-{expected_type} SETUP"),
             )
             .with_cseq(request);
     }
@@ -2240,7 +2252,7 @@ fn handle_ap2_setup_type_103(
             })
         });
 
-        let mut valid = type_val == 103 && ap2_policy.supports_stream_type(type_val);
+        let mut valid = type_val == expected_type && ap2_policy.supports_stream_type(type_val);
         if valid {
             match format {
                 Some(fmt) => {
@@ -2301,7 +2313,8 @@ fn handle_ap2_setup_type_103(
                 stream_connection_id_type,
                 compression_type_valid,
                 latency_fields_valid,
-                "AP2 type-103 stream failed pre-validation"
+                expected_type,
+                "AP2 audio stream failed pre-validation"
             );
         }
         any_invalid = any_invalid || !valid;
@@ -2376,13 +2389,9 @@ fn handle_ap2_setup_type_103(
             .header("X-Reason", format!("duplicate stream ID: {stream_id}"))
             .with_cseq(request);
     }
-    if session
-        .ap2
-        .find_stream_by_type(Ap2StreamType::BufferedAudio)
-        .is_some()
-    {
+    if session.ap2.find_audio_stream().is_some() {
         return response(455, "Method Not Valid in This State")
-            .header("X-Reason", "only one buffered audio stream is supported")
+            .header("X-Reason", "only one AP2 audio stream is supported")
             .with_cseq(request);
     }
 
@@ -2396,17 +2405,40 @@ fn handle_ap2_setup_type_103(
     let stream_connection_id = raw_stream
         .get("streamConnectionID")
         .and_then(plist_opaque_u64);
-    let runtime = Arc::new(BufferedStreamContext::new(
-        *stream_key,
-        audio_format,
-        sample_rate,
-        frames_per_packet,
-        stream_id,
-        stream_connection_id,
-    ));
+    enum AudioRuntime {
+        Buffered(Arc<BufferedStreamContext>),
+        Realtime(Arc<RealtimeStreamContext>),
+    }
+    let runtime = match stream_type {
+        Ap2StreamType::BufferedAudio => {
+            AudioRuntime::Buffered(Arc::new(BufferedStreamContext::new(
+                *stream_key,
+                audio_format,
+                sample_rate,
+                frames_per_packet,
+                stream_id,
+                stream_connection_id,
+            )))
+        }
+        Ap2StreamType::RealtimeAudio => {
+            AudioRuntime::Realtime(Arc::new(RealtimeStreamContext::new(
+                *stream_key,
+                audio_format,
+                sample_rate,
+                frames_per_packet,
+                stream_id,
+                stream_connection_id,
+            )))
+        }
+        Ap2StreamType::DataStream => unreachable!("validated audio stream"),
+    };
 
     let had_control = session.ap2_control_port.is_some();
-    let had_buffered = session.buffered_audio_port.is_some();
+    let had_audio_listener = match stream_type {
+        Ap2StreamType::BufferedAudio => session.buffered_audio_port.is_some(),
+        Ap2StreamType::RealtimeAudio => session.realtime_audio_port.is_some(),
+        Ap2StreamType::DataStream => false,
+    };
     let control_port = match session.ensure_ap2_control_socket() {
         Ok(port) => port,
         Err(e) => {
@@ -2415,10 +2447,18 @@ fn handle_ap2_setup_type_103(
         }
     };
 
-    let data_port = match session.ensure_buffered_audio_listener(state, playout, runtime.clone()) {
+    let data_port_result = match &runtime {
+        AudioRuntime::Buffered(runtime) => {
+            session.ensure_buffered_audio_listener(state, playout, Arc::clone(runtime))
+        }
+        AudioRuntime::Realtime(runtime) => {
+            session.ensure_realtime_audio_listener(state, playout, Arc::clone(runtime))
+        }
+    };
+    let data_port = match data_port_result {
         Ok(port) => port,
         Err(e) => {
-            warn!(%e, "failed to open AP2 buffered audio TCP socket");
+            warn!(%e, expected_type, "failed to open AP2 audio stream socket");
             if !had_control {
                 if let Some(handle) = session.ap2_control_listener.take() {
                     handle.abort();
@@ -2429,25 +2469,31 @@ fn handle_ap2_setup_type_103(
         }
     };
 
+    let stream_config = match runtime {
+        AudioRuntime::Buffered(runtime) => Ap2StreamConfig::BufferedAudio { runtime },
+        AudioRuntime::Realtime(runtime) => Ap2StreamConfig::RealtimeAudio { runtime },
+    };
     let ap2_stream = Ap2Stream {
         stream_id,
         stream_connection_id,
-        stream_type: Ap2StreamType::BufferedAudio,
-        config: Ap2StreamConfig::BufferedAudio { runtime },
+        stream_type,
+        config: stream_config,
         data_port,
         state: Ap2StreamState::Configured,
     };
 
     let mut stream_dict = plist::Dictionary::new();
-    stream_dict.insert("type".to_string(), plist_uint_value(103u64));
+    stream_dict.insert("type".to_string(), plist_uint_value(expected_type as u64));
     stream_dict.insert("controlPort".to_string(), plist_uint_value(control_port));
     stream_dict.insert("dataPort".to_string(), plist_uint_value(data_port));
-    stream_dict.insert(
-        "audioBufferSize".to_string(),
-        plist_uint_value(advertised_audio_buffer_size(
-            playout.buffered_packet_capacity(),
-        )),
-    );
+    if stream_type == Ap2StreamType::BufferedAudio {
+        stream_dict.insert(
+            "audioBufferSize".to_string(),
+            plist_uint_value(advertised_audio_buffer_size(
+                playout.buffered_packet_capacity(),
+            )),
+        );
+    }
 
     let mut response_dict = plist::Dictionary::new();
     response_dict.insert(
@@ -2457,8 +2503,8 @@ fn handle_ap2_setup_type_103(
     let mut body = Vec::new();
     if plist::to_writer_binary(&mut body, &plist::Value::Dictionary(response_dict.clone())).is_err()
     {
-        if !had_buffered {
-            session.abort_ap2_stream_listener(Ap2StreamType::BufferedAudio);
+        if !had_audio_listener {
+            session.abort_ap2_stream_listener(stream_type);
         }
         if !had_control {
             if let Some(handle) = session.ap2_control_listener.take() {
@@ -2471,8 +2517,8 @@ fn handle_ap2_setup_type_103(
 
     if let Err(e) = session.ap2.add_stream(ap2_stream) {
         warn!(%e, "AP2 stream SETUP rejected — cannot add stream");
-        if !had_buffered {
-            session.abort_ap2_stream_listener(Ap2StreamType::BufferedAudio);
+        if !had_audio_listener {
+            session.abort_ap2_stream_listener(stream_type);
         }
         if !had_control {
             if let Some(handle) = session.ap2_control_listener.take() {
@@ -2496,7 +2542,7 @@ fn handle_ap2_setup_type_103(
         if let Err(e) = session.ap2.begin_recording() {
             warn!(%e, "AP2 stream committed but pending RECORD could not activate");
             session.ap2.remove_stream(stream_id);
-            session.abort_ap2_stream_listener(Ap2StreamType::BufferedAudio);
+            session.abort_ap2_stream_listener(stream_type);
             playout.clear_stream();
             return response(455, "Method Not Valid in This State")
                 .header("X-Reason", format!("cannot activate pending RECORD: {e}"))
@@ -2533,8 +2579,13 @@ fn handle_ap2_setup_type_103(
     if session.ap2.phase() != Ap2SessionPhase::Recording {
         state.set_player_state(PlayerState::Paused);
     }
-    state.set_diagnostic("ap2_stream_type", "buffered");
-    state.set_diagnostic("ap2_buffered_audio_port", data_port.to_string());
+    state.set_diagnostic("ap2_stream_type", stream_label);
+    let port_diagnostic = if stream_type == Ap2StreamType::BufferedAudio {
+        "ap2_buffered_audio_port"
+    } else {
+        "ap2_realtime_audio_port"
+    };
+    state.set_diagnostic(port_diagnostic, data_port.to_string());
     state.set_diagnostic("ap2_control_port", control_port.to_string());
     state.set_diagnostic("ap2_shk_len", shk.len().to_string());
     if let Some(ct) = raw_stream.get("ct").and_then(plist_uint) {
@@ -2542,7 +2593,7 @@ fn handle_ap2_setup_type_103(
     }
     info!(
         data_port,
-        control_port, stream_id, "AP2 buffered audio stream committed"
+        control_port, stream_id, expected_type, "AP2 audio stream committed"
     );
 
     debug!(stream_count = 1, "AP2 stream SETUP response built");
@@ -2697,11 +2748,12 @@ fn handle_ap2_setup_type_130(
     let bind_addr = event_bind_addr(session.local_addr, local_ip);
 
     let secret = Arc::new(Zeroizing::new(shared_secret.to_vec()));
-    let (data_port, data_listener) = match DataStreamListener::bind(
+    let (data_port, data_listener) = match DataStreamListener::bind_with_state(
         bind_addr,
         secret,
         seed,
         crate::airplay::ap2::data::DEFAULT_TIMEOUT,
+        state.clone(),
     ) {
         Ok((port, listener)) => (port, listener),
         Err(e) => {
@@ -2826,10 +2878,48 @@ fn handle_ap2_setup_with_transcript(
                     config, state, session, &setup, streams, request, ap2_policy,
                 );
             }
+            Some(103) => {
+                return handle_ap2_setup_audio_stream(
+                    Ap2StreamType::BufferedAudio,
+                    config,
+                    state,
+                    session,
+                    &setup,
+                    streams,
+                    request,
+                    playout,
+                    dacp,
+                    ap2_policy,
+                );
+            }
+            Some(96) => {
+                return handle_ap2_setup_audio_stream(
+                    Ap2StreamType::RealtimeAudio,
+                    config,
+                    state,
+                    session,
+                    &setup,
+                    streams,
+                    request,
+                    playout,
+                    dacp,
+                    ap2_policy,
+                );
+            }
             _ => {
-                // Existing type 103 (buffered audio) path, or unsupported.
-                return handle_ap2_setup_type_103(
-                    config, state, session, &setup, streams, request, playout, dacp, ap2_policy,
+                // Run unknown/malformed types through the strict audio validator
+                // to preserve the transactional 400 response shape.
+                return handle_ap2_setup_audio_stream(
+                    Ap2StreamType::BufferedAudio,
+                    config,
+                    state,
+                    session,
+                    &setup,
+                    streams,
+                    request,
+                    playout,
+                    dacp,
+                    ap2_policy,
                 );
             }
         }
@@ -3683,18 +3773,20 @@ fn handle_feedback(session: &RtspSession, request: &RtspRequest) -> RtspResponse
     if session.ap2.phase() != Ap2SessionPhase::Recording {
         return response(200, "OK");
     }
-    let Some(stream) = session
-        .ap2
-        .find_stream_by_type(Ap2StreamType::BufferedAudio)
-    else {
+    let Some(stream) = session.ap2.find_audio_stream() else {
         return response(200, "OK");
     };
     let Some(sample_rate) = stream.sample_rate() else {
         return response(200, "OK");
     };
+    let stream_type = match stream.stream_type {
+        Ap2StreamType::BufferedAudio => 103u64,
+        Ap2StreamType::RealtimeAudio => 96u64,
+        Ap2StreamType::DataStream => unreachable!("find_audio_stream returned data stream"),
+    };
 
     let mut stream_feedback = plist::Dictionary::new();
-    stream_feedback.insert("type".to_string(), plist_uint_value(103u64));
+    stream_feedback.insert("type".to_string(), plist_uint_value(stream_type));
     stream_feedback.insert("sr".to_string(), plist::Value::Real(f64::from(sample_rate)));
     let mut feedback = plist::Dictionary::new();
     feedback.insert(
@@ -4311,6 +4403,10 @@ impl RtspResponse {
 mod tests {
     use super::*;
     use crate::playout::scheduler::{PlayoutCommand, PlayoutHandle};
+    use chacha20poly1305::{
+        ChaCha20Poly1305, KeyInit,
+        aead::{Aead, Payload},
+    };
     use rsa::pkcs1v15::Pkcs1v15Sign;
     use std::{sync::Arc, time::Duration};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -5577,15 +5673,22 @@ mod tests {
     // ── Realtime type 96 / Data type 130 rejection ──────────────────────
 
     #[tokio::test]
-    async fn ap2_setup_realtime_type96_rejected_no_listener_activation() {
+    async fn ap2_setup_realtime_type96_returns_udp_ports_and_runtime() {
         let mut config = crate::config::Config::default();
         config.airplay.airplay2_enabled = true;
-        config.airplay.control_port = 6001;
         let state = AppState::new(config.clone());
         let mut session = RtspSession::default();
+        session.ap2.mark_paired().unwrap();
+        session
+            .ap2
+            .configure_timing(Ap2TimingProtocol::Ptp, None, None)
+            .unwrap();
 
         let mut stream = plist::Dictionary::new();
         stream.insert("type".to_string(), plist_uint_value(96u64));
+        stream.insert("shk".to_string(), plist::Value::Data(vec![9u8; 32]));
+        stream.insert("audioFormat".to_string(), plist_uint_value(0x0080_0000u64));
+        stream.insert("spf".to_string(), plist_uint_value(1024u64));
         let mut setup = plist::Dictionary::new();
         setup.insert(
             "streams".to_string(),
@@ -5602,7 +5705,7 @@ mod tests {
         };
 
         let dacp = DacpController::disabled(state.clone());
-        let (playout, _cmd_rx, _ingress_rx) = test_playout();
+        let (playout, mut cmd_rx, mut ingress_rx) = test_playout();
         let policy = test_policy();
         let response = handle_ap2_setup(
             &config.airplay,
@@ -5613,27 +5716,100 @@ mod tests {
             &dacp,
             &policy,
         );
-        // Whole-request atomic rejection: returns 400 with binary plist body.
-        assert_eq!(response.code, 400);
+        assert_eq!(response.code, 200);
         let parsed: plist::Dictionary = plist::from_bytes(&response.body).unwrap();
         let streams = parsed
             .get("streams")
             .and_then(plist::Value::as_array)
             .unwrap();
         let first = streams[0].as_dictionary().unwrap();
-
         assert_eq!(first.get("type").and_then(plist_uint), Some(96));
-        assert_eq!(first.get("status").and_then(plist_uint), Some(1));
-        // No dataPort or controlPort — listeners were never opened.
-        assert!(first.get("dataPort").is_none());
-        assert!(first.get("controlPort").is_none());
-        // State must NOT be activated.
-        assert!(!state.snapshot().active);
-        // Diagnostics record rejection.
+        let data_port = first.get("dataPort").and_then(plist_uint).unwrap();
+        let control_port = first.get("controlPort").and_then(plist_uint).unwrap();
+        assert!(data_port > 0);
+        assert!(control_port > 0);
+        assert_ne!(data_port, control_port);
+        assert!(first.get("audioBufferSize").is_none());
+
+        let configured = session
+            .ap2
+            .find_stream_by_type(Ap2StreamType::RealtimeAudio)
+            .unwrap();
+        assert_eq!(configured.media_key(), Some(&[9u8; 32]));
         assert_eq!(
-            state.snapshot().diagnostics.get("ap2_stream_setup"),
-            Some(&"rejected-pre-validation".to_string())
+            configured.audio_format(),
+            Some(AudioFormat::Aac48000F24Stereo)
         );
+        assert_eq!(configured.sample_rate(), Some(48_000));
+        assert_eq!(configured.frames_per_packet(), Some(1024));
+        assert_eq!(session.realtime_audio_port, Some(data_port as u16));
+        assert!(session.realtime_audio_listener.is_some());
+        assert_eq!(
+            drain_cmds(&mut cmd_rx),
+            vec![PlayoutCommand::ConfigureStream(Ap2StreamRuntime {
+                stream_id: configured.stream_id,
+                stream_connection_id: configured.stream_connection_id,
+                audio_format: AudioFormat::Aac48000F24Stereo,
+                sample_rate: 48_000,
+                frames_per_packet: 1024,
+            })]
+        );
+
+        // Send one C-compatible encrypted realtime RTP packet to the negotiated
+        // UDP data port and prove it reaches the shared AP2 ingress unchanged
+        // after authentication/decryption.
+        let key = [9u8; 32];
+        let sequence = 0x1234u16;
+        let timestamp = 0x1020_3040u32;
+        let ssrc = 0x5060_7080u32;
+        let nonce_suffix = 0x1122_3344_5566_7788u64.to_be_bytes();
+        let compressed = b"realtime compressed frame";
+        let mut header = [0u8; 12];
+        header[0] = 0x80;
+        header[1] = 0x60;
+        header[2..4].copy_from_slice(&sequence.to_be_bytes());
+        header[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        header[8..12].copy_from_slice(&ssrc.to_be_bytes());
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&nonce_suffix);
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: compressed,
+                    aad: &header[4..12],
+                },
+            )
+            .unwrap();
+        let mut udp_packet = header.to_vec();
+        udp_packet.extend_from_slice(&ciphertext);
+        udp_packet.extend_from_slice(&nonce_suffix);
+        let target_ip = session.receiver_bind_addr().ip();
+        let sender_bind = match target_ip {
+            IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            IpAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
+        };
+        let sender = tokio::net::UdpSocket::bind(sender_bind).await.unwrap();
+        sender
+            .send_to(&udp_packet, SocketAddr::new(target_ip, data_port as u16))
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(1), ingress_rx.recv())
+            .await
+            .expect("realtime packet did not reach playout ingress")
+            .expect("playout ingress closed");
+        assert_eq!(
+            received.protocol,
+            crate::playout::packet::StreamProtocol::AirPlay2Realtime
+        );
+        assert_eq!(received.raw_sequence, u32::from(sequence));
+        assert_eq!(received.extended_sequence, u64::from(sequence));
+        assert_eq!(received.rtp_timestamp, timestamp);
+        assert_eq!(received.ssrc, ssrc);
+        assert_eq!(received.format, Some(AudioFormat::Aac48000F24Stereo));
+        assert_eq!(received.payload.as_ref(), compressed);
     }
 
     #[tokio::test]
@@ -6525,15 +6701,15 @@ mod tests {
         let features_from_info = parsed.get("features").and_then(plist_uint).unwrap();
         assert_eq!(features_from_info, policy.features);
 
-        // supportedFormats must contain audioStream (always 0) and bufferStream
+        // supportedFormats must match the implemented realtime and buffered policies
         let fmts = parsed
             .get("supportedFormats")
             .and_then(plist::Value::as_dictionary)
             .unwrap();
         assert_eq!(
             fmts.get("audioStream").and_then(plist_uint),
-            Some(0),
-            "realtime audio stream must always be 0"
+            Some(policy.audio_stream_formats),
+            "realtime audio formats must match capability policy"
         );
         assert!(fmts.get("bufferStream").and_then(plist_uint).unwrap_or(0) != 0);
         assert_eq!(

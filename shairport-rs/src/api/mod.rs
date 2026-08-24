@@ -12,7 +12,10 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 
 use crate::{
-    airplay::dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
+    airplay::{
+        ap2::mrp::MrpCommand,
+        dacp::{DacpController, dacp_command_for_alias, is_navigation_alias},
+    },
     audio::{
         AudioEngine, AudioEngineStatus, AudioManager, AudioOutputController,
         SelectAudioDeviceRequest,
@@ -301,18 +304,34 @@ async fn apply_remote_command(context: &ApiContext, command: String) -> CommandR
                     ),
                 };
             }
-            Err(err) if local_applied && !is_navigation_alias(&command) => {
-                return CommandResponse {
-                    accepted: true,
-                    command,
-                    message: format!("command applied locally; source control failed: {err}"),
-                };
-            }
-            Err(err) => {
+            Err(dacp_error) => {
+                if MrpCommand::from_alias(&command)
+                    .is_some_and(|mrp_command| context.state.send_mrp_command(mrp_command))
+                {
+                    if is_navigation_alias(&command) {
+                        context.audio_engine.set_playback_enabled(false);
+                        context.state.clear_track_for_transition();
+                    }
+                    return CommandResponse {
+                        accepted: true,
+                        command,
+                        message: "command sent to source via AirPlay 2 MediaRemote".to_string(),
+                    };
+                }
+
+                if local_applied && !is_navigation_alias(&command) {
+                    return CommandResponse {
+                        accepted: true,
+                        command,
+                        message: format!(
+                            "command applied locally; source control failed: {dacp_error}"
+                        ),
+                    };
+                }
                 return CommandResponse {
                     accepted: false,
                     command,
-                    message: err.to_string(),
+                    message: dacp_error.to_string(),
                 };
             }
         }
@@ -561,6 +580,28 @@ mod tests {
                 .unwrap()
                 .contains("remote control unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn system_media_pause_falls_back_to_connected_ap2_mrp() {
+        let config = Config::default();
+        let state = AppState::new(config.clone());
+        let mut mrp_rx = state.subscribe_mrp_commands();
+        let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
+        let context = ApiContext::new(
+            state.clone(),
+            AudioManager::new(config.audio.clone()),
+            audio_engine,
+            MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
+            dacp,
+        );
+
+        let response = apply_remote_command(&context, "pause".to_string()).await;
+        assert!(response.accepted);
+        assert!(response.message.contains("AirPlay 2 MediaRemote"));
+        assert_eq!(mrp_rx.recv().await.unwrap(), MrpCommand::Pause);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
     }
 
     #[tokio::test]

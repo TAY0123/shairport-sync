@@ -159,7 +159,7 @@ fn packet_matches_epoch(packet_epoch: u64, current_epoch: u64) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Ap2SubmitResult {
+pub(crate) enum Ap2SubmitResult {
     StaleEpoch,
     Accepted,
     Full,
@@ -171,7 +171,7 @@ enum Ap2SubmitResult {
 /// The helper validates the track-transition epoch immediately before the
 /// awaited send, records synthetic RTP diagnostics only for accepted packets,
 /// and publishes shared-ingress depth/drop counters to [`AppState`].
-async fn submit_ap2_packet(
+pub(crate) async fn submit_ap2_packet(
     state: &AppState,
     playout: &PlayoutHandle,
     packet: TimedPacket,

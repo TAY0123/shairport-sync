@@ -12,7 +12,11 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::{airplay::session_crypto::SessionCrypto, audio::AudioDevice, config::Config};
+use crate::{
+    airplay::{ap2::mrp::MrpCommand, session_crypto::SessionCrypto},
+    audio::AudioDevice,
+    config::Config,
+};
 
 /// Runtime-only AP1 remote transport endpoints (control + timing).
 /// Not serialized — reconstructed from SETUP Transport header at runtime.
@@ -26,6 +30,7 @@ pub struct Ap1RemoteEndpoints {
 pub struct AppState {
     inner: Arc<RwLock<StateSnapshot>>,
     events: broadcast::Sender<StateSnapshot>,
+    mrp_commands: broadcast::Sender<MrpCommand>,
     /// Classic AirPlay per-session AES key + IV (from SDP ANNOUNCE).
     pub session_crypto: Arc<RwLock<Option<SessionCrypto>>>,
     pub alac_magic_cookie: Arc<RwLock<Option<Vec<u8>>>>,
@@ -150,6 +155,7 @@ pub enum SyncQuality {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let (events, _) = broadcast::channel(64);
+        let (mrp_commands, _) = broadcast::channel(32);
         let snapshot = StateSnapshot {
             active: false,
             player_state: PlayerState::Stopped,
@@ -191,6 +197,7 @@ impl AppState {
         Self {
             inner: Arc::new(RwLock::new(snapshot)),
             events,
+            mrp_commands,
             session_crypto: Arc::new(RwLock::new(None)),
             alac_magic_cookie: Arc::new(RwLock::new(None)),
             alac_sample_rate: Arc::new(RwLock::new(None)),
@@ -206,6 +213,22 @@ impl AppState {
 
     pub fn snapshot(&self) -> StateSnapshot {
         self.inner.read().clone()
+    }
+
+    /// Subscribe to outbound AP2 MediaRemote commands. A live subscription is
+    /// owned only by an active type-130 DataStream worker, so send failure is a
+    /// reliable indication that no MRP transport is currently connected.
+    pub fn subscribe_mrp_commands(&self) -> broadcast::Receiver<MrpCommand> {
+        self.mrp_commands.subscribe()
+    }
+
+    /// Queue a playback command for the active AP2 MediaRemote DataStream.
+    pub fn send_mrp_command(&self, command: MrpCommand) -> bool {
+        self.mrp_commands.send(command).is_ok()
+    }
+
+    pub fn mrp_command_receiver_count(&self) -> usize {
+        self.mrp_commands.receiver_count()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateSnapshot> {

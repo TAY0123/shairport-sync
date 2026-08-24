@@ -115,7 +115,6 @@ pub struct Ap2CapabilityPolicy {
     /// Playable buffer-stream format mask (`supportedFormats.bufferStream`).
     pub buffer_stream_formats: u64,
     /// Real-time audio-stream format mask (`supportedFormats.audioStream`).
-    /// Always 0 in this profile (realtime type 96 is not implemented).
     pub audio_stream_formats: u64,
     /// Whether AirPlay 2 is enabled in configuration.
     pub ap2_enabled: bool,
@@ -185,7 +184,7 @@ impl Ap2CapabilityPolicy {
             status_flags,
             publish_airplay,
             buffer_stream_formats: buffer_stream,
-            audio_stream_formats: 0, // realtime type 96 not implemented
+            audio_stream_formats: buffer_stream,
             ap2_enabled: airplay2,
             ptp_available,
         }
@@ -209,8 +208,8 @@ impl Ap2CapabilityPolicy {
     /// Whether the given stream type is supported (i.e. will be actioned).
     ///
     /// Returns `true` only when AP2 is enabled, PTP is confirmed available,
-    /// and the stream type is implemented.  Currently only buffered audio
-    /// (type 103) is supported via this path.
+    /// and the stream type is implemented. Buffered audio (type 103) and
+    /// realtime audio (type 96) share the PTP-timed playout path.
     ///
     /// Type 130 (data stream) support is context-dependent and checked via
     /// [`supports_remote_control_data_stream`](Self::supports_remote_control_data_stream).
@@ -220,7 +219,7 @@ impl Ap2CapabilityPolicy {
         }
         match ty {
             103 => true,  // buffered audio
-            96 => false,  // realtime audio — not implemented
+            96 => true,   // realtime audio
             130 => false, // data stream — requires remote-control-only context
             _ => false,
         }
@@ -369,12 +368,10 @@ mod tests {
     // ── supportedFormats ─────────────────────────────────────────────────
 
     #[test]
-    fn audio_stream_is_always_zero() {
+    fn audio_stream_advertises_only_playable_realtime_formats() {
         let policy = Ap2CapabilityPolicy::from_config(&base_config(), true);
-        assert_eq!(
-            policy.audio_stream_formats, 0,
-            "realtime type 96 not implemented"
-        );
+        assert_eq!(policy.audio_stream_formats, policy.buffer_stream_formats);
+        assert_ne!(policy.audio_stream_formats, 0);
     }
 
     #[test]
@@ -422,10 +419,10 @@ mod tests {
     // ── Stream type support ──────────────────────────────────────────────
 
     #[test]
-    fn supports_buffered_103_only() {
+    fn supports_buffered_103_and_realtime_96() {
         let policy = Ap2CapabilityPolicy::from_config(&base_config(), true);
         assert!(policy.supports_stream_type(103));
-        assert!(!policy.supports_stream_type(96));
+        assert!(policy.supports_stream_type(96));
         assert!(!policy.supports_stream_type(130));
         assert!(!policy.supports_stream_type(0));
         assert!(!policy.supports_stream_type(999));

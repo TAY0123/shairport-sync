@@ -8,6 +8,14 @@ pub enum StreamProtocol {
     ClassicAp1,
     /// AirPlay 2 buffered audio over TCP (ChaCha20-Poly1305 blocks).
     AirPlay2Buffered,
+    /// AirPlay 2 realtime audio over UDP (RTP + ChaCha20-Poly1305 payload).
+    AirPlay2Realtime,
+}
+
+impl StreamProtocol {
+    pub const fn is_airplay2_audio(self) -> bool {
+        matches!(self, Self::AirPlay2Buffered | Self::AirPlay2Realtime)
+    }
 }
 
 /// A decoded-and-timestamped audio packet ready for the playout scheduler.

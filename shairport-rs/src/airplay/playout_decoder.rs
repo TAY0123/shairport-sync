@@ -188,7 +188,7 @@ impl AirPlayPacketDecoder {
                     cookie: cookie_bytes,
                 })
             }
-            StreamProtocol::AirPlay2Buffered => {
+            StreamProtocol::AirPlay2Buffered | StreamProtocol::AirPlay2Realtime => {
                 let format = packet.format?;
                 Some(DecoderKey::AirPlay2Buffered { format })
             }
@@ -270,7 +270,7 @@ impl PacketDecoder for AirPlayPacketDecoder {
             Some(pkt) if pkt.protocol == StreamProtocol::ClassicAp1 => {
                 self.ap1_concealment_ctx()?
             }
-            Some(pkt) if pkt.protocol == StreamProtocol::AirPlay2Buffered => {
+            Some(pkt) if pkt.protocol.is_airplay2_audio() => {
                 Self::ap2_concealment_ctx_from_packet(pkt)?
             }
             Some(pkt) => {
