@@ -491,7 +491,7 @@ impl Default for AirplayConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:3689".to_string(),
+            bind: "127.0.0.1:36890".to_string(),
         }
     }
 }
@@ -847,6 +847,6 @@ mod tests {
         assert_eq!(resolved.mdns.hostname, "from-env"); // env > file
         assert_eq!(resolved.mdns.service_name, "From File"); // file > default
         assert!(!resolved.system_media.enabled); // env > default
-        assert_eq!(resolved.server.bind, "127.0.0.1:3689"); // default
+        assert_eq!(resolved.server.bind, "127.0.0.1:36890"); // default
     }
 }
