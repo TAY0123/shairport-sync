@@ -146,6 +146,26 @@ desktop_entry = "shairport-rs" # Linux .desktop basename; optional for generic i
 Windows uses a hidden message window owned by shairport-rs for SMTC. macOS starts an
 accessory `NSApplication` and services its main run loop without showing a Dock icon.
 
+### Windows GUI
+
+A native Windows-only WinUI 3 front end is available as `shairport-rs-gui.exe`. It is
+implemented with Microsoft's `windows-reactor` crate and is not built into the macOS or
+Linux UI path. The GUI displays receiver/playback state, AirPlay source and output
+formats, PTP status, and remote-control diagnostics, and exposes Previous, Play, Pause,
+Next, Stop, and Refresh controls through the existing local HTTP API.
+
+When launched next to `shairport-rs.exe`, the GUI starts the receiver in the background
+if its API is not already reachable. The default API is `127.0.0.1:36890`. For a custom
+local API bind, pass `--api`, for example:
+
+```powershell
+.\target\release\shairport-rs-gui.exe --api 127.0.0.1:4700
+```
+
+Pass `--config <path>` and/or `--debug` to forward those options when the GUI starts the
+receiver. Use `--no-start-backend` when the GUI should only attach to an already-running
+receiver.
+
 ## Local HTTP API
 
 The API is intended for the bundled web UI and local automation.

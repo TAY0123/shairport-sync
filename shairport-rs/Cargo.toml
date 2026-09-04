@@ -59,11 +59,15 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-reactor = "0.100"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3.2", features = ["NSDate", "NSRunLoop"] }
+
+[build-dependencies]
+windows-reactor-setup = "0.100"
 
 [dev-dependencies]
 http-body-util = "0.1"
