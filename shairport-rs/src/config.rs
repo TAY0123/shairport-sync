@@ -111,16 +111,16 @@ pub struct AudioConfig {
 }
 
 fn default_pcm_fifo_ms() -> u32 {
-    150
+    500
 }
 fn default_start_watermark_ms() -> u32 {
-    80
+    250
 }
 fn default_low_watermark_ms() -> u32 {
-    40
+    100
 }
 fn default_target_watermark_ms() -> u32 {
-    80
+    200
 }
 
 impl AudioConfig {
@@ -514,10 +514,10 @@ impl Default for AudioConfig {
             backend: AudioBackendName::Cpal,
             host: AudioHostName::Default,
             device: None,
-            pcm_fifo_ms: 150,
-            start_watermark_ms: 80,
-            low_watermark_ms: 40,
-            target_watermark_ms: 80,
+            pcm_fifo_ms: 500,
+            start_watermark_ms: 250,
+            low_watermark_ms: 100,
+            target_watermark_ms: 200,
         }
     }
 }
@@ -700,10 +700,10 @@ mod tests {
     #[test]
     fn audio_config_defaults() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.audio.pcm_fifo_ms, 150);
-        assert_eq!(config.audio.start_watermark_ms, 80);
-        assert_eq!(config.audio.low_watermark_ms, 40);
-        assert_eq!(config.audio.target_watermark_ms, 80);
+        assert_eq!(config.audio.pcm_fifo_ms, 500);
+        assert_eq!(config.audio.start_watermark_ms, 250);
+        assert_eq!(config.audio.low_watermark_ms, 100);
+        assert_eq!(config.audio.target_watermark_ms, 200);
     }
 
     #[test]

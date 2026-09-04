@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, warn};
 
 use crate::{
     airplay::txt_records::AirplayService,
@@ -33,6 +34,7 @@ pub struct MdnsAdvertiser {
     external_children: Arc<Mutex<Vec<Child>>>,
     published_services: Arc<Mutex<Vec<AirplayService>>>,
     active_backend: Arc<Mutex<Option<MdnsBackend>>>,
+    publish_lock: Arc<AsyncMutex<()>>,
 }
 
 impl MdnsBackend {
@@ -57,10 +59,14 @@ impl MdnsAdvertiser {
             external_children: Arc::new(Mutex::new(Vec::new())),
             published_services: Arc::new(Mutex::new(Vec::new())),
             active_backend: Arc::new(Mutex::new(None)),
+            publish_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
     pub async fn publish(&self, services: Vec<AirplayService>) -> anyhow::Result<()> {
+        // Serialize publication/republication so the health supervisor and API
+        // cannot race while replacing external publisher processes.
+        let _publish_guard = self.publish_lock.lock().await;
         // Store for later republish
         *self.published_services.lock() = services.clone();
         let backend = match self.backend {
@@ -100,6 +106,37 @@ impl MdnsAdvertiser {
             return Ok(());
         }
         self.publish(services).await
+    }
+
+    /// Check external publisher subprocesses and republish all services when
+    /// any child has exited or become unqueryable. Returns `true` when a
+    /// restart was performed. Builtin/off backends require no supervision.
+    pub async fn supervise_once(&self) -> anyhow::Result<bool> {
+        let Some(backend) = self.active_backend.lock().clone() else {
+            return Ok(false);
+        };
+        if !matches!(
+            backend,
+            MdnsBackend::Avahi | MdnsBackend::DnsSd | MdnsBackend::External
+        ) {
+            return Ok(false);
+        }
+
+        let unhealthy_reason = {
+            let mut children = self.external_children.lock();
+            external_children_unhealthy(&mut children)
+        };
+        let Some(reason) = unhealthy_reason else {
+            return Ok(false);
+        };
+
+        let backend_name = backend.name();
+        warn!(backend = %backend_name, %reason, "mDNS external publisher unhealthy; restarting");
+        self.republish().await.with_context(|| {
+            format!("failed to restart {backend_name} mDNS publisher after: {reason}")
+        })?;
+        info!(backend = %backend_name, "mDNS external publisher restarted");
+        Ok(true)
     }
 
     async fn publish_builtin(&self, services: Vec<AirplayService>) -> anyhow::Result<()> {
@@ -242,6 +279,26 @@ impl MdnsAdvertiser {
     }
 }
 
+fn external_children_unhealthy(children: &mut [Child]) -> Option<String> {
+    if children.is_empty() {
+        return Some("no publisher processes are running".to_string());
+    }
+
+    for child in children.iter_mut() {
+        let pid = child.id();
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return Some(format!("publisher pid {pid} exited with {status}"));
+            }
+            Err(err) => {
+                return Some(format!("publisher pid {pid} status check failed: {err}"));
+            }
+        }
+    }
+    None
+}
+
 impl MdnsBackend {
     fn is_available(&self, config: &MdnsConfig) -> bool {
         match self {
@@ -338,6 +395,25 @@ mod tests {
         assert_eq!(trim_local_domain("_airplay._tcp.local."), "_airplay._tcp");
         assert_eq!(trim_local_domain("_raop._tcp.local"), "_raop._tcp");
         assert_eq!(trim_local_domain("_raop._tcp"), "_raop._tcp");
+    }
+
+    #[test]
+    fn external_health_requires_at_least_one_publisher() {
+        let mut children = Vec::new();
+        assert!(external_children_unhealthy(&mut children).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_health_detects_exited_publisher() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn test publisher");
+        child.wait().expect("wait for test publisher");
+        let mut children = vec![child];
+        let reason = external_children_unhealthy(&mut children).expect("exited child is unhealthy");
+        assert!(reason.contains("exited"));
     }
 
     #[test]

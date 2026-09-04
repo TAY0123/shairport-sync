@@ -137,9 +137,9 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            start_watermark_ms: 80,
-            low_watermark_ms: 40,
-            target_watermark_ms: 80,
+            start_watermark_ms: 250,
+            low_watermark_ms: 100,
+            target_watermark_ms: 200,
             jitter_capacity_packets: 512,
             reorder_grace_ms: 30,
         }
@@ -3601,8 +3601,11 @@ mod tests {
     #[test]
     fn reported_start_latency_uses_configured_watermark() {
         let (handle, _cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(8);
-        assert_eq!(handle.start_latency_frames(44_100), 3_528);
-        assert_eq!(handle.start_latency_frames(48_000), 3_840);
+        let watermark_ms = SchedulerConfig::default().start_watermark_ms as u64;
+        let expected_44k = ((44_100_u64 * watermark_ms) + 999) / 1_000;
+        let expected_48k = ((48_000_u64 * watermark_ms) + 999) / 1_000;
+        assert_eq!(handle.start_latency_frames(44_100), expected_44k as u32);
+        assert_eq!(handle.start_latency_frames(48_000), expected_48k as u32);
     }
 
     #[test]
