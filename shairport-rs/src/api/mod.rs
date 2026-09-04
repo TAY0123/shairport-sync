@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use tokio::sync::broadcast;
+use tracing::debug;
 
 use crate::{
     airplay::{
@@ -48,10 +49,10 @@ pub struct MediaControlRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct CommandResponse {
-    accepted: bool,
-    command: String,
-    message: String,
+pub(crate) struct CommandResponse {
+    pub(crate) accepted: bool,
+    pub(crate) command: String,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,10 +120,8 @@ impl ApiContext {
         self
     }
 
-    pub(crate) async fn dispatch_system_media_command(&self, command: &str) -> bool {
-        apply_remote_command(self, command.to_string())
-            .await
-            .accepted
+    pub(crate) async fn dispatch_system_media_command(&self, command: &str) -> CommandResponse {
+        apply_remote_command(self, command.to_string()).await
     }
 
     pub(crate) fn set_system_volume_linear(&self, volume: f64) {
@@ -292,9 +291,23 @@ async fn apply_remote_command(context: &ApiContext, command: String) -> CommandR
         match context.dacp.send(dacp_command).await {
             Ok(result) => {
                 if is_navigation_alias(&command) {
-                    context.audio_engine.set_playback_enabled(false);
+                    stop_local_playback(context);
                     context.state.clear_track_for_transition();
                 }
+                context
+                    .state
+                    .set_diagnostic("remote_control_delivery", "dacp");
+                context.state.set_diagnostic(
+                    "remote_control_mrp_receivers",
+                    context.state.mrp_command_receiver_count().to_string(),
+                );
+                debug!(
+                    command,
+                    local_applied,
+                    endpoint = %result.endpoint,
+                    status = %result.status_line,
+                    "remote command delivered to source via DACP"
+                );
                 return CommandResponse {
                     accepted: true,
                     command,
@@ -305,13 +318,32 @@ async fn apply_remote_command(context: &ApiContext, command: String) -> CommandR
                 };
             }
             Err(dacp_error) => {
-                if MrpCommand::from_alias(&command)
-                    .is_some_and(|mrp_command| context.state.send_mrp_command(mrp_command))
-                {
+                let mrp_receivers = context.state.mrp_command_receiver_count();
+                let mrp_sent = MrpCommand::from_alias(&command)
+                    .is_some_and(|mrp_command| context.state.send_mrp_command(mrp_command));
+                context
+                    .state
+                    .set_diagnostic("remote_control_mrp_receivers", mrp_receivers.to_string());
+                context.state.set_diagnostic(
+                    "remote_control_mrp_connected",
+                    (mrp_receivers > 0).to_string(),
+                );
+
+                if mrp_sent {
                     if is_navigation_alias(&command) {
-                        context.audio_engine.set_playback_enabled(false);
+                        stop_local_playback(context);
                         context.state.clear_track_for_transition();
                     }
+                    context
+                        .state
+                        .set_diagnostic("remote_control_delivery", "airplay2-mrp");
+                    debug!(
+                        command,
+                        local_applied,
+                        mrp_receivers,
+                        dacp_error = %dacp_error,
+                        "remote command queued for source via AirPlay 2 MediaRemote"
+                    );
                     return CommandResponse {
                         accepted: true,
                         command,
@@ -319,19 +351,32 @@ async fn apply_remote_command(context: &ApiContext, command: String) -> CommandR
                     };
                 }
 
+                context
+                    .state
+                    .set_diagnostic("remote_control_delivery", "local-only");
+                debug!(
+                    command,
+                    local_applied,
+                    source_delivered = false,
+                    mrp_receivers,
+                    dacp_error = %dacp_error,
+                    "remote command source delivery unavailable"
+                );
                 if local_applied && !is_navigation_alias(&command) {
                     return CommandResponse {
                         accepted: true,
                         command,
                         message: format!(
-                            "command applied locally; source control failed: {dacp_error}"
+                            "command applied locally; source control failed: {dacp_error}; AirPlay 2 MediaRemote receivers: {mrp_receivers}"
                         ),
                     };
                 }
                 return CommandResponse {
                     accepted: false,
                     command,
-                    message: dacp_error.to_string(),
+                    message: format!(
+                        "{dacp_error}; AirPlay 2 MediaRemote receivers: {mrp_receivers}"
+                    ),
                 };
             }
         }
@@ -398,14 +443,14 @@ fn apply_local_remote_command(context: &ApiContext, command: &str) -> bool {
             true
         }
         "pause" => {
-            context.audio_engine.set_playback_enabled(false);
+            pause_local_playback(context);
             context
                 .state
                 .set_player_state(crate::state::PlayerState::Paused);
             true
         }
         "stop" => {
-            context.audio_engine.set_playback_enabled(false);
+            stop_local_playback(context);
             context
                 .state
                 .set_player_state(crate::state::PlayerState::Stopped);
@@ -413,7 +458,7 @@ fn apply_local_remote_command(context: &ApiContext, command: &str) -> bool {
         }
         "playpause" | "toggle" => match context.state.snapshot().player_state {
             crate::state::PlayerState::Playing => {
-                context.audio_engine.set_playback_enabled(false);
+                pause_local_playback(context);
                 context
                     .state
                     .set_player_state(crate::state::PlayerState::Paused);
@@ -436,14 +481,46 @@ fn enable_local_playback_when_track_ready(context: &ApiContext) -> bool {
         context
             .state
             .set_diagnostic("audio_waiting_for_track_title", "true");
-        context.audio_engine.clear_output_samples();
+        if let Some(playout) = &context.playout {
+            playout.flush();
+        } else {
+            context.audio_engine.clear_output_samples();
+        }
         return false;
     }
     context
         .state
         .set_diagnostic("audio_waiting_for_track_title", "false");
-    context.audio_engine.set_playback_enabled(true);
+    if let Some(playout) = &context.playout {
+        match playout.status().state {
+            PlayoutState::Paused => playout.resume(),
+            PlayoutState::Stopped => playout.start(),
+            PlayoutState::Priming | PlayoutState::Playing | PlayoutState::Rebuffering => {}
+        }
+    } else {
+        context.audio_engine.set_playback_enabled(true);
+    }
     true
+}
+
+fn pause_local_playback(context: &ApiContext) {
+    if let Some(playout) = &context.playout {
+        // The scheduler owns the output gate. Pausing AudioEngine directly is
+        // transient because watermark transitions can reopen that gate while
+        // the AirPlay sender continues delivering packets.
+        playout.pause();
+        playout.flush();
+    } else {
+        context.audio_engine.set_playback_enabled(false);
+    }
+}
+
+fn stop_local_playback(context: &ApiContext) {
+    if let Some(playout) = &context.playout {
+        playout.stop();
+    } else {
+        context.audio_engine.set_playback_enabled(false);
+    }
 }
 
 async fn events(State(context): State<ApiContext>, ws: WebSocketUpgrade) -> Response {
@@ -583,6 +660,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_media_pause_uses_playout_scheduler_authority() {
+        let config = Config::default();
+        let state = AppState::new(config.clone());
+        state.set_player_state(PlayerState::Playing);
+        let dacp = DacpController::disabled(state.clone());
+        let (audio_engine, _consumer) = AudioEngine::new(16);
+        let (playout, mut cmd_rx, _ingress_rx) = PlayoutHandle::command_channel_for_tests(8);
+        let context = ApiContext::new(
+            state.clone(),
+            AudioManager::new(config.audio.clone()),
+            audio_engine,
+            MdnsAdvertiser::new(MdnsBackend::Off, config.mdns),
+            dacp,
+        )
+        .with_playout(playout);
+
+        let response = apply_remote_command(&context, "pause".to_string()).await;
+        assert!(response.accepted);
+        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        assert!(matches!(
+            cmd_rx.recv().await.unwrap(),
+            crate::playout::scheduler::PlayoutCommand::Pause
+        ));
+        assert!(matches!(
+            cmd_rx.recv().await.unwrap(),
+            crate::playout::scheduler::PlayoutCommand::Flush
+        ));
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("remote_control_delivery")
+                .map(String::as_str),
+            Some("local-only")
+        );
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("remote_control_mrp_receivers")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(response.message.contains("MediaRemote receivers: 0"));
+    }
+
+    #[tokio::test]
     async fn system_media_pause_falls_back_to_connected_ap2_mrp() {
         let config = Config::default();
         let state = AppState::new(config.clone());
@@ -601,7 +724,22 @@ mod tests {
         assert!(response.accepted);
         assert!(response.message.contains("AirPlay 2 MediaRemote"));
         assert_eq!(mrp_rx.recv().await.unwrap(), MrpCommand::Pause);
-        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.player_state, PlayerState::Paused);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("remote_control_delivery")
+                .map(String::as_str),
+            Some("airplay2-mrp")
+        );
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("remote_control_mrp_receivers")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 
     #[tokio::test]
@@ -635,12 +773,25 @@ mod tests {
             dacp,
         );
 
-        assert!(context.dispatch_system_media_command("pause").await);
+        assert!(
+            context
+                .dispatch_system_media_command("pause")
+                .await
+                .accepted
+        );
         let request = server.await.unwrap();
 
         assert!(request.starts_with("GET /ctrl-int/1/pause HTTP/1.1\r\n"));
         assert!(request.contains("Active-Remote: 123456789\r\n"));
-        assert_eq!(state.snapshot().player_state, PlayerState::Paused);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.player_state, PlayerState::Paused);
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("remote_control_delivery")
+                .map(String::as_str),
+            Some("dacp")
+        );
     }
 
     #[tokio::test]

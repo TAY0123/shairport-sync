@@ -124,7 +124,12 @@ Controls (SMTC), and macOS Now Playing / Remote Command Center. Play, pause, tog
 stop, next, and previous commands are routed through the same local/DACP command path
 as the HTTP API. Linux MPRIS volume changes control the receiver's local output gain.
 The receiver publishes `can_seek = false` and ignores seek requests because it does not
-own the sender's timeline.
+own the sender's timeline. Local play/pause/stop commands are applied through the playout
+scheduler so watermark recovery cannot reopen audio after a user pause. Sender delivery
+prefers DACP and falls back to a connected AirPlay 2 type-130 MediaRemote stream. Runtime
+state diagnostics expose `remote_control_delivery`, `remote_control_dacp_headers`,
+`remote_control_mrp_connected`, and `remote_control_mrp_receivers` when troubleshooting
+source-control availability.
 
 The integration is optional and non-fatal. On headless Linux systems without a user
 D-Bus session, for example, AirPlay playback continues even if MPRIS registration is

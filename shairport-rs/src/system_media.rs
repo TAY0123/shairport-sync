@@ -196,8 +196,13 @@ impl SystemMediaIntegration {
         };
 
         if let Some(command) = command {
-            let accepted = self.context.dispatch_system_media_command(command).await;
-            debug!(command, accepted, "system media transport command handled");
+            let result = self.context.dispatch_system_media_command(command).await;
+            debug!(
+                command,
+                accepted = result.accepted,
+                message = %result.message,
+                "system media transport command handled"
+            );
         }
     }
 }

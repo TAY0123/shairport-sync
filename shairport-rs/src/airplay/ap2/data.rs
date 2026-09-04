@@ -416,6 +416,22 @@ async fn send_encrypted_frame(
     Ok(())
 }
 
+struct MrpReceiverDiagnosticGuard {
+    state: Option<AppState>,
+}
+
+impl Drop for MrpReceiverDiagnosticGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let receivers = state.mrp_command_receiver_count();
+        state.set_diagnostic("remote_control_mrp_receivers", receivers.to_string());
+        state.set_diagnostic("remote_control_mrp_connected", (receivers > 0).to_string());
+        debug!(receivers, "AP2 MediaRemote command receiver disconnected");
+    }
+}
+
 async fn data_worker(
     stream: TcpStream,
     cipher: SharedDataCipher,
@@ -423,7 +439,18 @@ async fn data_worker(
     command_state: Option<AppState>,
 ) -> Result<(), DataStreamError> {
     let (mut reader, mut writer) = stream.into_split();
+    // Declare the guard before command_rx so command_rx is dropped first and
+    // the guard observes the post-disconnect receiver count.
+    let _mrp_diagnostic_guard = MrpReceiverDiagnosticGuard {
+        state: command_state.clone(),
+    };
     let mut command_rx = command_state.as_ref().map(AppState::subscribe_mrp_commands);
+    if let Some(state) = command_state.as_ref() {
+        let receivers = state.mrp_command_receiver_count();
+        state.set_diagnostic("remote_control_mrp_receivers", receivers.to_string());
+        state.set_diagnostic("remote_control_mrp_connected", "true");
+        debug!(receivers, "AP2 MediaRemote command receiver connected");
+    }
     let mut command_seqno = 0x1_0000_0000u64 | u64::from(rand::random::<u32>());
     let mut encrypted_pending = Vec::new();
     let mut plaintext_pending = Vec::new();
