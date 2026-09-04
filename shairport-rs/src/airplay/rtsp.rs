@@ -3435,7 +3435,7 @@ fn apply_ap2_command(
             body_len = request.body.len(),
             "AP2 /command plist parsed"
         );
-        debug_ap2_mr_supported_commands(&dict);
+        log_ap2_mr_supported_commands(state, &dict);
     }
 }
 
@@ -3450,7 +3450,7 @@ fn spawn_dacp_source_command(dacp: DacpController, dacp_command: &'static str) {
     });
 }
 
-fn debug_ap2_mr_supported_commands(dict: &plist::Dictionary) {
+fn log_ap2_mr_supported_commands(state: &AppState, dict: &plist::Dictionary) {
     let Some("updateMRSupportedCommands") = dict
         .get("type")
         .and_then(plist::Value::as_string)
@@ -3463,20 +3463,24 @@ fn debug_ap2_mr_supported_commands(dict: &plist::Dictionary) {
         .and_then(plist::Value::as_dictionary)
         .and_then(|params| params.get("mrSupportedCommandsFromSender"))
     else {
-        debug!("AP2 updateMRSupportedCommands missing mrSupportedCommandsFromSender array");
+        info!("AP2 updateMRSupportedCommands missing mrSupportedCommandsFromSender array");
+        state.set_diagnostic("ap2_mr_supported_commands", "missing-array");
         return;
     };
 
     let summaries = commands
         .iter()
-        .take(12)
+        .take(16)
         .enumerate()
         .map(|(idx, command)| match command {
             plist::Value::Data(data) => debug_ap2_embedded_command_summary(idx, data),
             other => format!("{idx}:{}", plist_value_kind(other)),
         })
         .collect::<Vec<_>>();
-    debug!(
+    let summary = summaries.join("; ");
+    state.set_diagnostic("ap2_mr_supported_command_count", commands.len().to_string());
+    state.set_diagnostic("ap2_mr_supported_commands", summary);
+    info!(
         count = commands.len(),
         first = ?summaries,
         "AP2 MR supported commands from sender"
@@ -3722,7 +3726,107 @@ fn debug_ap2_embedded_command_summary(idx: usize, data: &[u8]) -> String {
         }
         return format!("{idx}:plist {}", plist_value_kind(&value));
     }
-    format!("{idx}:data len={}", data.len())
+    let protobuf =
+        summarize_protobuf_payload(data).unwrap_or_else(|| format!("unparsed len={}", data.len()));
+    format!("{idx}:protobuf {protobuf}")
+}
+
+fn summarize_protobuf_payload(data: &[u8]) -> Option<String> {
+    let body = strip_protobuf_length_prefix(data).unwrap_or(data);
+    let (fields, consumed) = summarize_protobuf_fields(body, 0, 16)?;
+    if consumed != body.len() || fields.is_empty() {
+        return None;
+    }
+    Some(format!("len={} fields=[{}]", data.len(), fields.join(",")))
+}
+
+fn strip_protobuf_length_prefix(data: &[u8]) -> Option<&[u8]> {
+    let mut offset = 0;
+    let len = usize::try_from(read_protobuf_varint(data, &mut offset)?).ok()?;
+    (offset.checked_add(len)? == data.len()).then_some(&data[offset..])
+}
+
+fn summarize_protobuf_fields(
+    data: &[u8],
+    depth: usize,
+    max_fields: usize,
+) -> Option<(Vec<String>, usize)> {
+    let mut offset = 0;
+    let mut fields = Vec::new();
+
+    while offset < data.len() && fields.len() < max_fields {
+        let key = read_protobuf_varint(data, &mut offset)?;
+        let field = key >> 3;
+        let wire = (key & 0x7) as u8;
+        if field == 0 {
+            return None;
+        }
+
+        let summary = match wire {
+            0 => {
+                let value = read_protobuf_varint(data, &mut offset)?;
+                format!("f{field}=v{value}")
+            }
+            1 => {
+                let end = offset.checked_add(8)?;
+                if end > data.len() {
+                    return None;
+                }
+                offset = end;
+                format!("f{field}=fixed64")
+            }
+            2 => {
+                let len = usize::try_from(read_protobuf_varint(data, &mut offset)?).ok()?;
+                let end = offset.checked_add(len)?;
+                if end > data.len() {
+                    return None;
+                }
+                let nested = &data[offset..end];
+                offset = end;
+
+                if depth < 1 && !nested.is_empty() {
+                    if let Some((nested_fields, nested_consumed)) =
+                        summarize_protobuf_fields(nested, depth + 1, 8)
+                    {
+                        if nested_consumed == nested.len() && !nested_fields.is_empty() {
+                            format!("f{field}=len{len}{{{}}}", nested_fields.join(","))
+                        } else {
+                            format!("f{field}=len{len}")
+                        }
+                    } else {
+                        format!("f{field}=len{len}")
+                    }
+                } else {
+                    format!("f{field}=len{len}")
+                }
+            }
+            5 => {
+                let end = offset.checked_add(4)?;
+                if end > data.len() {
+                    return None;
+                }
+                offset = end;
+                format!("f{field}=fixed32")
+            }
+            _ => return None,
+        };
+        fields.push(summary);
+    }
+
+    Some((fields, offset))
+}
+
+fn read_protobuf_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *data.get(*offset)?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn parse_flushbuffered(request: &RtspRequest) -> Result<Ap2FlushRange, &'static str> {
@@ -4455,6 +4559,49 @@ mod tests {
         assert_eq!(request.method, "SET_PARAMETER");
         assert_eq!(request.headers.get("CSeq").unwrap(), "4");
         assert_eq!(request.body, b"volume: -10.0\r\n");
+    }
+
+    #[test]
+    fn summarizes_length_prefixed_mediaremote_protobuf() {
+        let payload = [0x06, 0x08, 0x01, 0x32, 0x02, 0x08, 0x02];
+        assert_eq!(
+            summarize_protobuf_payload(&payload).as_deref(),
+            Some("len=7 fields=[f1=v1,f6=len2{f1=v2}]")
+        );
+    }
+
+    #[test]
+    fn mediaremote_supported_commands_are_persisted_in_diagnostics() {
+        let state = AppState::new(crate::config::Config::default());
+        let mut params = plist::Dictionary::new();
+        params.insert(
+            "mrSupportedCommandsFromSender".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(vec![
+                0x06, 0x08, 0x01, 0x32, 0x02, 0x08, 0x02,
+            ])]),
+        );
+        let mut dict = plist::Dictionary::new();
+        dict.insert(
+            "type".to_string(),
+            plist::Value::String("updateMRSupportedCommands".to_string()),
+        );
+        dict.insert("params".to_string(), plist::Value::Dictionary(params));
+
+        log_ap2_mr_supported_commands(&state, &dict);
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot
+                .diagnostics
+                .get("ap2_mr_supported_command_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .get("ap2_mr_supported_commands")
+                .is_some_and(|value| value.contains("f6=len2{f1=v2}"))
+        );
     }
 
     #[test]
