@@ -10,7 +10,7 @@ mDNS discovery.
 cargo run --manifest-path shairport-rs/Cargo.toml -- --config shairport-rs/shairport-rs.toml
 ```
 
-The local API and web UI listen on `127.0.0.1:3689` by default.
+The local API and web UI listen on `127.0.0.1:36890` by default.
 
 ## Configuration layers
 
@@ -124,7 +124,12 @@ Controls (SMTC), and macOS Now Playing / Remote Command Center. Play, pause, tog
 stop, next, and previous commands are routed through the same local/DACP command path
 as the HTTP API. Linux MPRIS volume changes control the receiver's local output gain.
 The receiver publishes `can_seek = false` and ignores seek requests because it does not
-own the sender's timeline.
+own the sender's timeline. Local play/pause/stop commands are applied through the playout
+scheduler so watermark recovery cannot reopen audio after a user pause. Sender delivery
+prefers DACP and falls back to a connected AirPlay 2 type-130 MediaRemote stream. Runtime
+state diagnostics expose `remote_control_delivery`, `remote_control_dacp_headers`,
+`remote_control_mrp_connected`, and `remote_control_mrp_receivers` when troubleshooting
+source-control availability.
 
 The integration is optional and non-fatal. On headless Linux systems without a user
 D-Bus session, for example, AirPlay playback continues even if MPRIS registration is
@@ -176,9 +181,9 @@ Control commands:
 Example:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:3689/api/v1/media
-Invoke-RestMethod http://127.0.0.1:3689/api/v1/playout/status
-Invoke-RestMethod -Method Post http://127.0.0.1:3689/api/v1/media/control `
+Invoke-RestMethod http://127.0.0.1:36890/api/v1/media
+Invoke-RestMethod http://127.0.0.1:36890/api/v1/playout/status
+Invoke-RestMethod -Method Post http://127.0.0.1:36890/api/v1/media/control `
   -ContentType application/json `
   -Body '{"command":"next"}'
 ```
@@ -221,7 +226,7 @@ sequenceDiagram
     participant RTSP as shairport-rs RTSP :7000
     participant PTP as PTP :319/:320
     participant Audio as Buffered Audio TCP
-    participant API as Local API/UI :3689
+    participant API as Local API/UI :36890
 
     Sender->>RTSP: OPTIONS
     RTSP-->>Sender: Public methods
@@ -329,7 +334,7 @@ playout state and drift diagnostics:
 
 ```powershell
 while ($true) {
-  Invoke-RestMethod http://127.0.0.1:3689/api/v1/playout/status |
+  Invoke-RestMethod http://127.0.0.1:36890/api/v1/playout/status |
     ConvertTo-Json -Depth 4 -Compress
   Start-Sleep -Seconds 5
 }

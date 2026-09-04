@@ -80,6 +80,22 @@ impl DacpController {
         active_remote: Option<String>,
         peer_addr: Option<SocketAddr>,
     ) {
+        let has_dacp_id = dacp_id.is_some();
+        let has_active_remote = active_remote.is_some();
+        self.state.set_diagnostic(
+            "remote_control_dacp_headers",
+            match (has_dacp_id, has_active_remote) {
+                (true, true) => "complete",
+                (true, false) | (false, true) => "partial",
+                (false, false) => "missing",
+            },
+        );
+        debug!(
+            has_dacp_id,
+            has_active_remote,
+            peer = ?peer_addr,
+            "AirPlay remote-control headers updated"
+        );
         self.state
             .set_remote_control_session(dacp_id, active_remote, peer_addr);
         self.prewarm_endpoint();

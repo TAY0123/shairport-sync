@@ -1626,6 +1626,11 @@ fn update_dacp_session_from_headers(
     let active_remote = header_value(request, "Active-Remote").map(str::to_string);
     let dacp_id = header_value(request, "DACP-ID").map(str::to_string);
     if active_remote.is_none() && dacp_id.is_none() {
+        if request.method.eq_ignore_ascii_case("SETUP") {
+            debug!(
+                "RTSP SETUP contained no DACP-ID or Active-Remote headers; DACP sender control unavailable from this request"
+            );
+        }
         return;
     }
     if active_remote.is_some() {

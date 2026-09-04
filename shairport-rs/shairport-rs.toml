@@ -1,5 +1,5 @@
 [server]
-bind = "127.0.0.1:3689"
+bind = "127.0.0.1:36890"
 
 [airplay]
 enabled = true
