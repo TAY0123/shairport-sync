@@ -20,6 +20,13 @@ hostname = "shairport-rs"
 [audio]
 backend = "cpal"
 host = "default"
+# Buffered AirPlay 2 can see ~100 ms presentation-timeline corrections on
+# desktop systems. Keep enough decoded PCM headroom to absorb those without
+# immediately entering Rebuffering.
+pcm_fifo_ms = 500
+start_watermark_ms = 250
+target_watermark_ms = 200
+low_watermark_ms = 100
 
 [ptp]
 enabled = true

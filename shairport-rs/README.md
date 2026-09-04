@@ -68,6 +68,9 @@ when it is installed, then falls back to the built-in Rust publisher.
 The built-in backend publishes `_raop._tcp.local.` and `_airplay._tcp.local.`
 with automatic LAN address selection. On hosts with multiple adapters, set
 `mdns.interface` to the interface that shares a network with the Apple sender.
+External `dns-sd`/Avahi publishers are health-checked every 15 seconds and all
+services are republished automatically if a publisher process exits, which
+keeps discovery recoverable across long-running desktop/network changes.
 On Windows, allow inbound UDP 5353 and TCP 7000 for the daemon.
 
 ```toml
@@ -108,7 +111,17 @@ unavailable. The CPAL callback remains lock-free during these transitions.
 [audio]
 backend = "cpal"
 host = "default" # default, wasapi, coreaudio, alsa, asio, jack
+pcm_fifo_ms = 500
+start_watermark_ms = 250
+target_watermark_ms = 200
+low_watermark_ms = 100
 ```
+
+The FIFO/watermarks are durations, not byte counts, so AAC `F24`, ALAC `S24`,
+and 16-bit sources get the same time headroom after decode. During active
+playback an INFO-level `playout health` record is emitted every 30 seconds with
+FIFO occupancy/capacity, callback underruns, producer overflow, ingress depth,
+rebuffer/resync counters, drift timing error, and PTP state.
 
 ASIO support is feature-gated:
 
