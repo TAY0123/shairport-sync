@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::{
     airplay::{ap2::capability::Ap2CapabilityPolicy, playout_decoder::AirPlayPacketDecoder},
     api::ApiContext,
-    config::{Config, PtpBackendName},
+    config::{Config, ConfigOverrides, PtpBackendName},
     mdns::{MdnsAdvertiser, MdnsBackend},
     playout::scheduler::SchedulerConfig,
     state::AppState,
@@ -40,6 +40,9 @@ struct Args {
 
     #[arg(long, env = "SHAIRPORT_RS_DEBUG")]
     debug: bool,
+
+    #[command(flatten)]
+    config_overrides: ConfigOverrides,
 }
 
 #[tokio::main]
@@ -92,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         info!("debug logging enabled");
     }
 
-    let config = Config::load(args.config.as_deref())?;
+    let config = Config::load(args.config.as_deref(), &args.config_overrides)?;
     let app_state = AppState::new(config.clone());
 
     let audio_manager = audio::AudioManager::new(config.audio.clone());
@@ -339,5 +342,31 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn config_override_arguments_have_unique_ids_and_parse() {
+        Args::command().debug_assert();
+
+        let args = Args::try_parse_from([
+            "shairport-rs",
+            "--mdns-backend",
+            "dns-sd",
+            "--audio-host",
+            "wasapi",
+            "--airplay2-enabled",
+            "true",
+            "--system-media-enabled",
+            "false",
+        ])
+        .unwrap();
+
+        assert!(args.config.is_none());
     }
 }

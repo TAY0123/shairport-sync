@@ -12,6 +12,47 @@ cargo run --manifest-path shairport-rs/Cargo.toml -- --config shairport-rs/shair
 
 The local API and web UI listen on `127.0.0.1:3689` by default.
 
+## Configuration layers
+
+Runtime configuration is resolved in this order, from highest to lowest priority:
+
+```text
+command-line option > SHAIRPORT_RS_* environment > TOML file > built-in defaults
+```
+
+Every field in `Config` is exposed as a command-line option. Section names are used as
+prefixes, so `[mdns].backend` is `--mdns-backend`, `[audio].host` is `--audio-host`,
+and `[system_media].enabled` is `--system-media-enabled`. Run `shairport-rs --help`
+for the complete generated list.
+
+For example, select Apple's Bonjour / DNS-SD publisher on Windows without editing the
+TOML file:
+
+```powershell
+cargo run --manifest-path shairport-rs/Cargo.toml -- `
+  --config shairport-rs/shairport-rs.toml `
+  --mdns-backend dns-sd `
+  --audio-host wasapi
+```
+
+Boolean overrides take an explicit value, for example:
+
+```powershell
+--airplay2-enabled true --system-media-enabled false
+```
+
+Environment variables use `SHAIRPORT_RS_` plus a double underscore between the TOML
+section and field name:
+
+```powershell
+$env:SHAIRPORT_RS_MDNS__BACKEND = "dns-sd"
+$env:SHAIRPORT_RS_AUDIO__HOST = "wasapi"
+$env:SHAIRPORT_RS_SYSTEM_MEDIA__ENABLED = "false"
+```
+
+`SHAIRPORT_RS_CONFIG` still selects the config file and `SHAIRPORT_RS_DEBUG` still
+controls debug logging.
+
 ## Discovery
 
 `mdns.backend = "auto"` is the default. Auto mode uses the native mDNS publisher
