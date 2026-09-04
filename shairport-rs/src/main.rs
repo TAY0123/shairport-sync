@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // It owns the decoder, ingress channel, and watermark state machine,
     // and is the single authority for audio lifecycle commands.
     let scheduler_config = SchedulerConfig::from_audio_config(&config.audio);
+    let scheduler_target_watermark_ms = scheduler_config.target_watermark_ms;
     let decoder = AirPlayPacketDecoder::new(app_state.clone());
     let (playout_handle, playout_task) = playout::scheduler::spawn_playout_service_with_clock(
         scheduler_config,
@@ -136,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         let diag_engine = audio_engine.clone();
         let diag_state = app_state.clone();
         tokio::spawn(async move {
+            let mut last_callback_underrun_frames = diag_engine.status().callback_underrun_frames;
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick; report after one full interval.
@@ -145,6 +147,10 @@ async fn main() -> anyhow::Result<()> {
                 let scheduler = diag_playout.status();
                 let ingress = diag_playout.ingress_diagnostics();
                 let audio = diag_engine.status();
+                let callback_underrun_frames_delta = audio
+                    .callback_underrun_frames
+                    .saturating_sub(last_callback_underrun_frames);
+                last_callback_underrun_frames = audio.callback_underrun_frames;
                 let snapshot = diag_state.snapshot();
                 if !snapshot.active
                     && matches!(scheduler.state, playout::scheduler::PlayoutState::Stopped)
@@ -157,11 +163,16 @@ async fn main() -> anyhow::Result<()> {
                     state = ?scheduler.state,
                     source_format = snapshot.audio.source_format.as_deref().unwrap_or("unknown"),
                     fifo_queued_ms = audio.queued_ms,
+                    fifo_target_ms = scheduler_target_watermark_ms,
                     fifo_capacity_ms = audio.capacity_ms,
                     scheduler_queued_ms = scheduler.queued_ms,
                     callback_underrun_frames = audio.callback_underrun_frames,
+                    callback_underrun_frames_delta,
                     producer_overflow_frames = audio.producer_overflow_frames,
                     fifo_backpressure_events = scheduler.diag.fifo_backpressure_events,
+                    buffered_target_throttle_events = scheduler
+                        .diag
+                        .buffered_target_throttle_events,
                     resyncs = scheduler.diag.resync_count,
                     jitter_resync_required = scheduler.jitter.resync_required,
                     timing_gate_holds = scheduler.diag.timing_gate_holds,

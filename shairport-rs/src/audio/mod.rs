@@ -537,6 +537,10 @@ impl AudioManager {
                     selected.stream_config.channels,
                     config.pcm_fifo_ms,
                 );
+                // The output callback starts before an AirPlay stream exists.
+                // Keep the gate closed until the scheduler reaches Playing so
+                // idle silence is not counted as a callback underrun.
+                engine.set_output_gate(false);
                 let (supervisor, controller, initial) = AudioOutputSupervisor::spawn(
                     self.clone(),
                     engine.clone(),
@@ -547,6 +551,9 @@ impl AudioManager {
             }
             Err(_) => {
                 let (engine, consumer) = AudioEngine::new_for_output(44_100, 2, config.pcm_fifo_ms);
+                // As above, the fallback output callback is live before any
+                // AirPlay transport starts; leave it gated until Playing.
+                engine.set_output_gate(false);
                 let (supervisor, controller, initial) =
                     AudioOutputSupervisor::spawn(self.clone(), engine.clone(), consumer, None);
                 (engine, supervisor, controller, initial)

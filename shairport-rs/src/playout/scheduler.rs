@@ -638,6 +638,9 @@ pub struct SchedulerDiagnostics {
     pub fifo_backpressure_events: u64,
     /// Total frames in backpressure-rejected blocks.
     pub fifo_backpressure_frames: u64,
+    /// Times AP2 buffered decoding paused because the PCM FIFO had reached
+    /// the configured steady-state target watermark.
+    pub buffered_target_throttle_events: u64,
     /// Actual playout-state changes (start, pause, resume, stop, flush,
     /// watermark observation, active resync).  Idempotent same-state
     /// calls do not increment.
@@ -1155,6 +1158,20 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
             return 0;
         }
 
+        // AP2 buffered audio is deliberately bursty on the wire. During
+        // steady-state playback, keep compressed packets in the jitter /
+        // bounded ingress queues once decoded PCM reaches the configured
+        // target watermark. This lets TCP backpressure pace the sender and
+        // preserves the remainder of the PCM FIFO as headroom instead of
+        // treating physical capacity as the normal operating point.
+        let pending_is_buffered = self.pending.is_some()
+            && self.last_decoded_packet.as_ref().is_some_and(|packet| {
+                packet.protocol == super::packet::StreamProtocol::AirPlay2Buffered
+            });
+        if self.should_throttle_buffered_decode(pending_is_buffered) {
+            return 0;
+        }
+
         // ── Retry pending block first ──
         if let Some(rtp_timestamp) = self.pending_rtp_timestamp {
             self.maybe_install_hard_recovery_anchor(rtp_timestamp);
@@ -1236,6 +1253,10 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                         continue;
                     }
 
+                    if self.should_throttle_buffered_decode(packet_is_buffered) {
+                        return 0;
+                    }
+
                     // Take (consume) the slot.
                     match self.jitter.take_expected() {
                         TakeExpectedResult::Packet(_) => {}
@@ -1299,6 +1320,14 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                         return 0;
                     }
 
+                    let conceal_is_buffered =
+                        self.last_decoded_packet.as_ref().is_some_and(|packet| {
+                            packet.protocol == super::packet::StreamProtocol::AirPlay2Buffered
+                        });
+                    if self.should_throttle_buffered_decode(conceal_is_buffered) {
+                        return 0;
+                    }
+
                     // Grace expired — take the missing slot and conceal.
                     let seq = self.jitter.expected_sequence();
                     match self.jitter.take_expected() {
@@ -1345,6 +1374,19 @@ impl<D: PacketDecoder, S: PcmSink> SchedulerCore<D, S> {
                 }
             }
         }
+    }
+
+    fn should_throttle_buffered_decode(&mut self, buffered: bool) -> bool {
+        if !buffered || self.watermark.state() != PlayoutState::Playing {
+            return false;
+        }
+        let target_ms = self.config.target_watermark_ms as u64;
+        if target_ms == 0 || self.sink.queued_ms() < target_ms {
+            return false;
+        }
+        self.diag.buffered_target_throttle_events =
+            self.diag.buffered_target_throttle_events.saturating_add(1);
+        true
     }
 
     /// Observe the current sink FIFO level and apply any resulting
@@ -3333,6 +3375,29 @@ mod tests {
         }
         assert_eq!(scheduler.state(), PlayoutState::Playing);
         (scheduler, clock)
+    }
+
+    #[test]
+    fn ap2_buffered_playing_throttles_decode_at_target_watermark() {
+        let (mut scheduler, _clock) = playing_ap2_scheduler();
+        assert_eq!(scheduler.state(), PlayoutState::Playing);
+        assert_eq!(scheduler.sink().queued_ms, 3);
+        assert_eq!(scheduler.config.target_watermark_ms, 2);
+
+        let decoded_before = scheduler.status().diag.decoded_blocks;
+        assert_eq!(
+            scheduler.insert_packet(ap2_packet(13, 13)),
+            InsertResult::Accepted
+        );
+        assert_eq!(scheduler.process_ready(Instant::now()), 0);
+        assert_eq!(scheduler.status().diag.decoded_blocks, decoded_before);
+        assert_eq!(scheduler.status().diag.buffered_target_throttle_events, 1);
+
+        // Once the output callback drains below target, decoding resumes.
+        scheduler.sink_mut().queued_ms = 1;
+        assert_eq!(scheduler.process_ready(Instant::now()), 1);
+        assert_eq!(scheduler.status().diag.decoded_blocks, decoded_before + 1);
+        assert_eq!(scheduler.sink().queued_ms, 2);
     }
 
     #[test]
